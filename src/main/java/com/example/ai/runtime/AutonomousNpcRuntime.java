@@ -1,0 +1,267 @@
+package com.example.ai.runtime;
+
+import com.example.ai.action.AgentActionExecutor;
+import com.example.ai.intent.AgentDecision;
+import com.example.ai.intent.AgentDecisionParser;
+import com.example.ai.intent.AgentIntentType;
+import com.example.ai.llm.LlmRouter;
+import com.example.ai.memory.AgentMemoryStore;
+import com.example.ai.memory.MemoryContext;
+import com.example.ai.memory.MemoryEntry;
+import com.example.ai.perception.SemanticPerceptionService;
+import com.example.ai.perception.WorldSnapshot;
+import com.example.ai.prompt.PromptFactory;
+import com.example.ai.safety.SafetyPolicy;
+import net.minecraft.server.MinecraftServer;
+import org.slf4j.Logger;
+
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public final class AutonomousNpcRuntime {
+    private final Logger logger;
+    private final SemanticPerceptionService perceptionService;
+    private final PromptFactory promptFactory;
+    private final LlmRouter llmRouter;
+    private final AgentDecisionParser decisionParser;
+    private final AgentActionExecutor actionExecutor;
+    private final AgentMemoryStore memoryStore;
+    private final SafetyPolicy safetyPolicy;
+
+    private final Map<UUID, AgentHandle> agents = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> nextThinkAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> pendingInstruction = new ConcurrentHashMap<>();
+
+    private AutonomousNpcRuntime(
+            Logger logger,
+            SemanticPerceptionService perceptionService,
+            PromptFactory promptFactory,
+            LlmRouter llmRouter,
+            AgentDecisionParser decisionParser,
+            AgentActionExecutor actionExecutor,
+            AgentMemoryStore memoryStore,
+            SafetyPolicy safetyPolicy
+    ) {
+        this.logger = logger;
+        this.perceptionService = perceptionService;
+        this.promptFactory = promptFactory;
+        this.llmRouter = llmRouter;
+        this.decisionParser = decisionParser;
+        this.actionExecutor = actionExecutor;
+        this.memoryStore = memoryStore;
+        this.safetyPolicy = safetyPolicy;
+    }
+
+    public static AutonomousNpcRuntime createDefault(Logger logger) {
+        var memoryStore = AgentMemoryStore.createDefault(logger);
+        return new AutonomousNpcRuntime(
+                logger,
+                new SemanticPerceptionService(),
+                new PromptFactory(),
+                LlmRouter.defaultRouter(),
+                new AgentDecisionParser(),
+                new AgentActionExecutor(logger),
+                memoryStore,
+                SafetyPolicy.defaultPolicy()
+        );
+    }
+
+    public void onServerTick(MinecraftServer server) {
+        long now = System.currentTimeMillis();
+        for (AgentHandle handle : agents.values()) {
+            UUID npcId = handle.npcId();
+            actionExecutor.applyNextAction(server, npcId, handle.npcName());
+
+            boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
+            if (!hasPendingInstruction) {
+                continue;
+            }
+            if (now < nextThinkAt.getOrDefault(npcId, 0L)) {
+                continue;
+            }
+
+            MemoryContext memory = memoryStore.getContext(npcId);
+            String latestInstruction = latestInstruction(memory);
+            InstructionDemand demand = classifyDemand(latestInstruction);
+            String expectedIntent = expectedIntentForDemand(demand);
+            String targetHint = targetHintFromInstruction(latestInstruction, demand);
+            WorldSnapshot snapshot = perceptionService.captureFallback(handle.npcName());
+            String prompt = promptFactory.actionSelectionPrompt(
+                    snapshot,
+                    memory,
+                    hasPendingInstruction,
+                    latestInstruction,
+                    expectedIntent,
+                    targetHint
+            );
+            String raw = llmRouter.generate(prompt);
+            AgentDecision decision = decisionParser.parse(raw);
+            if (!decision.isValid()) {
+                logger.info("LLM produced invalid decision for agent {}: {}", handle.npcName(), raw);
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (!safetyPolicy.allow(npcId, decision)) {
+                logger.info("Safety policy blocked decision for agent {}: {}", handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+
+            if (decision.intent() == AgentIntentType.IDLE) {
+                logger.info("Idle decision rejected for pending instruction on agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (decision.intent() == AgentIntentType.DIALOGUE_REPLY
+                    && !decision.parameters().has("text")) {
+                logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST
+                    && !decision.parameters().has("item_id")) {
+                logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (decision.intent() == AgentIntentType.MINE_BLOCK
+                    && !decision.parameters().has("block")
+                    && !(decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"))) {
+                logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (decision.intent() == AgentIntentType.MINE_TO_CHEST
+                    && !decision.parameters().has("block")) {
+                logger.info("Mine-to-chest decision missing parameters.block for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (decision.intent() == AgentIntentType.MINE_TO_PLAYER
+                    && !decision.parameters().has("block")) {
+                logger.info("Mine-to-player decision missing parameters.block for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (demand == InstructionDemand.REQUIRE_MINE && decision.intent() != AgentIntentType.MINE_BLOCK) {
+                logger.info("Mine instruction requires MINE_BLOCK intent for agent {}. Got {}. Retrying.",
+                        handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (demand == InstructionDemand.REQUIRE_MINE_TO_CHEST && decision.intent() != AgentIntentType.MINE_TO_CHEST) {
+                logger.info("Mine-to-chest instruction requires MINE_TO_CHEST intent for agent {}. Got {}. Retrying.",
+                        handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (demand == InstructionDemand.REQUIRE_MINE_TO_PLAYER && decision.intent() != AgentIntentType.MINE_TO_PLAYER) {
+                logger.info("Mine-to-player instruction requires MINE_TO_PLAYER intent for agent {}. Got {}. Retrying.",
+                        handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (demand == InstructionDemand.REQUIRE_FETCH && decision.intent() != AgentIntentType.FETCH_FROM_CHEST) {
+                logger.info("Fetch instruction requires FETCH_FROM_CHEST intent for agent {}. Got {}. Retrying.",
+                        handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+
+            actionExecutor.execute(npcId, decision);
+            logger.info(
+                    "LLM decision queued: agent={} intent={} priority={} reasoning={}",
+                    handle.npcName(),
+                    decision.intent(),
+                    decision.priority(),
+                    decision.reasoning()
+            );
+            memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
+            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision", snapshot.toJson().toString()));
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, now + 1500L);
+        }
+    }
+
+    public void registerAgent(UUID npcId, String npcName) {
+        agents.put(npcId, new AgentHandle(npcId, npcName));
+        pendingInstruction.put(npcId, false);
+        logger.info("Registered embodied AI agent {}", npcName);
+    }
+
+    public void enqueuePlayerUtterance(UUID npcId, String playerName, String text) {
+        memoryStore.appendShortTerm(npcId, MemoryEntry.dialogue(playerName, text));
+        pendingInstruction.put(npcId, true);
+        nextThinkAt.put(npcId, 0L);
+    }
+
+    public boolean isAgentRegistered(UUID npcId) {
+        return agents.containsKey(npcId);
+    }
+
+    private String latestInstruction(MemoryContext memory) {
+        if (memory.shortTerm().isEmpty()) {
+            return "";
+        }
+        return memory.shortTerm().get(memory.shortTerm().size() - 1).content();
+    }
+
+    private InstructionDemand classifyDemand(String instruction) {
+        String lower = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
+        if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
+                && (lower.contains("give me") || lower.contains("give to me") || lower.contains("to my inventory") || lower.contains("my inventory"))) {
+            return InstructionDemand.REQUIRE_MINE_TO_PLAYER;
+        }
+        if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
+                && (lower.contains("chest") || lower.contains("store") || lower.contains("put in"))) {
+            return InstructionDemand.REQUIRE_MINE_TO_CHEST;
+        }
+        if (lower.contains("mine") || lower.contains("dig") || lower.contains("break")) {
+            return InstructionDemand.REQUIRE_MINE;
+        }
+        if (lower.contains("bring") || lower.contains("fetch") || lower.contains("get me")) {
+            return InstructionDemand.REQUIRE_FETCH;
+        }
+        return InstructionDemand.NONE;
+    }
+
+    private String expectedIntentForDemand(InstructionDemand demand) {
+        return switch (demand) {
+            case REQUIRE_MINE -> "mine_block";
+            case REQUIRE_FETCH -> "fetch_from_chest";
+            case REQUIRE_MINE_TO_CHEST -> "mine_to_chest";
+            case REQUIRE_MINE_TO_PLAYER -> "mine_to_player";
+            case NONE -> "";
+        };
+    }
+
+    private String targetHintFromInstruction(String instruction, InstructionDemand demand) {
+        String lower = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
+        if (lower.contains("grass")) {
+            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:grass_block" : "minecraft:grass_block";
+        }
+        if (lower.contains("glass")) {
+            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:glass" : "minecraft:glass";
+        }
+        if (lower.contains("cobblestone")) {
+            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:cobblestone" : "minecraft:cobblestone";
+        }
+        if (lower.contains("oak log")) {
+            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:oak_log" : "minecraft:oak_log";
+        }
+        return "";
+    }
+
+    private record AgentHandle(UUID npcId, String npcName) {
+    }
+
+    private enum InstructionDemand {
+        NONE,
+        REQUIRE_MINE,
+        REQUIRE_MINE_TO_CHEST,
+        REQUIRE_MINE_TO_PLAYER,
+        REQUIRE_FETCH
+    }
+}
