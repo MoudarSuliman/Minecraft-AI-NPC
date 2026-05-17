@@ -266,9 +266,11 @@ public final class AutonomousNpcRuntime {
                 && (lower.contains("give me")
                 || lower.contains("give to me")
                 || lower.contains("give it to me")
+                || lower.contains("give them to me")
                 || lower.contains("deliver to me")
                 || lower.contains("to my inventory")
-                || lower.contains("my inventory"))) {
+                || lower.contains("my inventory")
+                || mentionsInventory(lower))) {
             return InstructionDemand.REQUIRE_MINE_TO_PLAYER;
         }
         if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
@@ -291,6 +293,15 @@ public final class AutonomousNpcRuntime {
             return InstructionDemand.REQUIRE_FETCH;
         }
         return InstructionDemand.NONE;
+    }
+
+    private boolean mentionsInventory(String lower) {
+        if (lower == null || lower.isBlank()) {
+            return false;
+        }
+        return lower.contains("inventory")
+                || lower.contains("inverntory")
+                || lower.matches(".*\\binv\\w*tory\\b.*");
     }
 
     private String expectedIntentForDemand(InstructionDemand demand) {

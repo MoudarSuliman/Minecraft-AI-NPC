@@ -45,6 +45,20 @@ public final class TradeIntentParser {
             // If no specific item, treat as generic stock inquiry (they want to know prices)
             return new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, "", 0, null);
         }
+        if (containsAny(lower, "do you accept", "would you accept", "will you accept")
+                && containsAny(lower, "emerald", "emeralds")
+                && lower.contains("for")) {
+            String itemId = detectItem(lower);
+            Integer quantityAfterFor = numberAfterFor(lower);
+            if (!itemId.isEmpty()) {
+                int quantity = quantityAfterFor == null ? 1 : Math.max(1, quantityAfterFor);
+                return new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, itemId, quantity, null);
+            }
+            Integer proposed = firstNumber(lower);
+            if (proposed != null) {
+                return new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, proposed);
+            }
+        }
         if (isPaymentInquiry(lower)) {
             return new ParsedTradeIntent(TradeIntentType.INQUIRE_PAYMENT, "", 0, null);
         }
@@ -52,6 +66,9 @@ public final class TradeIntentParser {
             return new ParsedTradeIntent(TradeIntentType.ACCEPT_OFFER, "", 0, null);
         }
         if (containsAny(lower, "too expensive", "expensive", "too much", "cheaper", "lower", "discount")) {
+            return new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, null);
+        }
+        if (containsAny(lower, "i dont like it", "i don't like it", "not good", "dont like this", "don't like this")) {
             return new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, null);
         }
         if (containsAny(lower, "can you do", "could you do", "how about", "what about", "make it")) {
@@ -72,7 +89,7 @@ public final class TradeIntentParser {
             return new ParsedTradeIntent(TradeIntentType.DECLINE_OFFER, "", 0, null);
         }
         if (containsAny(lower, "for") && containsAny(lower, "emerald", "emeralds")) {
-            Integer proposed = firstNumber(lower);
+            Integer proposed = emeraldAmount(lower);
             if (proposed != null) {
                 return new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, proposed);
             }
@@ -104,10 +121,16 @@ public final class TradeIntentParser {
     }
 
     private boolean isPaymentInquiry(String lower) {
-        if (!(containsAny(lower, "accept", "pay with", "trade for", "instead of emerald", "instead of emeralds"))) {
-            return false;
+        if (containsAny(lower, "instead of emerald", "instead of emeralds")) {
+            return true;
         }
-        return !containsAny(lower, "i accept", "deal", "i'll take it", "ill take it");
+        if (containsAny(lower, "pay with", "trade for")) {
+            return !containsAny(lower, "emerald", "emeralds");
+        }
+        if (containsAny(lower, "do you accept", "would you accept", "will you accept")) {
+            return !containsAny(lower, "emerald", "emeralds");
+        }
+        return false;
     }
 
     private boolean isRefusalPhrase(String trimmed) {
@@ -132,6 +155,30 @@ public final class TradeIntentParser {
 
     private Integer firstNumber(String lower) {
         Matcher matcher = NUMBER_PATTERN.matcher(lower);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Integer numberAfterFor(String lower) {
+        Matcher matcher = Pattern.compile("\\bfor\\s+(\\d+)\\b").matcher(lower);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(matcher.group(1));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Integer emeraldAmount(String lower) {
+        Matcher matcher = Pattern.compile("\\b(\\d+)\\s+emeralds?\\b").matcher(lower);
         if (!matcher.find()) {
             return null;
         }
