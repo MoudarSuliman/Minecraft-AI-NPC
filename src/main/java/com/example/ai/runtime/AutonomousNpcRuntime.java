@@ -56,13 +56,15 @@ public final class AutonomousNpcRuntime {
 
     public static AutonomousNpcRuntime createDefault(Logger logger) {
         var memoryStore = AgentMemoryStore.createDefault(logger);
+        var promptFactory = new PromptFactory();
+        var llmRouter = LlmRouter.defaultRouter();
         return new AutonomousNpcRuntime(
                 logger,
                 new SemanticPerceptionService(),
-                new PromptFactory(),
-                LlmRouter.defaultRouter(),
+                promptFactory,
+                llmRouter,
                 new AgentDecisionParser(),
-                new AgentActionExecutor(logger),
+                new AgentActionExecutor(logger, promptFactory, llmRouter),
                 memoryStore,
                 SafetyPolicy.defaultPolicy()
         );
@@ -72,6 +74,8 @@ public final class AutonomousNpcRuntime {
         long now = System.currentTimeMillis();
         for (AgentHandle handle : agents.values()) {
             UUID npcId = handle.npcId();
+            actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
+            actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId());
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
             boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
@@ -83,11 +87,33 @@ public final class AutonomousNpcRuntime {
             }
 
             MemoryContext memory = memoryStore.getContext(npcId);
-            String latestInstruction = latestInstruction(memory);
+            String latestEntry = latestInstruction(memory);
+            String speaker = speakerFromEntry(latestEntry);
+            String latestInstruction = instructionTextFromEntry(latestEntry);
+            WorldSnapshot snapshot = perceptionService.captureFallback(handle.npcName());
+
+            if (actionExecutor.tryHandleTradeInstruction(
+                    server,
+                    npcId,
+                    handle.npcName(),
+                    speaker,
+                    handle.ownerPlayerId(),
+                    latestInstruction,
+                    memory,
+                    snapshot
+            )) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(
+                        npcId,
+                        MemoryEntry.episodic("trade", "Handled trade instruction from " + speaker + ": " + latestInstruction)
+                );
+                continue;
+            }
+
             InstructionDemand demand = classifyDemand(latestInstruction);
             String expectedIntent = expectedIntentForDemand(demand);
             String targetHint = targetHintFromInstruction(latestInstruction, demand);
-            WorldSnapshot snapshot = perceptionService.captureFallback(handle.npcName());
             String prompt = promptFactory.actionSelectionPrompt(
                     snapshot,
                     memory,
@@ -186,7 +212,11 @@ public final class AutonomousNpcRuntime {
     }
 
     public void registerAgent(UUID npcId, String npcName) {
-        agents.put(npcId, new AgentHandle(npcId, npcName));
+        registerAgent(npcId, npcName, null);
+    }
+
+    public void registerAgent(UUID npcId, String npcName, UUID ownerPlayerId) {
+        agents.put(npcId, new AgentHandle(npcId, npcName, ownerPlayerId));
         pendingInstruction.put(npcId, false);
         logger.info("Registered embodied AI agent {}", npcName);
     }
@@ -208,10 +238,37 @@ public final class AutonomousNpcRuntime {
         return memory.shortTerm().get(memory.shortTerm().size() - 1).content();
     }
 
+    private String speakerFromEntry(String entry) {
+        if (entry == null || entry.isBlank()) {
+            return "";
+        }
+        int sep = entry.indexOf(':');
+        if (sep <= 0) {
+            return "";
+        }
+        return entry.substring(0, sep).trim();
+    }
+
+    private String instructionTextFromEntry(String entry) {
+        if (entry == null || entry.isBlank()) {
+            return "";
+        }
+        int sep = entry.indexOf(':');
+        if (sep < 0 || sep + 1 >= entry.length()) {
+            return entry.trim();
+        }
+        return entry.substring(sep + 1).trim();
+    }
+
     private InstructionDemand classifyDemand(String instruction) {
         String lower = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
         if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
-                && (lower.contains("give me") || lower.contains("give to me") || lower.contains("to my inventory") || lower.contains("my inventory"))) {
+                && (lower.contains("give me")
+                || lower.contains("give to me")
+                || lower.contains("give it to me")
+                || lower.contains("deliver to me")
+                || lower.contains("to my inventory")
+                || lower.contains("my inventory"))) {
             return InstructionDemand.REQUIRE_MINE_TO_PLAYER;
         }
         if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
@@ -220,6 +277,15 @@ public final class AutonomousNpcRuntime {
         }
         if (lower.contains("mine") || lower.contains("dig") || lower.contains("break")) {
             return InstructionDemand.REQUIRE_MINE;
+        }
+        if (lower.contains("buy")
+                || lower.contains("trade")
+                || lower.contains("deal")
+                || lower.contains("emerald")
+                || lower.contains("counter")
+                || lower.contains("no thanks")
+                || lower.contains("decline")) {
+            return InstructionDemand.REQUIRE_TRADE;
         }
         if (lower.contains("bring") || lower.contains("fetch") || lower.contains("get me")) {
             return InstructionDemand.REQUIRE_FETCH;
@@ -233,6 +299,7 @@ public final class AutonomousNpcRuntime {
             case REQUIRE_FETCH -> "fetch_from_chest";
             case REQUIRE_MINE_TO_CHEST -> "mine_to_chest";
             case REQUIRE_MINE_TO_PLAYER -> "mine_to_player";
+            case REQUIRE_TRADE -> "dialogue_reply";
             case NONE -> "";
         };
     }
@@ -254,7 +321,7 @@ public final class AutonomousNpcRuntime {
         return "";
     }
 
-    private record AgentHandle(UUID npcId, String npcName) {
+    private record AgentHandle(UUID npcId, String npcName, UUID ownerPlayerId) {
     }
 
     private enum InstructionDemand {
@@ -262,6 +329,7 @@ public final class AutonomousNpcRuntime {
         REQUIRE_MINE,
         REQUIRE_MINE_TO_CHEST,
         REQUIRE_MINE_TO_PLAYER,
+        REQUIRE_TRADE,
         REQUIRE_FETCH
     }
 }

@@ -1,6 +1,18 @@
 package com.example.ai.action;
 
 import com.example.ai.intent.AgentDecision;
+import com.example.ai.llm.LlmRouter;
+import com.example.ai.memory.MemoryContext;
+import com.example.ai.perception.WorldSnapshot;
+import com.example.ai.prompt.PromptFactory;
+import com.example.ai.trade.ParsedTradeIntent;
+import com.example.ai.trade.TradeNegotiationDraft;
+import com.example.ai.trade.TradeNegotiationParser;
+import com.example.ai.trade.TradeCounterResult;
+import com.example.ai.trade.TradeIntentParser;
+import com.example.ai.trade.TradeIntentType;
+import com.example.ai.trade.TradeOffer;
+import com.example.ai.trade.TradeOfferEngine;
 import com.google.gson.JsonObject;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -28,15 +40,31 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class AgentActionExecutor {
     private static final int CHEST_SCAN_RADIUS = 16;
     private static final int MINE_SCAN_RADIUS = 8;
+    private static final int TRADE_SCAN_RADIUS = 18;
+    private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
+    private static final long TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS = 45_000L;
+    private static final double OWNER_IDLE_RADIUS_SQR = 36.0;   // 6 blocks
+    private static final double OWNER_PULL_RADIUS_SQR = 196.0;  // 14 blocks
+    private static final double OWNER_TELEPORT_RADIUS_SQR = 3600.0; // 60 blocks
+    private static final double TRADE_GREETING_RADIUS_SQR = 25.0; // 5 blocks
 
     private final Logger logger;
+    private final PromptFactory promptFactory;
+    private final LlmRouter llmRouter;
+    private final TradeOfferEngine tradeOfferEngine = TradeOfferEngine.defaultEngine();
+    private final TradeIntentParser tradeIntentParser = new TradeIntentParser();
+    private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
+    private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
+    private final Map<TradeSessionKey, Long> nextTradeGreetingAt = new ConcurrentHashMap<>();
 
-    public AgentActionExecutor(Logger logger) {
+    public AgentActionExecutor(Logger logger, PromptFactory promptFactory, LlmRouter llmRouter) {
         this.logger = logger;
+        this.promptFactory = promptFactory;
+        this.llmRouter = llmRouter;
     }
 
     public boolean execute(UUID npcId, AgentDecision decision) {
@@ -120,6 +148,473 @@ public final class AgentActionExecutor {
 
         logger.info("Action execution: npc={} intent={} success={}", fallbackName, intent, success);
         return success;
+    }
+
+    public void enforceOwnerLeash(MinecraftServer server, UUID npcId, UUID ownerPlayerId, String fallbackName) {
+        if (ownerPlayerId == null) {
+            return;
+        }
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) {
+            return;
+        }
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerPlayerId);
+        if (owner == null || owner.level() != villager.level()) {
+            return;
+        }
+
+        double distance = villager.distanceToSqr(owner);
+        if (distance <= OWNER_IDLE_RADIUS_SQR) {
+            return;
+        }
+
+        if (distance >= OWNER_TELEPORT_RADIUS_SQR) {
+            villager.teleportTo(owner.getX(), owner.getY(), owner.getZ());
+            logger.info("Owner leash teleported npc={} back to owner", fallbackName);
+            return;
+        }
+
+        if (distance >= OWNER_PULL_RADIUS_SQR) {
+            villager.getNavigation().moveTo(owner.getX(), owner.getY(), owner.getZ(), 0.9);
+        }
+    }
+
+    public void maybeSendTradeGreeting(MinecraftServer server, UUID npcId, String fallbackName, UUID ownerPlayerId) {
+        if (ownerPlayerId == null) {
+            return;
+        }
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) {
+            return;
+        }
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerPlayerId);
+        if (owner == null || owner.level() != villager.level()) {
+            return;
+        }
+        if (villager.distanceToSqr(owner) > TRADE_GREETING_RADIUS_SQR) {
+            return;
+        }
+
+        TradeSessionKey key = new TradeSessionKey(npcId, ownerPlayerId);
+        long now = System.currentTimeMillis();
+        long allowedAt = nextTradeGreetingAt.getOrDefault(key, 0L);
+        if (now < allowedAt) {
+            return;
+        }
+
+        TradeSession session = tradeSessions.computeIfAbsent(key, ignored -> new TradeSession());
+        if (session.activeOffer != null) {
+            if (now <= session.activeOffer.expiresAtMillis()) {
+                return;
+            }
+            session.activeOffer = null;
+        }
+        if (now - session.lastInteractionAtMillis < TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS) {
+            return;
+        }
+
+        nextTradeGreetingAt.put(key, now + TRADE_GREETING_COOLDOWN_MILLIS);
+        session.lastInteractionAtMillis = now;
+        speakAsNpc(server, villager, fallbackName, "You looking to trade?");
+    }
+
+    public boolean tryHandleTradeInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot
+    ) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) {
+            return false;
+        }
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) {
+            return false;
+        }
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
+            return false;
+        }
+
+        TradeSessionKey key = new TradeSessionKey(npcId, player.getUUID());
+        TradeSession session = tradeSessions.computeIfAbsent(key, ignored -> new TradeSession());
+        long now = System.currentTimeMillis();
+
+        if (session.activeOffer != null && now > session.activeOffer.expiresAtMillis()) {
+            session.activeOffer = null;
+            session.lastInteractionAtMillis = now;
+            speakAsNpc(server, villager, fallbackName, "That offer expired. Ask again and I'll make a new one.");
+            return true;
+        }
+
+        ParsedTradeIntent tradeIntent = tradeIntentParser.parse(instruction);
+        boolean engageTrade = tradeIntent.type() != TradeIntentType.NONE
+                || session.activeOffer != null
+                || isLikelyTradeUtterance(instruction);
+        if (!engageTrade) {
+            return false;
+        }
+
+        // For accept/decline, don't call LLM - these are binary outcomes
+        if (tradeIntent.type() == TradeIntentType.ACCEPT_OFFER) {
+            return handleTradeAccept(server, villager, fallbackName, player, session, null);
+        }
+        if (tradeIntent.type() == TradeIntentType.DECLINE_OFFER) {
+            session.activeOffer = null;
+            speakAsNpc(server, villager, fallbackName, "No worries. Let me know if you want to trade later.");
+            session.lastInteractionAtMillis = now;
+            return true;
+        }
+
+        String mode = tradeIntent.type() == TradeIntentType.NONE ? "clarify" : tradeIntent.type().name().toLowerCase();
+        String prompt = promptFactory.tradeNegotiationPrompt(
+                villager.getName().getString(),
+                player.getName().getString(),
+                instruction,
+                mode,
+                session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
+                tradeStockSummary(villager),
+                tradeFactsForIntent(tradeIntent, session, instruction),
+                snapshot,
+                memory
+        );
+        TradeNegotiationDraft draft = tradeNegotiationParser.parse(llmRouter.generate(prompt));
+        if (tradeIntent.type() == TradeIntentType.NONE) {
+            if (session.activeOffer != null) {
+                session.lastInteractionAtMillis = now;
+                speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "We are still negotiating. Say deal, no, or your counter in emeralds."));
+                return true;
+            }
+            speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "Tell me the item and amount you want to buy."));
+            session.lastInteractionAtMillis = now;
+            return true;
+        }
+        session.lastInteractionAtMillis = now;
+
+        return switch (tradeIntent.type()) {
+            case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, session, now, draft);
+            case INQUIRE_PAYMENT -> handlePaymentInquiry(server, villager, fallbackName, draft);
+            case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, villager, fallbackName, session, draft);
+            case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, session, tradeIntent, now, draft);
+            case COUNTER_OFFER -> handleTradeCounter(server, villager, fallbackName, session, tradeIntent, now, draft);
+            case ACCEPT_OFFER, DECLINE_OFFER -> false;  // Already handled above
+            case NONE -> false;
+        };
+    }
+
+    private boolean handleSessionStatusInquiry(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            TradeSession session,
+            TradeNegotiationDraft draft
+    ) {
+        if (session.activeOffer != null) {
+            speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "We still have an active offer. Say deal, no, or counter in emeralds."));
+            return true;
+        }
+        speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "No active offer right now."));
+        return true;
+    }
+
+    private boolean handlePaymentInquiry(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            TradeNegotiationDraft draft
+    ) {
+        speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "I only accept emeralds right now."));
+        return true;
+    }
+
+    private boolean handleStockInquiry(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            TradeSession session,
+            long now,
+            TradeNegotiationDraft draft
+    ) {
+        ServerLevel level = (ServerLevel) villager.level();
+        List<String> offers = new ArrayList<>();
+        for (String itemId : tradeOfferEngine.supportedItems()) {
+            Item item = resolveKnownItem(itemId);
+            if (item == null) {
+                continue;
+            }
+            int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+            if (stock <= 0) {
+                continue;
+            }
+            TradeOffer preview = tradeOfferEngine.quote(itemId, 1, stock, 0, false, now);
+            offers.add(readableItemName(itemId) + " (" + stock + " in stock, " + preview.unitPrice() + " emerald each)");
+        }
+        if (offers.isEmpty()) {
+            session.activeOffer = null;
+            speakAsNpc(server, villager, fallbackName, "I'm out of stock right now.");
+            return true;
+        }
+        offers.sort(String::compareTo);
+        int limit = Math.min(4, offers.size());
+        String message = String.join(", ", offers.subList(0, limit));
+        if (offers.size() > limit) {
+            message = message + ", and more.";
+        }
+        speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "I currently sell: " + message));
+        return true;
+    }
+
+    private boolean handleTradeRequest(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            TradeSession session,
+            ParsedTradeIntent tradeIntent,
+            long now,
+            TradeNegotiationDraft draft
+    ) {
+        String itemId = tradeIntent.itemId();
+        int quantity = Math.max(1, tradeIntent.quantity());
+        if (!tradeOfferEngine.supportsItem(itemId)) {
+            speakAsNpc(server, villager, fallbackName, "I don't trade that item right now.");
+            return true;
+        }
+
+        int stock = countItemInNearbyChests((ServerLevel) villager.level(), villager.blockPosition(), resolveKnownItem(itemId), TRADE_SCAN_RADIUS);
+        if (stock < quantity) {
+            speakAsNpc(server, villager, fallbackName, "I only have " + stock + " in stock right now.");
+            return true;
+        }
+
+        TradeOffer offer = tradeOfferEngine.quote(itemId, quantity, stock, 0, false, now);
+        TradeNegotiationDraft pricingDraft = draft;
+        if (pricingDraft != null && (pricingDraft.suggestedUnitPrice() != null || pricingDraft.suggestedTotalPrice() != null)) {
+            offer = tradeOfferEngine.quote(
+                    itemId,
+                    quantity,
+                    stock,
+                    0,
+                    false,
+                    now,
+                    pricingDraft.suggestedUnitPrice(),
+                    pricingDraft.suggestedTotalPrice()
+            );
+        }
+        session.activeOffer = offer;
+        speakAsNpc(server, villager, fallbackName, groundedOfferText(draft.responseText(), offer));
+        return true;
+    }
+
+    private boolean handleTradeCounter(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            TradeSession session,
+            ParsedTradeIntent tradeIntent,
+            long now,
+            TradeNegotiationDraft draft
+    ) {
+        if (session.activeOffer == null) {
+            speakAsNpc(server, villager, fallbackName, "I need to make an offer first.");
+            return true;
+        }
+        Integer proposed = tradeIntent.counterTotalPrice();
+        if (proposed == null || proposed <= 0) {
+            int minimum = tradeOfferEngine.minimumAcceptableTotal(session.activeOffer);
+            int autoCounter = Math.max(minimum, session.activeOffer.totalPrice() - Math.max(1, session.activeOffer.totalPrice() / 10));
+            if (draft.counterTotalPrice() != null && draft.counterTotalPrice() >= minimum) {
+                autoCounter = draft.counterTotalPrice();
+            }
+            TradeOffer autoOffer = new TradeOffer(
+                    session.activeOffer.itemId(),
+                    session.activeOffer.quantity(),
+                    Math.max(1, autoCounter / Math.max(1, session.activeOffer.quantity())),
+                    autoCounter,
+                    session.activeOffer.maxDiscountPct(),
+                    session.activeOffer.expiresAtMillis()
+            );
+            session.activeOffer = autoOffer;
+            speakAsNpc(server, villager, fallbackName, groundedCounterText(draft.responseText(), autoOffer));
+            return true;
+        }
+        TradeCounterResult counter = tradeOfferEngine.evaluateCounter(session.activeOffer, proposed, now);
+        if (!counter.accepted()) {
+            speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "That's too low. Lowest I can do is " + counter.minimumAcceptableTotal() + " emeralds."));
+            return true;
+        }
+
+        session.activeOffer = counter.offer();
+        speakAsNpc(server, villager, fallbackName, groundedCounterText(draft.responseText(), counter.offer()));
+        return true;
+    }
+
+    private boolean handleTradeAccept(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            ServerPlayer player,
+            TradeSession session,
+            TradeNegotiationDraft draft
+    ) {
+        if (session.activeOffer == null) {
+            speakAsNpc(server, villager, fallbackName, "There's no active offer yet.");
+            return true;
+        }
+
+        TradeOffer offer = session.activeOffer;
+        if (!hasAtLeast(player, Items.EMERALD, offer.totalPrice())) {
+            speakAsNpc(server, villager, fallbackName, "You don't have enough emeralds for that trade.");
+            return true;
+        }
+        Item item = resolveKnownItem(offer.itemId());
+        if (item == null) {
+            speakAsNpc(server, villager, fallbackName, "I can't complete that trade right now.");
+            return true;
+        }
+        ServerLevel level = (ServerLevel) villager.level();
+        int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+        if (stock < offer.quantity()) {
+            session.activeOffer = null;
+            speakAsNpc(server, villager, fallbackName, "I ran out of stock before completing the deal.");
+            return true;
+        }
+
+        boolean paid = removeFromInventory(player, Items.EMERALD, offer.totalPrice());
+        if (!paid) {
+            speakAsNpc(server, villager, fallbackName, "I couldn't take payment. Try again.");
+            return true;
+        }
+        ItemStack collected = withdrawFromNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS, offer.quantity());
+        if (collected.getCount() < offer.quantity()) {
+            player.getInventory().add(new ItemStack(Items.EMERALD, offer.totalPrice()));
+            session.activeOffer = null;
+            speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "Trade failed while collecting stock. I refunded your emeralds."));
+            return true;
+        }
+
+        ItemStack remaining = insertIntoPlayerInventory(player, collected.copy());
+        if (!remaining.isEmpty()) {
+            Containers.dropItemStack(
+                    player.level(),
+                    player.getX(),
+                    player.getY() + 1.0,
+                    player.getZ(),
+                    remaining
+            );
+        }
+
+        BlockPos chestPos = findNearestChest(level, villager.blockPosition(), CHEST_SCAN_RADIUS);
+        ItemStack emeraldStack = new ItemStack(Items.EMERALD, offer.totalPrice());
+        if (chestPos != null) {
+            ItemStack emeraldRemaining = insertIntoChest(level, chestPos, emeraldStack);
+            if (!emeraldRemaining.isEmpty()) {
+                Containers.dropItemStack(level, villager.getX(), villager.getY() + 1.0, villager.getZ(), emeraldRemaining);
+            }
+        } else {
+            Containers.dropItemStack(level, villager.getX(), villager.getY() + 1.0, villager.getZ(), emeraldStack);
+        }
+
+        session.activeOffer = null;
+        speakAsNpc(server, villager, fallbackName, fallbackOrDefault(draft.responseText(), "Deal done. Pleasure trading with you."));
+        return true;
+    }
+
+    private ServerPlayer findPlayerByName(MinecraftServer server, String playerName) {
+        if (playerName == null || playerName.isBlank()) {
+            return null;
+        }
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.getName().getString().equalsIgnoreCase(playerName)) {
+                return player;
+            }
+        }
+        return null;
+    }
+
+    private String tradeStockSummary(Villager villager) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return "unavailable";
+        }
+        List<String> entries = new ArrayList<>();
+        for (String itemId : tradeOfferEngine.supportedItems()) {
+            Item item = resolveKnownItem(itemId);
+            if (item == null) {
+                continue;
+            }
+            int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+            if (stock > 0) {
+                entries.add(readableItemName(itemId) + "=" + stock);
+            }
+        }
+        if (entries.isEmpty()) {
+            return "none";
+        }
+        return String.join(", ", entries);
+    }
+
+    private String summarizeOffer(TradeOffer offer) {
+        return readableItemName(offer.itemId())
+                + " x" + offer.quantity()
+                + " for " + offer.totalPrice() + " emeralds";
+    }
+
+    private String tradeFactsForIntent(ParsedTradeIntent tradeIntent, TradeSession session, String instruction) {
+        if (tradeIntent.type() == TradeIntentType.REQUEST_OFFER && session.activeOffer == null) {
+            String itemId = tradeIntent.itemId();
+            int quantity = Math.max(1, tradeIntent.quantity());
+            int stock = 0;
+            return "request_item=" + itemId
+                    + "; quantity=" + quantity
+                    + "; stock=" + stock;
+        }
+        if (tradeIntent.type() == TradeIntentType.COUNTER_OFFER && session.activeOffer != null) {
+            return "current_offer=" + summarizeOffer(session.activeOffer)
+                    + "; minimum_total=" + tradeOfferEngine.minimumAcceptableTotal(session.activeOffer)
+                    + "; player_text=" + instruction;
+        }
+        if (tradeIntent.type() == TradeIntentType.ACCEPT_OFFER && session.activeOffer != null) {
+            return "active_offer=" + summarizeOffer(session.activeOffer);
+        }
+        return "session_active=" + (session.activeOffer != null);
+    }
+
+    private String groundedOfferText(String draftText, TradeOffer offer) {
+        String fallback = "I can offer " + offer.quantity() + "x " + readableItemName(offer.itemId())
+                + " for " + offer.totalPrice() + " emeralds. Deal?";
+        if (draftText == null || draftText.isBlank()) {
+            return fallback;
+        }
+        String lower = draftText.toLowerCase();
+        boolean hasItem = lower.contains(readableItemName(offer.itemId()).toLowerCase());
+        boolean hasPrice = lower.contains(String.valueOf(offer.totalPrice()));
+        boolean hasCurrency = lower.contains("emerald");
+        if (!hasItem || !hasPrice || !hasCurrency) {
+            return fallback;
+        }
+        return draftText;
+    }
+
+    private String groundedCounterText(String draftText, TradeOffer offer) {
+        String fallback = "Alright, " + offer.totalPrice() + " emeralds. Deal?";
+        if (draftText == null || draftText.isBlank()) {
+            return fallback;
+        }
+        String lower = draftText.toLowerCase();
+        if (!lower.contains(String.valueOf(offer.totalPrice()))) {
+            return fallback;
+        }
+        return draftText;
+    }
+
+    private String fallbackOrDefault(String draftText, String fallback) {
+        if (draftText == null || draftText.isBlank()) {
+            return fallback;
+        }
+        return draftText;
     }
 
     private JsonObject pollNextAction(UUID npcId) {
@@ -314,7 +809,7 @@ public final class AgentActionExecutor {
     }
 
     private boolean startMineToPlayerTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
-        if (!(villager.level() instanceof ServerLevel level)) {
+        if (!(villager.level() instanceof ServerLevel)) {
             return false;
         }
         if (!parameters.has("block")) {
@@ -772,6 +1267,137 @@ public final class AgentActionExecutor {
         };
     }
 
+    private String readableItemName(String itemId) {
+        if (itemId == null || itemId.isBlank()) {
+            return "item";
+        }
+        String normalized = itemId.replace("minecraft:", "").replace('_', ' ');
+        return normalized;
+    }
+
+    private void speakAsNpc(MinecraftServer server, Villager villager, String fallbackName, String text) {
+        String npcName = villager.getName().getString();
+        if (npcName == null || npcName.isBlank()) {
+            npcName = fallbackName;
+        }
+        Component message = Component.literal("[" + npcName + "] " + text);
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level() == villager.level() && player.distanceToSqr(villager) <= 400.0) {
+                player.sendSystemMessage(message);
+            }
+        }
+    }
+
+    private int countItemInNearbyChests(ServerLevel level, BlockPos center, Item item, int radius) {
+        if (item == null) {
+            return 0;
+        }
+        int total = 0;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockEntity blockEntity = level.getBlockEntity(pos);
+                    if (!(blockEntity instanceof ChestBlockEntity chest)) {
+                        continue;
+                    }
+                    for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+                        ItemStack stack = chest.getItem(slot);
+                        if (stack.is(item)) {
+                            total += stack.getCount();
+                        }
+                    }
+                }
+            }
+        }
+        return total;
+    }
+
+    private ItemStack withdrawFromNearbyChests(ServerLevel level, BlockPos center, Item item, int radius, int neededCount) {
+        int remaining = neededCount;
+        ItemStack collected = ItemStack.EMPTY;
+        for (int dx = -radius; dx <= radius && remaining > 0; dx++) {
+            for (int dy = -4; dy <= 4 && remaining > 0; dy++) {
+                for (int dz = -radius; dz <= radius && remaining > 0; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockEntity blockEntity = level.getBlockEntity(pos);
+                    if (!(blockEntity instanceof ChestBlockEntity chest)) {
+                        continue;
+                    }
+                    for (int slot = 0; slot < chest.getContainerSize() && remaining > 0; slot++) {
+                        ItemStack current = chest.getItem(slot);
+                        if (!current.is(item)) {
+                            continue;
+                        }
+                        int take = Math.min(remaining, current.getCount());
+                        ItemStack removed = chest.removeItem(slot, take);
+                        if (removed.isEmpty()) {
+                            continue;
+                        }
+                        if (collected.isEmpty()) {
+                            collected = removed.copy();
+                        } else {
+                            collected.grow(removed.getCount());
+                        }
+                        remaining -= removed.getCount();
+                    }
+                    chest.setChanged();
+                }
+            }
+        }
+        return collected;
+    }
+
+    private boolean hasAtLeast(ServerPlayer player, Item item, int requiredCount) {
+        int total = 0;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (stack.is(item)) {
+                total += stack.getCount();
+                if (total >= requiredCount) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean removeFromInventory(ServerPlayer player, Item item, int removeCount) {
+        int remaining = removeCount;
+        for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = player.getInventory().getItem(slot);
+            if (!stack.is(item) || stack.isEmpty()) {
+                continue;
+            }
+            int take = Math.min(remaining, stack.getCount());
+            ItemStack removed = player.getInventory().removeItem(slot, take);
+            remaining -= removed.getCount();
+            if (remaining <= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isLikelyTradeUtterance(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String lower = text.toLowerCase();
+        return lower.contains("buy")
+                || lower.contains("sell")
+                || lower.contains("trade")
+                || lower.contains("emerald")
+                || lower.contains("offer")
+                || lower.contains("deal")
+                || lower.contains("price")
+                || lower.contains("stock")
+                || lower.contains("how")
+                || lower.contains("much")
+                || lower.contains("cost")
+                || lower.contains("charge");
+    }
+
     private void notifyNearbyPlayers(MinecraftServer server, Villager villager, String text) {
         Component message = Component.literal(text);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
@@ -786,6 +1412,17 @@ public final class AgentActionExecutor {
         int dy = a.getY() - b.getY();
         int dz = a.getZ() - b.getZ();
         return (double) dx * dx + (double) dy * dy + (double) dz * dz;
+    }
+
+    private record TradeSessionKey(UUID npcId, UUID playerId) {
+    }
+
+    private static final class TradeSession {
+        private TradeOffer activeOffer;
+        private long lastInteractionAtMillis = 0L;
+
+        private TradeSession() {
+        }
     }
 
     private enum MineToChestPhase {

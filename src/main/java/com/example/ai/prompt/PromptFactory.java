@@ -24,7 +24,7 @@ public final class PromptFactory {
         envelope.addProperty("expected_intent", expectedIntent);
         envelope.addProperty("target_hint", targetHint);
         envelope.addProperty("required_schema",
-                "{\"intent\":\"idle|dialogue_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
+                "{\"intent\":\"idle|dialogue_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
         envelope.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
@@ -62,6 +62,40 @@ public final class PromptFactory {
         envelope.add("memory", memoryToJson(memory));
         envelope.addProperty("format",
                 "{\"intent\":\"build_structure\",\"parameters\":{\"steps\":[{\"intent\":\"move_to\",\"parameters\":{}},{\"intent\":\"place_block\",\"parameters\":{}}]},\"reasoning\":\"...\",\"priority\":0.0}");
+        return envelope.toString();
+    }
+
+    public String tradeNegotiationPrompt(
+            String npcName,
+            String playerName,
+            String playerText,
+            String mode,
+            String activeOfferSummary,
+            String stockSummary,
+            String requiredFacts,
+            WorldSnapshot snapshot,
+            MemoryContext memory
+    ) {
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("task", "trade_negotiation");
+        envelope.addProperty("npc_name", npcName);
+        envelope.addProperty("player_name", playerName);
+        envelope.addProperty("player_utterance", playerText);
+        envelope.addProperty("mode", mode);
+        envelope.addProperty("active_offer", activeOfferSummary);
+        envelope.addProperty("stock_summary", stockSummary);
+        envelope.addProperty("required_facts", requiredFacts);
+        envelope.add("perception", snapshot.toJson());
+        envelope.add("memory", memoryToJson(memory));
+        envelope.addProperty("format",
+                "{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}");
+        envelope.addProperty("constraints",
+                "Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. "
+                        + "CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. "
+                        + "Never invent items, prices, or stock. Suggested prices must be integers >= 1. "
+                        + "Always reference the actual stock and item names from required_facts. "
+                        + "If suggesting a new price, set both suggested_unit_price and suggested_total_price. "
+                        + "If counter_total_price is not relevant, omit it or set null.");
         return envelope.toString();
     }
 

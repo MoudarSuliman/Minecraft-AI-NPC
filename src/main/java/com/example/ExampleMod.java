@@ -60,7 +60,7 @@ public class ExampleMod implements ModInitializer {
 		}
 
 		String displayName = nearest.getName().getString();
-		runtime.registerAgent(nearest.getUUID(), displayName);
+		runtime.registerAgent(nearest.getUUID(), displayName, player.getUUID());
 		player.sendSystemMessage(Component.literal("[LLM NPC] Bound nearest villager: " + displayName));
 		return 1;
 	}

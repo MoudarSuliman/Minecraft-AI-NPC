@@ -8,6 +8,10 @@ public enum AgentIntentType {
     MINE_BLOCK,
     MINE_TO_CHEST,
     MINE_TO_PLAYER,
+    TRADE_OFFER,
+    TRADE_ACCEPT,
+    TRADE_DECLINE,
+    TRADE_COUNTER,
     PLACE_BLOCK,
     BREAK_BLOCK,
     BUILD_STRUCTURE
