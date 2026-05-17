@@ -33,6 +33,7 @@ import org.slf4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -63,6 +64,8 @@ public final class AgentActionExecutor {
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, Long> nextTradeGreetingAt = new ConcurrentHashMap<>();
 
@@ -276,6 +279,7 @@ public final class AgentActionExecutor {
                 tradeIntent = new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, explicitCounter);
             }
         }
+        lastTradeIntentByNpc.put(npcId, tradeIntent.type().name().toLowerCase());
         boolean engageTrade = tradeIntent.type() != TradeIntentType.NONE
                 || session.activeOffer != null
                 || isLikelyTradeUtterance(instruction)
@@ -307,7 +311,13 @@ public final class AgentActionExecutor {
                 snapshot,
                 memory
         );
-        TradeNegotiationDraft draft = tradeNegotiationParser.parse(llmRouter.generate(prompt));
+        tradeLlmInFlightByNpc.put(npcId, true);
+        TradeNegotiationDraft draft;
+        try {
+            draft = tradeNegotiationParser.parse(llmRouter.generate(prompt));
+        } finally {
+            tradeLlmInFlightByNpc.put(npcId, false);
+        }
         if (tradeIntent.type() == TradeIntentType.NONE) {
             if (session.activeOffer != null) {
                 session.lastInteractionAtMillis = now;
@@ -704,6 +714,58 @@ public final class AgentActionExecutor {
             return fallback;
         }
         return draftText;
+    }
+
+    public boolean isTradeLlmInFlight(UUID npcId) {
+        return tradeLlmInFlightByNpc.getOrDefault(npcId, false);
+    }
+
+    public String lastTradeIntent(UUID npcId) {
+        return lastTradeIntentByNpc.getOrDefault(npcId, "none");
+    }
+
+    public String currentTaskPhase(UUID npcId) {
+        MineToPlayerTask mineToPlayer = activeMineToPlayer.get(npcId);
+        if (mineToPlayer != null) {
+            return "mine_to_player:" + mineToPlayer.phase.name().toLowerCase(Locale.ROOT)
+                    + " (" + mineToPlayer.minedCount + "/" + mineToPlayer.count + ")";
+        }
+        MineToChestTask mineToChest = activeMineToChest.get(npcId);
+        if (mineToChest != null) {
+            return "mine_to_chest:" + mineToChest.phase.name().toLowerCase(Locale.ROOT)
+                    + " (" + mineToChest.minedCount + "/" + mineToChest.count + ")";
+        }
+        DeliveryTask delivery = activeDeliveries.get(npcId);
+        if (delivery != null) {
+            return "fetch_delivery:" + delivery.phase.name().toLowerCase(Locale.ROOT)
+                    + " (" + delivery.itemId + " x" + delivery.count + ")";
+        }
+        List<JsonObject> queued = actionOutbox.get(npcId);
+        if (queued != null && !queued.isEmpty()) {
+            JsonObject head = queued.get(0);
+            String intent = head.has("intent") ? head.get("intent").getAsString() : "unknown";
+            return "queued:" + intent;
+        }
+        return "idle";
+    }
+
+    public String activeOfferSummary(UUID npcId, UUID ownerPlayerId) {
+        TradeSession session = null;
+        if (ownerPlayerId != null) {
+            session = tradeSessions.get(new TradeSessionKey(npcId, ownerPlayerId));
+        }
+        if (session == null) {
+            for (Map.Entry<TradeSessionKey, TradeSession> entry : tradeSessions.entrySet()) {
+                if (entry.getKey().npcId().equals(npcId)) {
+                    session = entry.getValue();
+                    break;
+                }
+            }
+        }
+        if (session == null || session.activeOffer == null) {
+            return "none";
+        }
+        return summarizeOffer(session.activeOffer);
     }
 
     private JsonObject pollNextAction(UUID npcId) {

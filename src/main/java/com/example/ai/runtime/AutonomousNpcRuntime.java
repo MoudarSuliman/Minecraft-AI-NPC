@@ -15,6 +15,8 @@ import com.example.ai.safety.SafetyPolicy;
 import net.minecraft.server.MinecraftServer;
 import org.slf4j.Logger;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -33,6 +35,10 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, AgentHandle> agents = new ConcurrentHashMap<>();
     private final Map<UUID, Long> nextThinkAt = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> pendingInstruction = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> llmInFlight = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastDemandByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastExpectedIntentByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
 
     private AutonomousNpcRuntime(
             Logger logger,
@@ -113,6 +119,8 @@ public final class AutonomousNpcRuntime {
 
             InstructionDemand demand = classifyDemand(latestInstruction);
             String expectedIntent = expectedIntentForDemand(demand);
+            lastDemandByNpc.put(npcId, demand.name().toLowerCase(Locale.ROOT));
+            lastExpectedIntentByNpc.put(npcId, expectedIntent.isBlank() ? "none" : expectedIntent);
             String targetHint = targetHintFromInstruction(latestInstruction, demand);
             String prompt = promptFactory.actionSelectionPrompt(
                     snapshot,
@@ -122,8 +130,15 @@ public final class AutonomousNpcRuntime {
                     expectedIntent,
                     targetHint
             );
-            String raw = llmRouter.generate(prompt);
+            llmInFlight.put(npcId, true);
+            String raw;
+            try {
+                raw = llmRouter.generate(prompt);
+            } finally {
+                llmInFlight.put(npcId, false);
+            }
             AgentDecision decision = decisionParser.parse(raw);
+            lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase(Locale.ROOT));
             if (!decision.isValid()) {
                 logger.info("LLM produced invalid decision for agent {}: {}", handle.npcName(), raw);
                 nextThinkAt.put(npcId, now + 1200L);
@@ -229,6 +244,50 @@ public final class AutonomousNpcRuntime {
 
     public boolean isAgentRegistered(UUID npcId) {
         return agents.containsKey(npcId);
+    }
+
+    public String statusForAgent(UUID npcId) {
+        AgentHandle handle = agents.get(npcId);
+        if (handle == null) {
+            return "registered=false";
+        }
+        boolean pending = pendingInstruction.getOrDefault(npcId, false);
+        boolean actionLlmBusy = llmInFlight.getOrDefault(npcId, false);
+        boolean tradeLlmBusy = actionExecutor.isTradeLlmInFlight(npcId);
+        String phase = actionExecutor.currentTaskPhase(npcId);
+        String offer = actionExecutor.activeOfferSummary(npcId, handle.ownerPlayerId());
+        String lastTradeIntent = actionExecutor.lastTradeIntent(npcId);
+        return "registered=true"
+                + " | npc=" + handle.npcName()
+                + " | phase=" + phase
+                + " | active_offer=" + offer
+                + " | pending_instruction=" + pending
+                + " | pending_llm_calls=" + (actionLlmBusy || tradeLlmBusy)
+                + " | last_parser_intent=" + lastTradeIntent;
+    }
+
+    public List<String> debugForAgent(UUID npcId) {
+        List<String> lines = new ArrayList<>();
+        AgentHandle handle = agents.get(npcId);
+        if (handle == null) {
+            lines.add("registered=false");
+            return lines;
+        }
+        long now = System.currentTimeMillis();
+        long nextAt = nextThinkAt.getOrDefault(npcId, 0L);
+        long waitMs = Math.max(0L, nextAt - now);
+        MemoryContext context = memoryStore.getContext(npcId);
+
+        lines.add(statusForAgent(npcId));
+        lines.add("owner_player_id=" + (handle.ownerPlayerId() == null ? "none" : handle.ownerPlayerId()));
+        lines.add("next_think_in_ms=" + waitMs);
+        lines.add("last_demand=" + lastDemandByNpc.getOrDefault(npcId, "none"));
+        lines.add("expected_intent=" + lastExpectedIntentByNpc.getOrDefault(npcId, "none"));
+        lines.add("last_decision_intent=" + lastParsedDecisionIntentByNpc.getOrDefault(npcId, "none"));
+        lines.add("memory_sizes short=" + context.shortTerm().size()
+                + " working=" + context.working().size()
+                + " long=" + context.longTerm().size());
+        return lines;
     }
 
     private String latestInstruction(MemoryContext memory) {

@@ -49,6 +49,14 @@ public class ExampleMod implements ModInitializer {
 											StringArgumentType.getString(context, "message")
 									)))
 			);
+			dispatcher.register(
+					Commands.literal("llm_status")
+							.executes(context -> statusNearestVillager(context.getSource().getPlayerOrException()))
+			);
+			dispatcher.register(
+					Commands.literal("llm_debug")
+							.executes(context -> debugNearestVillager(context.getSource().getPlayerOrException()))
+			);
 		});
 	}
 
@@ -78,6 +86,36 @@ public class ExampleMod implements ModInitializer {
 
 		runtime.enqueuePlayerUtterance(nearest.getUUID(), player.getName().getString(), message);
 		player.sendSystemMessage(Component.literal("[LLM NPC] Instruction queued for " + nearest.getName().getString() + ": " + message));
+		return 1;
+	}
+
+	private int statusNearestVillager(ServerPlayer player) {
+		Villager nearest = findNearestVillager(player, 20.0);
+		if (nearest == null) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] No villager found within 20 blocks."));
+			return 0;
+		}
+		if (!runtime.isAgentRegistered(nearest.getUUID())) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] Nearest villager is not bound. Use /llm_bind_nearest first."));
+			return 0;
+		}
+		player.sendSystemMessage(Component.literal("[LLM NPC][STATUS] " + runtime.statusForAgent(nearest.getUUID())));
+		return 1;
+	}
+
+	private int debugNearestVillager(ServerPlayer player) {
+		Villager nearest = findNearestVillager(player, 20.0);
+		if (nearest == null) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] No villager found within 20 blocks."));
+			return 0;
+		}
+		if (!runtime.isAgentRegistered(nearest.getUUID())) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] Nearest villager is not bound. Use /llm_bind_nearest first."));
+			return 0;
+		}
+		for (String line : runtime.debugForAgent(nearest.getUUID())) {
+			player.sendSystemMessage(Component.literal("[LLM NPC][DEBUG] " + line));
+		}
 		return 1;
 	}
 
