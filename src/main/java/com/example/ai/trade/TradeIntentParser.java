@@ -20,7 +20,9 @@ public final class TradeIntentParser {
             Map.entry("planks", "minecraft:oak_planks"),
             Map.entry("stone", "minecraft:stone"),
             Map.entry("dirt", "minecraft:dirt"),
-            Map.entry("sand", "minecraft:sand")
+            Map.entry("sand", "minecraft:sand"),
+            Map.entry("stick", "minecraft:stick"),
+            Map.entry("sticks", "minecraft:stick")
     );
 
     public ParsedTradeIntent parse(String text) {
@@ -32,6 +34,12 @@ public final class TradeIntentParser {
 
         if (containsAny(lower, "what do you sell", "what do you have", "show stock", "show me your stock", "what items")) {
             return new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, "", 0, null);
+        }
+        if (containsAny(lower, "do you have", "have you got", "got any")) {
+            String itemId = detectItem(lower);
+            if (!itemId.isEmpty()) {
+                return new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, itemId, 1, null);
+            }
         }
         if (containsAny(lower, "are we done trading", "done trading", "still trading", "trade done", "trading or no")) {
             return new ParsedTradeIntent(TradeIntentType.INQUIRE_SESSION_STATUS, "", 0, null);
@@ -49,9 +57,9 @@ public final class TradeIntentParser {
                 && containsAny(lower, "emerald", "emeralds")
                 && lower.contains("for")) {
             String itemId = detectItem(lower);
-            Integer quantityAfterFor = numberAfterFor(lower);
             if (!itemId.isEmpty()) {
-                int quantity = quantityAfterFor == null ? 1 : Math.max(1, quantityAfterFor);
+                Integer detected = firstNumber(lower);
+                int quantity = detected == null ? 1 : Math.max(1, detected);
                 return new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, itemId, quantity, null);
             }
             Integer proposed = firstNumber(lower);
@@ -111,6 +119,8 @@ public final class TradeIntentParser {
             return false;
         }
         return containsAny(lower, "deal", "i accept", "i'll take it", "ill take it", "sounds good")
+                || lower.contains("let's do that")
+                || lower.contains("lets do that")
                 || lower.contains("go ahead")
                 || trimmed.equals("sure")
                 || trimmed.equals("yeah")

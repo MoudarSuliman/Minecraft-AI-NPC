@@ -98,6 +98,25 @@ public final class AutonomousNpcRuntime {
             String latestInstruction = instructionTextFromEntry(latestEntry);
             WorldSnapshot snapshot = perceptionService.captureFallback(handle.npcName());
 
+            if (actionExecutor.tryHandleRecipeInstruction(
+                    server,
+                    npcId,
+                    handle.npcName(),
+                    speaker,
+                    handle.ownerPlayerId(),
+                    latestInstruction,
+                    memory,
+                    snapshot
+            )) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(
+                        npcId,
+                        MemoryEntry.episodic("recipe", "Handled recipe instruction from " + speaker + ": " + latestInstruction)
+                );
+                continue;
+            }
+
             if (actionExecutor.tryHandleTradeInstruction(
                     server,
                     npcId,

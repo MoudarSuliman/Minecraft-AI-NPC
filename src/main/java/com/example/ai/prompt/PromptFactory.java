@@ -99,6 +99,60 @@ public final class PromptFactory {
         return envelope.toString();
     }
 
+    public String recipeAssistantPrompt(
+            String npcName,
+            String playerName,
+            String playerText,
+            String requiredFacts,
+            WorldSnapshot snapshot,
+            MemoryContext memory
+    ) {
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("task", "recipe_assistant");
+        envelope.addProperty("npc_name", npcName);
+        envelope.addProperty("player_name", playerName);
+        envelope.addProperty("player_utterance", playerText);
+        envelope.addProperty("required_facts", requiredFacts);
+        envelope.add("perception", snapshot.toJson());
+        envelope.add("memory", memoryToJson(memory));
+        envelope.addProperty("format", "{\"response_text\":\"...\"}");
+        envelope.addProperty("constraints",
+                "Return strict JSON only. Keep response_text concise and natural. "
+                        + "Do not invent quantities, items, stock, or prices not in required_facts. "
+                        + "If required_facts includes an active_offer, mention the exact offer and emerald currency.");
+        return envelope.toString();
+    }
+
+    public String tradeIntentClassifierPrompt(
+            String npcName,
+            String playerName,
+            String playerText,
+            String activeOfferSummary,
+            String stockSummary,
+            String parserHint,
+            WorldSnapshot snapshot,
+            MemoryContext memory
+    ) {
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("task", "trade_intent_classifier");
+        envelope.addProperty("npc_name", npcName);
+        envelope.addProperty("player_name", playerName);
+        envelope.addProperty("player_utterance", playerText);
+        envelope.addProperty("active_offer", activeOfferSummary);
+        envelope.addProperty("stock_summary", stockSummary);
+        envelope.addProperty("parser_hint", parserHint);
+        envelope.add("perception", snapshot.toJson());
+        envelope.add("memory", memoryToJson(memory));
+        envelope.addProperty("format",
+                "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
+                        + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}");
+        envelope.addProperty("constraints",
+                "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
+                        + "If ambiguous, return intent none with low confidence. "
+                        + "Never invent item ids; only use known Minecraft item ids from context.");
+        return envelope.toString();
+    }
+
     private JsonObject memoryToJson(MemoryContext memory) {
         JsonObject json = new JsonObject();
         json.add("short_term", toArray(memory.shortTerm()));

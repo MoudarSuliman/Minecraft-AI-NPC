@@ -1,12 +1,9 @@
 package com.example.ai.trade;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 public final class TradeNegotiationParser {
-    private final Gson gson = new Gson();
-
     public TradeNegotiationDraft parse(String raw) {
         if (raw == null || raw.isBlank()) {
             return new TradeNegotiationDraft("", null, null, null, "empty response", 0.1);
@@ -40,7 +37,11 @@ public final class TradeNegotiationParser {
                     Math.max(0.0, Math.min(1.0, priority))
             );
         } catch (Exception ignored) {
-            return new TradeNegotiationDraft("", null, null, null, "parser fallback", 0.1);
+            String fallbackText = raw
+                    .replace("```json", "")
+                    .replace("```", "")
+                    .trim();
+            return new TradeNegotiationDraft(fallbackText, null, null, null, "parser fallback", 0.3);
         }
     }
 }

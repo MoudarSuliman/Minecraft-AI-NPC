@@ -25,7 +25,8 @@ public final class TradeOfferEngine {
                 "minecraft:oak_planks", 1,
                 "minecraft:stone", 1,
                 "minecraft:dirt", 1,
-                "minecraft:sand", 1
+                "minecraft:sand", 1,
+                "minecraft:stick", 1
         ), Map.of(
                 "minecraft:grass_block", 2,
                 "minecraft:cobblestone", 2,
@@ -34,7 +35,8 @@ public final class TradeOfferEngine {
                 "minecraft:stone", 2,
                 "minecraft:oak_planks", 2,
                 "minecraft:glass", 3,
-                "minecraft:oak_log", 3
+                "minecraft:oak_log", 3,
+                "minecraft:stick", 2
         ));
     }
 
