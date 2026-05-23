@@ -129,7 +129,6 @@ public final class PromptFactory {
             String playerText,
             String activeOfferSummary,
             String stockSummary,
-            String parserHint,
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
@@ -140,7 +139,6 @@ public final class PromptFactory {
         envelope.addProperty("player_utterance", playerText);
         envelope.addProperty("active_offer", activeOfferSummary);
         envelope.addProperty("stock_summary", stockSummary);
-        envelope.addProperty("parser_hint", parserHint);
         envelope.add("perception", snapshot.toJson());
         envelope.add("memory", memoryToJson(memory));
         envelope.addProperty("format",
@@ -148,9 +146,85 @@ public final class PromptFactory {
                         + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}");
         envelope.addProperty("constraints",
                 "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
-                        + "If ambiguous, return intent none with low confidence. "
-                        + "Never invent item ids; only use known Minecraft item ids from context.");
+                        + "Treat availability/count/price/payment questions as trade intents. "
+                        + "Examples that should map to inquire_stock: 'do you have sticks', 'how many sticks do you have', 'what do you sell'. "
+                        + "Examples that should map to request_offer: 'can I get 2 sticks', 'offer for 3 glass'. "
+                        + "If active_offer is present and player indicates agreement (deal/yes/sure/go ahead/take it), map to accept_offer. "
+                        + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
+                        + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
+                        + "Use intent none only when the utterance is truly unrelated to trade. "
+                        + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer.");
         return envelope.toString();
+    }
+
+    public String tradeIntentRecoveryPrompt(
+            String playerText,
+            String activeOfferSummary,
+            String stockSummary,
+            String lastRequestedItemId
+    ) {
+        String safePlayerText = playerText == null ? "" : playerText;
+        String safeActiveOffer = activeOfferSummary == null ? "" : activeOfferSummary;
+        String safeStockSummary = stockSummary == null ? "" : stockSummary;
+        String safeLastItem = lastRequestedItemId == null ? "" : lastRequestedItemId;
+
+        return "You are a Minecraft trade intent classifier.\n"
+                + "Classify the player's trade intent.\n"
+                + "Player utterance: " + safePlayerText + "\n"
+                + "Active offer: " + safeActiveOffer + "\n"
+                + "Stock summary: " + safeStockSummary + "\n"
+                + "Last requested item id: " + safeLastItem + "\n"
+                + "Rules:\n"
+                + "- 'do you have X', 'how many X', 'what do you sell' => inquire_stock.\n"
+                + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n"
+                + "- active offer + 'deal/yes/sure' => accept_offer.\n"
+                + "- active offer + 'no/nope/not now' => decline_offer.\n"
+                + "- explicit emerald counter => counter_offer with counter_total_price.\n"
+                + "- If follow-up omits item and last requested item exists, reuse it.\n"
+                + "- Use none only if unrelated to trade.\n"
+                + "Return ONLY this JSON object with no extra text:\n"
+                + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
+                + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
+    }
+
+    public String tradeIntentDisambiguationPrompt(
+            String playerText,
+            String activeOfferSummary,
+            String stockSummary,
+            String lastRequestedItemId,
+            String initialIntent,
+            String initialItemId,
+            int initialQuantity,
+            Integer initialCounterTotalPrice,
+            double initialConfidence
+    ) {
+        String safePlayerText = playerText == null ? "" : playerText;
+        String safeActiveOffer = activeOfferSummary == null ? "" : activeOfferSummary;
+        String safeStockSummary = stockSummary == null ? "" : stockSummary;
+        String safeLastItem = lastRequestedItemId == null ? "" : lastRequestedItemId;
+        String safeInitialIntent = initialIntent == null ? "none" : initialIntent;
+        String safeInitialItem = initialItemId == null ? "" : initialItemId;
+        String safeInitialCounter = initialCounterTotalPrice == null ? "null" : String.valueOf(initialCounterTotalPrice);
+
+        return "You are a Minecraft trade intent classifier.\n"
+                + "Decide the single best trade intent for the player's message.\n"
+                + "Player utterance: " + safePlayerText + "\n"
+                + "Active offer: " + safeActiveOffer + "\n"
+                + "Stock summary: " + safeStockSummary + "\n"
+                + "Last requested item id: " + safeLastItem + "\n"
+                + "Initial classification: intent=" + safeInitialIntent
+                + ", item_id=" + safeInitialItem
+                + ", quantity=" + initialQuantity
+                + ", counter_total_price=" + safeInitialCounter
+                + ", confidence=" + initialConfidence + "\n"
+                + "Rules:\n"
+                + "- Use request_offer when player asks to receive/get/buy now (e.g. 'give me 1 stick', 'can I get 2 sticks', 'i want 1 stick').\n"
+                + "- Use inquire_stock only for availability/count questions (e.g. 'do you have sticks', 'how many sticks').\n"
+                + "- If follow-up omits item and last requested item id exists, reuse it.\n"
+                + "- Use none only if unrelated to trade.\n"
+                + "Return ONLY this JSON object with no extra text:\n"
+                + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
+                + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
     }
 
     private JsonObject memoryToJson(MemoryContext memory) {

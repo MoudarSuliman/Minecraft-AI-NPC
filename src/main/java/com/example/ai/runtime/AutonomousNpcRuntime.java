@@ -96,7 +96,7 @@ public final class AutonomousNpcRuntime {
             String latestEntry = latestInstruction(memory);
             String speaker = speakerFromEntry(latestEntry);
             String latestInstruction = instructionTextFromEntry(latestEntry);
-            WorldSnapshot snapshot = perceptionService.captureFallback(handle.npcName());
+            WorldSnapshot snapshot = actionExecutor.captureWorldSnapshot(server, npcId, handle.npcName());
 
             if (actionExecutor.tryHandleRecipeInstruction(
                     server,

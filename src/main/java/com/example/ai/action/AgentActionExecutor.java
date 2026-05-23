@@ -3,6 +3,7 @@ package com.example.ai.action;
 import com.example.ai.intent.AgentDecision;
 import com.example.ai.llm.LlmRouter;
 import com.example.ai.memory.MemoryContext;
+import com.example.ai.perception.SemanticPerceptionService;
 import com.example.ai.perception.WorldSnapshot;
 import com.example.ai.prompt.PromptFactory;
 import com.example.ai.trade.ParsedTradeIntent;
@@ -11,7 +12,6 @@ import com.example.ai.trade.TradeNegotiationParser;
 import com.example.ai.trade.TradeCounterResult;
 import com.example.ai.trade.TradeIntentClassifierDraft;
 import com.example.ai.trade.TradeIntentClassifierParser;
-import com.example.ai.trade.TradeIntentParser;
 import com.example.ai.trade.TradeIntentType;
 import com.example.ai.trade.TradeOffer;
 import com.example.ai.trade.TradeOfferEngine;
@@ -37,22 +37,20 @@ import org.slf4j.Logger;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 public final class AgentActionExecutor {
-    private static final Pattern FOR_BLOCKS_COUNT_PATTERN = Pattern.compile("\\bfor\\s+(\\d+)\\s+blocks?\\b");
-    private static final Pattern LEADING_BLOCK_COUNT_PATTERN = Pattern.compile("\\b(\\d+)\\s+[a-z_]+\\s+blocks?\\b");
-    private static final Pattern EMERALD_AMOUNT_PATTERN = Pattern.compile("\\b(\\d+)\\s+emeralds?\\b");
     private static final int CHEST_SCAN_RADIUS = 16;
     private static final int MINE_SCAN_RADIUS = 8;
     private static final int TRADE_SCAN_RADIUS = 18;
+    private static final double TRADE_INTENT_CONFIDENCE_THRESHOLD = 0.6;
+    private static final boolean TRADE_DEBUG_CHAT = true;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
     private static final long TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS = 45_000L;
     private static final double OWNER_IDLE_RADIUS_SQR = 36.0;   // 6 blocks
@@ -63,8 +61,8 @@ public final class AgentActionExecutor {
     private final Logger logger;
     private final PromptFactory promptFactory;
     private final LlmRouter llmRouter;
+    private final SemanticPerceptionService perceptionService = new SemanticPerceptionService();
     private final TradeOfferEngine tradeOfferEngine = TradeOfferEngine.defaultEngine();
-    private final TradeIntentParser tradeIntentParser = new TradeIntentParser();
     private final TradeIntentClassifierParser tradeIntentClassifierParser = new TradeIntentClassifierParser();
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
@@ -99,6 +97,115 @@ public final class AgentActionExecutor {
         });
         logger.debug("Queued action for {}: {}", npcId, action);
         return true;
+    }
+
+    public WorldSnapshot captureWorldSnapshot(MinecraftServer server, UUID npcId, String fallbackName) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel level)) {
+            return perceptionService.captureFallback(fallbackName);
+        }
+
+        BlockPos center = villager.blockPosition();
+        Map<String, Integer> nearbyBlocks = scanNearbyBlocks(level, center, 8);
+        List<WorldSnapshot.SeenEntity> nearbyEntities = scanNearbyEntities(level, villager, 16);
+        WorldSnapshot.EnvironmentContext environment = buildEnvironmentContext(level, center, nearbyEntities);
+        return perceptionService.capture(
+                fallbackName,
+                new WorldSnapshot.Position(center.getX(), center.getY(), center.getZ()),
+                nearbyBlocks,
+                nearbyEntities,
+                environment
+        );
+    }
+
+    private Map<String, Integer> scanNearbyBlocks(ServerLevel level, BlockPos center, int radius) {
+        Map<String, Integer> histogram = new LinkedHashMap<>();
+        int radiusSqr = radius * radius;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    if (center.distSqr(pos) > radiusSqr) {
+                        continue;
+                    }
+                    var state = level.getBlockState(pos);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                    histogram.merge(blockId, 1, Integer::sum);
+                }
+            }
+        }
+        return histogram;
+    }
+
+    private List<WorldSnapshot.SeenEntity> scanNearbyEntities(ServerLevel level, Villager villager, int radius) {
+        List<WorldSnapshot.SeenEntity> entities = new ArrayList<>();
+        for (Entity entity : level.getEntities(villager, villager.getBoundingBox().inflate(radius))) {
+            if (entity == villager) {
+                continue;
+            }
+            double distance = entity.distanceTo(villager);
+            String type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+            String name = entity.getDisplayName().getString();
+            entities.add(new WorldSnapshot.SeenEntity(type, name, distance));
+        }
+        entities.sort(Comparator.comparingDouble(WorldSnapshot.SeenEntity::distance));
+        if (entities.size() > 25) {
+            return new ArrayList<>(entities.subList(0, 25));
+        }
+        return entities;
+    }
+
+    private WorldSnapshot.EnvironmentContext buildEnvironmentContext(ServerLevel level, BlockPos center, List<WorldSnapshot.SeenEntity> nearbyEntities) {
+        String biome = level.getBiome(center)
+                .unwrapKey()
+                .map(Object::toString)
+                .orElse(level.dimension().toString());
+        long timeOfDay = level.getGameTime() % 24000L;
+        boolean isNight = timeOfDay >= 13000L && timeOfDay <= 23000L;
+        String weather;
+        if (level.isThundering()) {
+            weather = "thunder";
+        } else if (level.isRaining()) {
+            weather = "rain";
+        } else {
+            weather = "clear";
+        }
+        int hostileCount = 0;
+        for (WorldSnapshot.SeenEntity entity : nearbyEntities) {
+            if (isLikelyHostile(entity.type())) {
+                hostileCount += 1;
+            }
+        }
+        int light = level.getMaxLocalRawBrightness(center);
+        String threatLevel;
+        if (hostileCount >= 2 || (hostileCount >= 1 && (isNight || light < 7))) {
+            threatLevel = "high";
+        } else if (hostileCount >= 1 || light < 7 || isNight) {
+            threatLevel = "medium";
+        } else {
+            threatLevel = "low";
+        }
+        return new WorldSnapshot.EnvironmentContext(biome, timeOfDay, isNight, weather, threatLevel);
+    }
+
+    private boolean isLikelyHostile(String entityType) {
+        String lower = entityType.toLowerCase(Locale.ROOT);
+        return lower.contains("creeper")
+                || lower.contains("zombie")
+                || lower.contains("skeleton")
+                || lower.contains("spider")
+                || lower.contains("witch")
+                || lower.contains("slime")
+                || lower.contains("enderman")
+                || lower.contains("blaze")
+                || lower.contains("drowned")
+                || lower.contains("warden")
+                || lower.contains("pillager")
+                || lower.contains("vindicator")
+                || lower.contains("phantom");
     }
 
     public boolean applyNextAction(MinecraftServer server, UUID npcId, String fallbackName) {
@@ -371,58 +478,23 @@ public final class AgentActionExecutor {
             return true;
         }
 
-        ParsedTradeIntent tradeIntent = tradeIntentParser.parse(instruction);
-        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(villager, player, instruction, session, tradeIntent, snapshot, memory, npcId);
-        if (llmClassified.type() != TradeIntentType.NONE && llmClassified.type() != tradeIntent.type()) {
-            tradeIntent = llmClassified;
-        }
-        if (tradeIntent.type() == TradeIntentType.INQUIRE_STOCK
-                && isBarePriceInquiry(instruction)
-                && session.lastRequestedItemId != null
-                && !session.lastRequestedItemId.isBlank()) {
-            tradeIntent = new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, session.lastRequestedItemId, 1, null);
-        }
-        if (tradeIntent.type() == TradeIntentType.COUNTER_OFFER
-                && session.activeOffer == null
-                && session.lastRequestedItemId != null
-                && !session.lastRequestedItemId.isBlank()) {
-            int quantity = extractRequestedQuantityFromCounterPhrase(instruction);
-            tradeIntent = new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, session.lastRequestedItemId, quantity, null);
-        }
-        if (tradeIntent.type() == TradeIntentType.NONE && session.activeOffer != null) {
-            Integer explicitCounter = extractEmeraldCounterAmount(instruction);
-            if (explicitCounter != null) {
-                tradeIntent = new ParsedTradeIntent(TradeIntentType.COUNTER_OFFER, "", 0, explicitCounter);
-            }
-        }
-        if (tradeIntent.type() == TradeIntentType.NONE
-                && session.activeOffer != null
-                && mentionsOfferItem(instruction, session.activeOffer.itemId())) {
-            int quantity = extractRequestedQuantityFromItemPhrase(instruction);
-            if (quantity > 0) {
-                tradeIntent = new ParsedTradeIntent(
-                        TradeIntentType.REQUEST_OFFER,
-                        session.activeOffer.itemId(),
-                        quantity,
-                        null
-                );
-            }
-        }
-        if (tradeIntent.type() == TradeIntentType.NONE
-                && session.activeOffer != null
-                && isLikelyNonTradeTaskUtterance(instruction)) {
-            session.lastInteractionAtMillis = now;
-            speakAsNpc(server, villager, fallbackName, "We still have an active offer: " + summarizeOffer(session.activeOffer) + ". Say deal, no, or your counter in emeralds.");
-            return true;
-        }
-        lastTradeIntentByNpc.put(npcId, tradeIntent.type().name().toLowerCase());
-        boolean engageTrade = tradeIntent.type() != TradeIntentType.NONE
-                || session.activeOffer != null
-                || isLikelyTradeUtterance(instruction)
-                || isTradeFollowUpUtterance(instruction, session);
-        if (!engageTrade) {
+        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(villager, player, instruction, session, snapshot, memory, npcId);
+        ParsedTradeIntent tradeIntent = resolveTradeIntent(llmClassified, session);
+        logger.info(
+                "[TRADE-DEBUG] npc={} utterance='{}' llm_intent={} resolved_intent={} resolved_item={} resolved_qty={} resolved_counter={}",
+                fallbackName,
+                instruction,
+                llmClassified.type().name().toLowerCase(Locale.ROOT),
+                tradeIntent.type().name().toLowerCase(Locale.ROOT),
+                tradeIntent.itemId(),
+                tradeIntent.quantity(),
+                tradeIntent.counterTotalPrice()
+        );
+        if (tradeIntent.type() == TradeIntentType.NONE && session.activeOffer == null) {
             return false;
         }
+        lastTradeIntentByNpc.put(npcId, tradeIntent.type().name().toLowerCase());
+        boolean engageTrade = tradeIntent.type() != TradeIntentType.NONE || session.activeOffer != null;
 
         // For accept/decline, don't call LLM - these are binary outcomes
         if (tradeIntent.type() == TradeIntentType.ACCEPT_OFFER) {
@@ -467,7 +539,7 @@ public final class AgentActionExecutor {
         session.lastInteractionAtMillis = now;
 
         return switch (tradeIntent.type()) {
-            case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, session, now, draft);
+            case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, session, tradeIntent, now, draft);
             case INQUIRE_PAYMENT -> handlePaymentInquiry(server, villager, fallbackName, draft);
             case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, villager, fallbackName, session, draft);
             case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, session, tradeIntent, now, draft);
@@ -507,10 +579,30 @@ public final class AgentActionExecutor {
             Villager villager,
             String fallbackName,
             TradeSession session,
+            ParsedTradeIntent tradeIntent,
             long now,
             TradeNegotiationDraft draft
     ) {
         ServerLevel level = (ServerLevel) villager.level();
+        String requestedItemId = tradeIntent == null ? "" : tradeIntent.itemId();
+        if (requestedItemId != null && !requestedItemId.isBlank() && tradeOfferEngine.supportsItem(requestedItemId)) {
+            Item requestedItem = resolveKnownItem(requestedItemId);
+            if (requestedItem != null) {
+                int stock = countItemInNearbyChests(level, villager.blockPosition(), requestedItem, TRADE_SCAN_RADIUS);
+                session.lastRequestedItemId = requestedItemId;
+                session.lastRequestedQuantity = 1;
+                if (stock <= 0) {
+                    speakAsNpc(server, villager, fallbackName, "I don't have that in stock right now.");
+                    return true;
+                }
+                TradeOffer preview = tradeOfferEngine.quote(requestedItemId, 1, stock, 0, false, now);
+                String response = "I currently have " + stock + " " + readableItemName(requestedItemId)
+                        + " in stock at " + preview.unitPrice() + " emerald each.";
+                speakAsNpc(server, villager, fallbackName, groundedStockText(draft.responseText(), response));
+                return true;
+            }
+        }
+
         List<String> offers = new ArrayList<>();
         String firstItemIdWithStock = null;
         for (String itemId : tradeOfferEngine.supportedItems()) {
@@ -1912,156 +2004,11 @@ public final class AgentActionExecutor {
         return false;
     }
 
-    private boolean isLikelyTradeUtterance(String text) {
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        String lower = text.toLowerCase();
-        return lower.contains("buy")
-                || lower.contains("sell")
-                || lower.contains("trade")
-                || lower.contains("emerald")
-                || lower.contains("offer")
-                || lower.contains("deal")
-                || lower.contains("price")
-                || lower.contains("stock")
-                || lower.contains("how")
-                || lower.contains("much")
-                || lower.contains("cost")
-                || lower.contains("charge");
-    }
-
-    private boolean isBarePriceInquiry(String text) {
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        String lower = text.toLowerCase();
-        return (lower.contains("how much") || lower.contains("what price") || lower.contains("cost"))
-                && !lower.contains("buy")
-                && !lower.contains("give me")
-                && !lower.contains("can i get");
-    }
-
-    private boolean isTradeFollowUpUtterance(String text, TradeSession session) {
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        if (session == null) {
-            return false;
-        }
-        long age = System.currentTimeMillis() - session.lastInteractionAtMillis;
-        if (age > 30_000L) {
-            return false;
-        }
-        String trimmed = text.trim().toLowerCase();
-        return trimmed.equals("yes")
-                || trimmed.equals("okay")
-                || trimmed.equals("ok")
-                || trimmed.equals("deal")
-                || trimmed.equals("sure")
-                || trimmed.contains("that's what i said")
-                || trimmed.contains("thats what i said");
-    }
-
-    private boolean isLikelyNonTradeTaskUtterance(String text) {
-        if (text == null || text.isBlank()) {
-            return false;
-        }
-        String lower = text.toLowerCase(Locale.ROOT);
-        return lower.contains("mine")
-                || lower.contains("dig")
-                || lower.contains("break")
-                || lower.contains("fetch")
-                || lower.contains("bring")
-                || lower.contains("get me")
-                || lower.contains("build")
-                || lower.contains("craft")
-                || lower.contains("move");
-    }
-
-    private int extractRequestedQuantityFromCounterPhrase(String text) {
-        if (text == null || text.isBlank()) {
-            return 1;
-        }
-        String lower = text.toLowerCase();
-        Matcher matcher = FOR_BLOCKS_COUNT_PATTERN.matcher(lower);
-        if (matcher.find()) {
-            try {
-                return Math.max(1, Integer.parseInt(matcher.group(1)));
-            } catch (NumberFormatException ignored) {
-                return 1;
-            }
-        }
-        matcher = LEADING_BLOCK_COUNT_PATTERN.matcher(lower);
-        if (matcher.find()) {
-            try {
-                return Math.max(1, Integer.parseInt(matcher.group(1)));
-            } catch (NumberFormatException ignored) {
-                return 1;
-            }
-        }
-        return 1;
-    }
-
-    private int extractRequestedQuantityFromItemPhrase(String text) {
-        if (text == null || text.isBlank()) {
-            return 0;
-        }
-        Matcher matcher = Pattern.compile("\\b(\\d+)\\s*(x\\s*)?[a-z_]+\\b").matcher(text.toLowerCase(Locale.ROOT));
-        if (!matcher.find()) {
-            return 0;
-        }
-        try {
-            return Math.max(1, Integer.parseInt(matcher.group(1)));
-        } catch (NumberFormatException ignored) {
-            return 0;
-        }
-    }
-
-    private boolean mentionsOfferItem(String text, String itemId) {
-        if (text == null || text.isBlank() || itemId == null || itemId.isBlank()) {
-            return false;
-        }
-        String lower = text.toLowerCase(Locale.ROOT);
-        return switch (itemId) {
-            case "minecraft:stick" -> lower.contains("stick");
-            case "minecraft:grass_block" -> lower.contains("grass block") || lower.contains("grass_block");
-            case "minecraft:glass" -> lower.contains("glass");
-            case "minecraft:cobblestone" -> lower.contains("cobblestone");
-            case "minecraft:oak_log" -> lower.contains("oak log") || lower.contains("oak_log") || lower.contains("log");
-            case "minecraft:oak_planks" -> lower.contains("oak plank") || lower.contains("oak_planks") || lower.contains("plank");
-            case "minecraft:stone" -> lower.contains("stone");
-            case "minecraft:dirt" -> lower.contains("dirt");
-            case "minecraft:sand" -> lower.contains("sand");
-            default -> {
-                String normalized = itemId.startsWith("minecraft:") ? itemId.substring("minecraft:".length()) : itemId;
-                normalized = normalized.replace('_', ' ');
-                yield lower.contains(normalized);
-            }
-        };
-    }
-
-    private Integer extractEmeraldCounterAmount(String text) {
-        if (text == null || text.isBlank()) {
-            return null;
-        }
-        Matcher matcher = EMERALD_AMOUNT_PATTERN.matcher(text.toLowerCase());
-        if (!matcher.find()) {
-            return null;
-        }
-        try {
-            return Integer.parseInt(matcher.group(1));
-        } catch (NumberFormatException ignored) {
-            return null;
-        }
-    }
-
     private ParsedTradeIntent classifyTradeIntentWithLlm(
             Villager villager,
             ServerPlayer player,
             String instruction,
             TradeSession session,
-            ParsedTradeIntent parserIntent,
             WorldSnapshot snapshot,
             MemoryContext memory,
             UUID npcId
@@ -2072,24 +2019,81 @@ public final class AgentActionExecutor {
                 instruction,
                 session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
                 tradeStockSummary(villager),
-                parserIntent.type().name().toLowerCase(Locale.ROOT),
                 snapshot,
                 memory
         );
         tradeLlmInFlightByNpc.put(npcId, true);
         TradeIntentClassifierDraft classified;
+        String rawClassified;
         try {
-            classified = tradeIntentClassifierParser.parse(llmRouter.generate(prompt));
+            rawClassified = llmRouter.generate(prompt);
+            classified = tradeIntentClassifierParser.parse(rawClassified);
+            if (classified.intent() == TradeIntentType.NONE) {
+                String recoveryPrompt = promptFactory.tradeIntentRecoveryPrompt(
+                        instruction,
+                        session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
+                        tradeStockSummary(villager),
+                        session.lastRequestedItemId
+                );
+                String recoveryRaw = llmRouter.generate(recoveryPrompt);
+                TradeIntentClassifierDraft recovered = tradeIntentClassifierParser.parse(recoveryRaw);
+                rawClassified = recoveryRaw;
+                if (recovered.intent() != TradeIntentType.NONE) {
+                    classified = recovered;
+                }
+            }
         } finally {
             tradeLlmInFlightByNpc.put(npcId, false);
         }
-        if (classified.confidence() < 0.6) {
+        if (classified.intent() != TradeIntentType.NONE && classified.confidence() <= 0.0) {
+            classified = new TradeIntentClassifierDraft(
+                    classified.intent(),
+                    classified.itemId(),
+                    classified.quantity(),
+                    classified.counterTotalPrice(),
+                    0.7
+            );
+        }
+        logger.info(
+                "[TRADE-DEBUG] npc={} trade_intent_llm intent={} confidence={} item={} quantity={} counter={} active_offer_present={} raw={}",
+                villager.getName().getString(),
+                classified.intent().name().toLowerCase(Locale.ROOT),
+                classified.confidence(),
+                classified.itemId(),
+                classified.quantity(),
+                classified.counterTotalPrice(),
+                session.activeOffer != null,
+                rawClassified == null ? "" : rawClassified.replace('\n', ' ').replace('\r', ' ')
+        );
+        if (TRADE_DEBUG_CHAT) {
+            player.sendSystemMessage(Component.literal(String.format(
+                    Locale.ROOT,
+                    "[LLM NPC][DEBUG] trade-intent LLM: intent=%s confidence=%.2f item=%s qty=%d counter=%s",
+                    classified.intent().name().toLowerCase(Locale.ROOT),
+                    classified.confidence(),
+                    classified.itemId() == null || classified.itemId().isBlank() ? "-" : classified.itemId(),
+                    classified.quantity(),
+                    classified.counterTotalPrice() == null ? "-" : classified.counterTotalPrice()
+            )));
+        }
+        if (classified.intent() == TradeIntentType.NONE) {
+            logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: none intent", villager.getName().getString());
             return ParsedTradeIntent.none();
         }
+        if (classified.confidence() < TRADE_INTENT_CONFIDENCE_THRESHOLD) {
+            logger.info(
+                    "[TRADE-DEBUG] npc={} trade_intent_llm low confidence {} < {}, proceeding because intent is non-none",
+                    villager.getName().getString(),
+                    classified.confidence(),
+                    TRADE_INTENT_CONFIDENCE_THRESHOLD
+            );
+        }
         if (classified.intent() == TradeIntentType.ACCEPT_OFFER && session.activeOffer == null) {
+            logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: accept_offer without active offer", villager.getName().getString());
             return ParsedTradeIntent.none();
         }
         if (classified.intent() == TradeIntentType.COUNTER_OFFER && session.activeOffer == null) {
+            logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: counter_offer without active offer", villager.getName().getString());
             return ParsedTradeIntent.none();
         }
         String itemId = classified.itemId();
@@ -2103,6 +2107,46 @@ public final class AgentActionExecutor {
             counter = null;
         }
         return new ParsedTradeIntent(classified.intent(), itemId == null ? "" : itemId, quantity, counter);
+    }
+
+    private ParsedTradeIntent resolveTradeIntent(ParsedTradeIntent llmIntent, TradeSession session) {
+        if (llmIntent.type() == TradeIntentType.NONE) {
+            long age = System.currentTimeMillis() - session.lastInteractionAtMillis;
+            if (age <= 60_000L && session.lastRequestedItemId != null && !session.lastRequestedItemId.isBlank()) {
+                return new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, session.lastRequestedItemId, 1, null);
+            }
+            if (age <= 60_000L && session.activeOffer != null) {
+                return new ParsedTradeIntent(TradeIntentType.INQUIRE_SESSION_STATUS, "", 0, null);
+            }
+            return ParsedTradeIntent.none();
+        }
+        String itemId = llmIntent.itemId();
+        if ((itemId == null || itemId.isBlank())
+                && (llmIntent.type() == TradeIntentType.REQUEST_OFFER || llmIntent.type() == TradeIntentType.INQUIRE_STOCK)
+                && session.lastRequestedItemId != null
+                && !session.lastRequestedItemId.isBlank()) {
+            itemId = session.lastRequestedItemId;
+        }
+
+        int quantity = llmIntent.quantity();
+        if (quantity <= 0) {
+            quantity = 1;
+        }
+
+        Integer counter = llmIntent.counterTotalPrice();
+        if (llmIntent.type() != TradeIntentType.COUNTER_OFFER) {
+            counter = null;
+        }
+        if (counter != null && counter <= 0) {
+            counter = null;
+        }
+
+        return new ParsedTradeIntent(
+                llmIntent.type(),
+                itemId == null ? "" : itemId,
+                quantity,
+                counter
+        );
     }
 
     private void notifyNearbyPlayers(MinecraftServer server, Villager villager, String text) {
