@@ -123,6 +123,27 @@ public final class PromptFactory {
         return envelope.toString();
     }
 
+    public String relationshipGreetingPrompt(
+            String npcName,
+            String playerName,
+            MemoryContext memory
+    ) {
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("task", "relationship_greeting");
+        envelope.addProperty("npc_name", npcName);
+        envelope.addProperty("player_name", playerName);
+        envelope.add("memory", memoryToJson(memory));
+        envelope.addProperty("format", "{\"response_text\":\"...\"}");
+        envelope.addProperty("constraints",
+                "Return strict JSON only. Keep response_text short (max 2 sentences), warm, and natural. "
+                        + "The greeting MUST start with 'Welcome back'. "
+                        + "Pick one meaningful topic from memory.long_term that reflects a concrete prior task, objective, or event. "
+                        + "Avoid trivial confirmations like 'yes', 'ok', 'deal', 'sure', or generic trade chatter. "
+                        + "Reference the chosen topic as something discussed last time without inventing new facts. "
+                        + "Do not mention internal memory or JSON.");
+        return envelope.toString();
+    }
+
     public String tradeIntentClassifierPrompt(
             String npcName,
             String playerName,

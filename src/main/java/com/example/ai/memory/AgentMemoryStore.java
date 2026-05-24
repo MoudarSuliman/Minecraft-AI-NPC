@@ -3,7 +3,9 @@ package com.example.ai.memory;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.slf4j.Logger;
 
 import java.io.IOException;
@@ -27,6 +29,7 @@ public final class AgentMemoryStore {
     private final Map<UUID, List<MemoryEntry>> shortTerm = new ConcurrentHashMap<>();
     private final Map<UUID, List<MemoryEntry>> working = new ConcurrentHashMap<>();
     private final Map<UUID, List<MemoryEntry>> longTerm = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> loaded = new ConcurrentHashMap<>();
 
     private AgentMemoryStore(Logger logger, Path basePath) {
         this.logger = logger;
@@ -52,6 +55,7 @@ public final class AgentMemoryStore {
     }
 
     public MemoryContext getContext(UUID npcId) {
+        ensureLoaded(npcId);
         List<MemoryEntry> shortList = new ArrayList<>(shortTerm.getOrDefault(npcId, List.of()));
         List<MemoryEntry> workingList = new ArrayList<>(working.getOrDefault(npcId, List.of()));
         List<MemoryEntry> longList = longTerm.getOrDefault(npcId, List.of()).stream()
@@ -62,6 +66,7 @@ public final class AgentMemoryStore {
     }
 
     private void append(Map<UUID, List<MemoryEntry>> target, UUID npcId, MemoryEntry entry, int maxSize) {
+        ensureLoaded(npcId);
         target.compute(npcId, (id, list) -> {
             List<MemoryEntry> safe = list == null ? new ArrayList<>() : new ArrayList<>(list);
             safe.add(entry);
@@ -83,6 +88,43 @@ public final class AgentMemoryStore {
         } catch (IOException e) {
             logger.warn("Failed to persist memory for {}", npcId, e);
         }
+    }
+
+    private void ensureLoaded(UUID npcId) {
+        if (loaded.putIfAbsent(npcId, true) != null) {
+            return;
+        }
+        Path file = basePath.resolve(npcId + ".json");
+        if (!Files.exists(file)) {
+            return;
+        }
+        try {
+            JsonObject root = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+            shortTerm.put(npcId, deserializeList(root.getAsJsonArray("short_term")));
+            working.put(npcId, deserializeList(root.getAsJsonArray("working")));
+            longTerm.put(npcId, deserializeList(root.getAsJsonArray("long_term")));
+        } catch (Exception e) {
+            logger.warn("Failed to load memory for {}", npcId, e);
+        }
+    }
+
+    private List<MemoryEntry> deserializeList(JsonArray array) {
+        List<MemoryEntry> list = new ArrayList<>();
+        if (array == null) {
+            return list;
+        }
+        for (JsonElement element : array) {
+            if (!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject json = element.getAsJsonObject();
+            String type = json.has("type") ? json.get("type").getAsString() : "unknown";
+            long timestamp = json.has("timestamp") ? json.get("timestamp").getAsLong() : System.currentTimeMillis();
+            String content = json.has("content") ? json.get("content").getAsString() : "";
+            double salience = json.has("salience") ? json.get("salience").getAsDouble() : 0.5;
+            list.add(new MemoryEntry(type, timestamp, content, salience));
+        }
+        return list;
     }
 
     private JsonArray serializeList(List<MemoryEntry> list) {

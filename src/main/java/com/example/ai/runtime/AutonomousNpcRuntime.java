@@ -80,8 +80,9 @@ public final class AutonomousNpcRuntime {
         long now = System.currentTimeMillis();
         for (AgentHandle handle : agents.values()) {
             UUID npcId = handle.npcId();
+            MemoryContext memory = memoryStore.getContext(npcId);
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
-            actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId());
+            actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
             boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
@@ -92,7 +93,6 @@ public final class AutonomousNpcRuntime {
                 continue;
             }
 
-            MemoryContext memory = memoryStore.getContext(npcId);
             String latestEntry = latestInstruction(memory);
             String speaker = speakerFromEntry(latestEntry);
             String latestInstruction = instructionTextFromEntry(latestEntry);

@@ -301,7 +301,13 @@ public final class AgentActionExecutor {
         }
     }
 
-    public void maybeSendTradeGreeting(MinecraftServer server, UUID npcId, String fallbackName, UUID ownerPlayerId) {
+    public void maybeSendTradeGreeting(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            UUID ownerPlayerId,
+            MemoryContext memory
+    ) {
         if (ownerPlayerId == null) {
             return;
         }
@@ -338,8 +344,16 @@ public final class AgentActionExecutor {
             return;
         }
 
+        boolean isFirstContactAfterJoin = session.lastInteractionAtMillis == 0L;
         nextTradeGreetingAt.put(key, now + TRADE_GREETING_COOLDOWN_MILLIS);
         session.lastInteractionAtMillis = now;
+        String relationshipGreeting = isFirstContactAfterJoin && hasLongTermMemory(memory)
+                ? generateRelationshipGreeting(npcId, villager, owner, memory)
+                : "";
+        if (!relationshipGreeting.isBlank()) {
+            speakAsNpc(server, villager, fallbackName, relationshipGreeting);
+            return;
+        }
         speakAsNpc(server, villager, fallbackName, "You looking to trade?");
     }
 
@@ -2163,6 +2177,46 @@ public final class AgentActionExecutor {
         int dy = a.getY() - b.getY();
         int dz = a.getZ() - b.getZ();
         return (double) dx * dx + (double) dy * dy + (double) dz * dz;
+    }
+
+    private boolean hasLongTermMemory(MemoryContext memory) {
+        return memory != null
+                && memory.longTerm() != null
+                && !memory.longTerm().isEmpty();
+    }
+
+    private String generateRelationshipGreeting(
+            UUID npcId,
+            Villager villager,
+            ServerPlayer owner,
+            MemoryContext memory
+    ) {
+        String fallback = "Welcome back. Last time we spoke, you were working on one of your goals."
+                + " Want to continue from there or trade?";
+        String prompt = promptFactory.relationshipGreetingPrompt(
+                villager.getName().getString(),
+                owner.getName().getString(),
+                memory
+        );
+        tradeLlmInFlightByNpc.put(npcId, true);
+        try {
+            String responseText = parseRecipeResponseText(llmRouter.generate(prompt));
+            return groundedRelationshipGreetingText(responseText, fallback);
+        } finally {
+            tradeLlmInFlightByNpc.put(npcId, false);
+        }
+    }
+
+    private String groundedRelationshipGreetingText(String draftText, String fallback) {
+        if (draftText == null || draftText.isBlank()) {
+            return fallback;
+        }
+        String lower = draftText.toLowerCase(Locale.ROOT);
+        boolean hasWelcomeBack = lower.contains("welcome back");
+        boolean hasTopicHint = lower.contains("last time")
+                || lower.contains("we spoke")
+                || lower.contains("you were");
+        return hasWelcomeBack && hasTopicHint ? draftText : fallback;
     }
 
     private record TradeSessionKey(UUID npcId, UUID playerId) {
