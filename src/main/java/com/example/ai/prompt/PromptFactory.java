@@ -15,17 +15,17 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("has_pending_instruction", hasPendingInstruction);
-        envelope.addProperty("latest_instruction", latestInstruction);
-        envelope.addProperty("expected_intent", expectedIntent);
-        envelope.addProperty("target_hint", targetHint);
-        envelope.addProperty("required_schema",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("has_pending_instruction", hasPendingInstruction);
+        payload.addProperty("latest_instruction", latestInstruction);
+        payload.addProperty("expected_intent", expectedIntent);
+        payload.addProperty("target_hint", targetHint);
+        payload.addProperty("required_schema",
                 "{\"intent\":\"idle|dialogue_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
-        envelope.addProperty("constraints", hasPendingInstruction
+        payload.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
                 + "Choose an actionable intent that advances latest_instruction. "
@@ -41,28 +41,28 @@ public final class PromptFactory {
                 + "If target_hint is non-empty, use it in parameters.block or parameters.item_id. "
                 + "For dialogue_reply, parameters.text is REQUIRED."
                 : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
-        return envelope.toString();
+        return payload.toString();
     }
 
     public String dialoguePrompt(String playerText, WorldSnapshot snapshot, MemoryContext memory) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "dialogue");
-        envelope.addProperty("player_utterance", playerText);
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format", "{\"intent\":\"dialogue_reply\",\"parameters\":{\"text\":\"...\"},\"reasoning\":\"...\",\"priority\":0.0}");
-        return envelope.toString();
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "dialogue");
+        payload.addProperty("player_utterance", playerText);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format", "{\"intent\":\"dialogue_reply\",\"parameters\":{\"text\":\"...\"},\"reasoning\":\"...\",\"priority\":0.0}");
+        return payload.toString();
     }
 
     public String planningPrompt(String objective, WorldSnapshot snapshot, MemoryContext memory) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "planning");
-        envelope.addProperty("objective", objective);
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "planning");
+        payload.addProperty("objective", objective);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format",
                 "{\"intent\":\"build_structure\",\"parameters\":{\"steps\":[{\"intent\":\"move_to\",\"parameters\":{}},{\"intent\":\"place_block\",\"parameters\":{}}]},\"reasoning\":\"...\",\"priority\":0.0}");
-        return envelope.toString();
+        return payload.toString();
     }
 
     public String tradeNegotiationPrompt(
@@ -76,27 +76,27 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "trade_negotiation");
-        envelope.addProperty("npc_name", npcName);
-        envelope.addProperty("player_name", playerName);
-        envelope.addProperty("player_utterance", playerText);
-        envelope.addProperty("mode", mode);
-        envelope.addProperty("active_offer", activeOfferSummary);
-        envelope.addProperty("stock_summary", stockSummary);
-        envelope.addProperty("required_facts", requiredFacts);
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "trade_negotiation");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("player_utterance", playerText);
+        payload.addProperty("mode", mode);
+        payload.addProperty("active_offer", activeOfferSummary);
+        payload.addProperty("stock_summary", stockSummary);
+        payload.addProperty("required_facts", requiredFacts);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format",
                 "{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}");
-        envelope.addProperty("constraints",
+        payload.addProperty("constraints",
                 "Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. "
                         + "CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. "
                         + "Never invent items, prices, or stock. Suggested prices must be integers >= 1. "
                         + "Always reference the actual stock and item names from required_facts. "
                         + "If suggesting a new price, set both suggested_unit_price and suggested_total_price. "
                         + "If counter_total_price is not relevant, omit it or set null.");
-        return envelope.toString();
+        return payload.toString();
     }
 
     public String recipeAssistantPrompt(
@@ -107,20 +107,20 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "recipe_assistant");
-        envelope.addProperty("npc_name", npcName);
-        envelope.addProperty("player_name", playerName);
-        envelope.addProperty("player_utterance", playerText);
-        envelope.addProperty("required_facts", requiredFacts);
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format", "{\"response_text\":\"...\"}");
-        envelope.addProperty("constraints",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "recipe_assistant");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("player_utterance", playerText);
+        payload.addProperty("required_facts", requiredFacts);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
                 "Return strict JSON only. Keep response_text concise and natural. "
                         + "Do not invent quantities, items, stock, or prices not in required_facts. "
                         + "If required_facts includes an active_offer, mention the exact offer and emerald currency.");
-        return envelope.toString();
+        return payload.toString();
     }
 
     public String relationshipGreetingPrompt(
@@ -128,20 +128,50 @@ public final class PromptFactory {
             String playerName,
             MemoryContext memory
     ) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "relationship_greeting");
-        envelope.addProperty("npc_name", npcName);
-        envelope.addProperty("player_name", playerName);
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format", "{\"response_text\":\"...\"}");
-        envelope.addProperty("constraints",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "relationship_greeting");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
                 "Return strict JSON only. Keep response_text short (max 2 sentences), warm, and natural. "
                         + "The greeting MUST start with 'Welcome back'. "
                         + "Pick one meaningful topic from memory.long_term that reflects a concrete prior task, objective, or event. "
                         + "Avoid trivial confirmations like 'yes', 'ok', 'deal', 'sure', or generic trade chatter. "
                         + "Reference the chosen topic as something discussed last time without inventing new facts. "
                         + "Do not mention internal memory or JSON.");
-        return envelope.toString();
+        return payload.toString();
+    }
+
+    public String searchStatusPrompt(
+            String npcName,
+            String playerName,
+            String eventType,
+            String requiredFacts
+    ) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "search_status_dialogue");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("event_type", eventType);
+        payload.addProperty("required_facts", requiredFacts);
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. Keep response_text to one short sentence (max 16 words). "
+                + "Use first-person NPC speech (no system tags). "
+                + "Do not include role labels or narration like 'As a villager'. "
+                + "Do not ask follow-up questions. "
+                + "Do not invent coordinates or targets not in required_facts. "
+                + "If coordinates are in required_facts, repeat them accurately. "
+                + "For search_start acknowledge the target and promise to report back. "
+                + "For target_found you MUST explicitly say the target was found and include the exact location. "
+                + "For beacon_start/beacon_update mention the exact target and location. "
+                + "For search_expand mention the new search radius. "
+                + "For search_failed explicitly say it was not found. "
+                + "For search_cancelled explicitly say the search is cancelled. "
+                + "For search_complete explicitly say the search is complete.");
+        return payload.toString();
     }
 
     public String tradeIntentClassifierPrompt(
@@ -153,19 +183,19 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject envelope = new JsonObject();
-        envelope.addProperty("task", "trade_intent_classifier");
-        envelope.addProperty("npc_name", npcName);
-        envelope.addProperty("player_name", playerName);
-        envelope.addProperty("player_utterance", playerText);
-        envelope.addProperty("active_offer", activeOfferSummary);
-        envelope.addProperty("stock_summary", stockSummary);
-        envelope.add("perception", snapshot.toJson());
-        envelope.add("memory", memoryToJson(memory));
-        envelope.addProperty("format",
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "trade_intent_classifier");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("player_utterance", playerText);
+        payload.addProperty("active_offer", activeOfferSummary);
+        payload.addProperty("stock_summary", stockSummary);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format",
                 "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
                         + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}");
-        envelope.addProperty("constraints",
+        payload.addProperty("constraints",
                 "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
                         + "Treat availability/count/price/payment questions as trade intents. "
                         + "Examples that should map to inquire_stock: 'do you have sticks', 'how many sticks do you have', 'what do you sell'. "
@@ -175,7 +205,7 @@ public final class PromptFactory {
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
                         + "Use intent none only when the utterance is truly unrelated to trade. "
                         + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer.");
-        return envelope.toString();
+        return payload.toString();
     }
 
     public String tradeIntentRecoveryPrompt(
@@ -226,7 +256,6 @@ public final class PromptFactory {
         String safeInitialIntent = initialIntent == null ? "none" : initialIntent;
         String safeInitialItem = initialItemId == null ? "" : initialItemId;
         String safeInitialCounter = initialCounterTotalPrice == null ? "null" : String.valueOf(initialCounterTotalPrice);
-
         return "You are a Minecraft trade intent classifier.\n"
                 + "Decide the single best trade intent for the player's message.\n"
                 + "Player utterance: " + safePlayerText + "\n"

@@ -25,14 +25,17 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Containers;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.npc.villager.Villager;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.level.levelgen.Heightmap;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Method;
@@ -49,6 +52,13 @@ public final class AgentActionExecutor {
     private static final int CHEST_SCAN_RADIUS = 16;
     private static final int MINE_SCAN_RADIUS = 8;
     private static final int TRADE_SCAN_RADIUS = 18;
+    private static final int SEARCH_BASE_RADIUS = 24;
+    private static final int SEARCH_MAX_RADIUS = 96;
+    private static final int SEARCH_BEACON_TICKS = 20 * 30;
+    private static final int SEARCH_SCAN_INTERVAL_TICKS = 40;
+    private static final int SEARCH_PATROL_STALL_TICKS = 40;
+    private static final long SEARCH_STATUS_COOLDOWN_MILLIS = 6_000L;
+    private static final long SEARCH_TRADE_SUPPRESS_MILLIS = 60_000L;
     private static final double TRADE_INTENT_CONFIDENCE_THRESHOLD = 0.6;
     private static final boolean TRADE_DEBUG_CHAT = true;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
@@ -69,6 +79,7 @@ public final class AgentActionExecutor {
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
+    private final Map<UUID, SearchTask> activeSearchTasks = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
@@ -214,6 +225,7 @@ public final class AgentActionExecutor {
             if (activeDeliveries.containsKey(npcId)
                     || activeMineToChest.containsKey(npcId)
                     || activeMineToPlayer.containsKey(npcId)
+                    || activeSearchTasks.containsKey(npcId)
                     || actionOutbox.containsKey(npcId)) {
                 logger.warn("No villager entity found for bound agent {}", npcId);
             }
@@ -247,6 +259,15 @@ public final class AgentActionExecutor {
             return active;
         }
 
+        SearchTask searchTask = activeSearchTasks.get(npcId);
+        if (searchTask != null) {
+            boolean active = advanceSearchTask(server, villager, fallbackName, searchTask);
+            if (!active) {
+                activeSearchTasks.remove(npcId);
+            }
+            return active;
+        }
+
         JsonObject next = pollNextAction(npcId);
         if (next == null) {
             return false;
@@ -274,6 +295,9 @@ public final class AgentActionExecutor {
 
     public void enforceOwnerLeash(MinecraftServer server, UUID npcId, UUID ownerPlayerId, String fallbackName) {
         if (ownerPlayerId == null) {
+            return;
+        }
+        if (activeSearchTasks.containsKey(npcId)) {
             return;
         }
         Villager villager = findVillager(server, npcId);
@@ -456,6 +480,67 @@ public final class AgentActionExecutor {
         );
         String responseText = parseRecipeResponseText(llmRouter.generate(prompt));
         speakAsNpc(server, villager, fallbackName, groundedRecipeText(responseText, fallbackReply.toString(), stickOffer));
+        return true;
+    }
+
+    public boolean tryHandleSearchInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction
+    ) {
+        if (instruction == null || instruction.isBlank()) {
+            return false;
+        }
+        SearchRequest request = parseSearchRequest(instruction);
+        if (request == null) {
+            return false;
+        }
+
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel)) {
+            return false;
+        }
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) {
+            return false;
+        }
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
+            return false;
+        }
+        if (activeSearchTasks.containsKey(npcId)) {
+            speakSearchStatusWithLlm(
+                    server,
+                    villager,
+                    fallbackName,
+                    player.getName().getString(),
+                    "search_already_active",
+                    "target=" + request.label(),
+                    "I am already running a search task."
+            );
+            return true;
+        }
+
+        SearchTask task = new SearchTask(
+                request.label(),
+                request.entityTypeId(),
+                request.requirePinkSheep(),
+                player.getUUID()
+        );
+        task.nextStatusAtMillis = System.currentTimeMillis() + SEARCH_STATUS_COOLDOWN_MILLIS;
+        activeSearchTasks.put(npcId, task);
+        suppressTradeGreeting(npcId, player.getUUID(), SEARCH_TRADE_SUPPRESS_MILLIS);
+        speakSearchStatusWithLlm(
+                server,
+                villager,
+                fallbackName,
+                player.getName().getString(),
+                "search_start",
+                "target=" + request.label(),
+                "Got it. I will search for " + request.label() + " and call out its location when I find it."
+        );
         return true;
     }
 
@@ -993,6 +1078,105 @@ public final class AgentActionExecutor {
         return draftText;
     }
 
+    private void speakSearchStatusWithLlm(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            String playerName,
+            String eventType,
+            String requiredFacts,
+            String fallbackText
+    ) {
+        String prompt = promptFactory.searchStatusPrompt(
+                villager.getName().getString(),
+                playerName == null || playerName.isBlank() ? "player" : playerName,
+                eventType,
+                requiredFacts
+        );
+        tradeLlmInFlightByNpc.put(villager.getUUID(), true);
+        try {
+            String responseText = parseRecipeResponseText(llmRouter.generate(prompt));
+            String grounded = groundedSearchStatusText(responseText, eventType, requiredFacts, fallbackText);
+            speakAsNpc(server, villager, fallbackName, grounded);
+        } finally {
+            tradeLlmInFlightByNpc.put(villager.getUUID(), false);
+        }
+    }
+
+    private String groundedSearchStatusText(
+            String draftText,
+            String eventType,
+            String requiredFacts,
+            String fallback
+    ) {
+        if (draftText == null || draftText.isBlank()) {
+            return fallback;
+        }
+        String lower = draftText.toLowerCase(Locale.ROOT);
+        String event = eventType == null ? "" : eventType.toLowerCase(Locale.ROOT);
+        boolean mentionsSearching = lower.contains("search");
+
+        boolean semanticOk = switch (event) {
+            case "target_found" -> (lower.contains("found") || lower.contains("located")) && !mentionsSearching;
+            case "search_failed" -> lower.contains("could not find")
+                    || lower.contains("couldn't find")
+                    || lower.contains("didn't find")
+                    || lower.contains("not found");
+            case "search_complete" -> lower.contains("complete") || lower.contains("completed") || lower.contains("finished");
+            case "search_cancelled" -> lower.contains("cancel");
+            case "target_lost" -> lower.contains("lost") || lower.contains("resume");
+            case "search_expand" -> lower.contains("radius") || lower.contains("search");
+            case "search_start" -> lower.contains("search");
+            case "beacon_start" -> (lower.contains("found") || lower.contains("beacon") || lower.contains("staying")) && !mentionsSearching;
+            case "beacon_update" -> (lower.contains("still") || lower.contains("beacon") || lower.contains("here")) && !mentionsSearching;
+            default -> true;
+        };
+        if (!semanticOk) {
+            return fallback;
+        }
+
+        if ("target_found".equals(event) || "beacon_start".equals(event) || "beacon_update".equals(event)) {
+            Integer x = extractFactInt(requiredFacts, "x");
+            Integer y = extractFactInt(requiredFacts, "y");
+            Integer z = extractFactInt(requiredFacts, "z");
+            if (x != null && !lower.contains(String.valueOf(x))) {
+                return fallback;
+            }
+            if (y != null && !lower.contains(String.valueOf(y))) {
+                return fallback;
+            }
+            if (z != null && !lower.contains(String.valueOf(z))) {
+                return fallback;
+            }
+        }
+        return draftText;
+    }
+
+    private Integer extractFactInt(String requiredFacts, String key) {
+        if (requiredFacts == null || requiredFacts.isBlank() || key == null || key.isBlank()) {
+            return null;
+        }
+        String token = key + "=";
+        int index = requiredFacts.indexOf(token);
+        if (index < 0) {
+            return null;
+        }
+        int start = index + token.length();
+        int end = requiredFacts.indexOf(';', start);
+        if (end < 0) {
+            end = requiredFacts.length();
+        }
+        String value = requiredFacts.substring(start, end).trim();
+        if (value.isEmpty()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     public boolean isTradeLlmInFlight(UUID npcId) {
         return tradeLlmInFlightByNpc.getOrDefault(npcId, false);
     }
@@ -1016,6 +1200,11 @@ public final class AgentActionExecutor {
         if (delivery != null) {
             return "fetch_delivery:" + delivery.phase.name().toLowerCase(Locale.ROOT)
                     + " (" + delivery.itemId + " x" + delivery.count + ")";
+        }
+        SearchTask searchTask = activeSearchTasks.get(npcId);
+        if (searchTask != null) {
+            return "search:" + searchTask.phase.name().toLowerCase(Locale.ROOT)
+                    + " (" + searchTask.targetLabel + ", r=" + searchTask.searchRadius + ")";
         }
         List<JsonObject> queued = actionOutbox.get(npcId);
         if (queued != null && !queued.isEmpty()) {
@@ -1517,8 +1706,278 @@ public final class AgentActionExecutor {
         };
     }
 
+    private boolean advanceSearchTask(MinecraftServer server, Villager villager, String fallbackName, SearchTask task) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return false;
+        }
+        ServerPlayer requester = server.getPlayerList().getPlayer(task.requesterId);
+        if (requester == null || requester.level() != villager.level()) {
+            speakSearchStatusWithLlm(
+                    server,
+                    villager,
+                    fallbackName,
+                    "player",
+                    "search_cancelled",
+                    "target=" + task.targetLabel,
+                    "Search cancelled because the requester is unavailable."
+            );
+            suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
+            return false;
+        }
+
+        return switch (task.phase) {
+            case FIND_TARGET -> {
+                task.scanTickCounter += 1;
+                if (task.patrolTarget == null
+                        || villager.getNavigation().isDone()
+                        || villager.distanceToSqr(
+                        task.patrolTarget.getX() + 0.5,
+                        task.patrolTarget.getY() + 0.5,
+                        task.patrolTarget.getZ() + 0.5
+                ) <= 6.25
+                        || task.scanTickCounter - task.lastPatrolAssignTick >= SEARCH_SCAN_INTERVAL_TICKS) {
+                    task.patrolTarget = pickSearchPatrolTarget(level, villager.blockPosition(), villager, task.searchRadius);
+                    task.lastPatrolAssignTick = task.scanTickCounter;
+                }
+                if (task.patrolTarget != null) {
+                    double distanceToPatrol = villager.distanceToSqr(
+                            task.patrolTarget.getX() + 0.5,
+                            task.patrolTarget.getY() + 0.5,
+                            task.patrolTarget.getZ() + 0.5
+                    );
+                    boolean moving = villager.getNavigation().moveTo(
+                            task.patrolTarget.getX() + 0.5,
+                            task.patrolTarget.getY() + 0.5,
+                            task.patrolTarget.getZ() + 0.5,
+                            0.9
+                    );
+                    if (!moving) {
+                        task.patrolTarget = null;
+                        task.patrolNoProgressTicks = 0;
+                        task.lastPatrolDistance = Double.MAX_VALUE;
+                    } else {
+                        if (distanceToPatrol + 0.25 < task.lastPatrolDistance) {
+                            task.patrolNoProgressTicks = 0;
+                        } else {
+                            task.patrolNoProgressTicks += 1;
+                        }
+                        task.lastPatrolDistance = distanceToPatrol;
+                        if (task.patrolNoProgressTicks >= SEARCH_PATROL_STALL_TICKS) {
+                            task.patrolTarget = null;
+                            task.patrolNoProgressTicks = 0;
+                            task.lastPatrolDistance = Double.MAX_VALUE;
+                        }
+                    }
+                }
+                if (task.scanTickCounter % SEARCH_SCAN_INTERVAL_TICKS != 0) {
+                    yield true;
+                }
+                Entity target = findNearestSearchTarget(level, villager, task);
+                if (target != null) {
+                    task.targetEntityId = target.getUUID();
+                    task.phase = SearchPhase.MOVE_TO_TARGET;
+                    task.patrolTarget = null;
+                    task.patrolNoProgressTicks = 0;
+                    task.lastPatrolDistance = Double.MAX_VALUE;
+                    BlockPos pos = target.blockPosition();
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "target_found",
+                            "target=" + task.targetLabel + "; x=" + pos.getX() + "; y=" + pos.getY() + "; z=" + pos.getZ(),
+                            "I found " + task.targetLabel + " near " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + "."
+                    );
+                    yield true;
+                }
+                task.failedScans += 1;
+                if (task.searchRadius < SEARCH_MAX_RADIUS) {
+                    task.searchRadius = Math.min(SEARCH_MAX_RADIUS, task.searchRadius + 8);
+                    if (task.searchRadius != task.lastAnnouncedRadius && shouldEmitSearchStatus(task)) {
+                        task.lastAnnouncedRadius = task.searchRadius;
+                        speakSearchStatusWithLlm(
+                                server,
+                                villager,
+                                fallbackName,
+                                requester.getName().getString(),
+                                "search_expand",
+                                "target=" + task.targetLabel + "; radius=" + task.searchRadius,
+                                "Expanding search radius to " + task.searchRadius + " blocks."
+                        );
+                    }
+                    yield true;
+                }
+                if (task.failedScans >= 20) {
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "search_failed",
+                            "target=" + task.targetLabel + "; radius=" + task.searchRadius,
+                            "I could not find " + task.targetLabel + " nearby."
+                    );
+                    suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
+                    yield false;
+                }
+                yield true;
+            }
+            case MOVE_TO_TARGET -> {
+                Entity target = level.getEntity(task.targetEntityId);
+                if (target == null || !target.isAlive() || !matchesSearchTarget(target, task)) {
+                    task.targetEntityId = null;
+                    task.phase = SearchPhase.FIND_TARGET;
+                    task.failedScans = 0;
+                    task.patrolTarget = null;
+                    task.patrolNoProgressTicks = 0;
+                    task.lastPatrolDistance = Double.MAX_VALUE;
+                    yield true;
+                }
+                villager.getNavigation().moveTo(target.getX(), target.getY(), target.getZ(), 0.9);
+                if (villager.distanceToSqr(target) <= 9.0) {
+                    task.phase = SearchPhase.BEACON;
+                    task.beaconTicksRemaining = SEARCH_BEACON_TICKS;
+                    BlockPos pos = target.blockPosition();
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "beacon_start",
+                            "target=" + task.targetLabel + "; x=" + pos.getX() + "; y=" + pos.getY() + "; z=" + pos.getZ(),
+                            "I found " + task.targetLabel + " and I am staying at " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + "."
+                    );
+                }
+                yield true;
+            }
+            case BEACON -> {
+                Entity target = level.getEntity(task.targetEntityId);
+                if (target == null || !target.isAlive() || !matchesSearchTarget(target, task)) {
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "target_lost",
+                            "target=" + task.targetLabel,
+                            "Lost the target. Resuming search."
+                    );
+                    task.targetEntityId = null;
+                    task.phase = SearchPhase.FIND_TARGET;
+                    task.failedScans = 0;
+                    task.searchRadius = Math.max(task.searchRadius, SEARCH_BASE_RADIUS);
+                    yield true;
+                }
+                villager.getNavigation().moveTo(target.getX(), target.getY(), target.getZ(), 0.75);
+                task.beaconTicksRemaining -= 1;
+                if (task.beaconTicksRemaining == 200) {
+                    BlockPos pos = target.blockPosition();
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "beacon_update",
+                            "target=" + task.targetLabel + "; x=" + pos.getX() + "; y=" + pos.getY() + "; z=" + pos.getZ(),
+                            "I am still here with " + task.targetLabel + " at " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + "."
+                    );
+                }
+                if (task.beaconTicksRemaining <= 0) {
+                    speakSearchStatusWithLlm(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "search_complete",
+                            "target=" + task.targetLabel,
+                            "Search complete."
+                    );
+                    suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
+                    yield false;
+                }
+                yield true;
+            }
+            case DONE -> false;
+        };
+    }
+
+    private boolean shouldEmitSearchStatus(SearchTask task) {
+        long now = System.currentTimeMillis();
+        if (now < task.nextStatusAtMillis) {
+            return false;
+        }
+        task.nextStatusAtMillis = now + SEARCH_STATUS_COOLDOWN_MILLIS;
+        return true;
+    }
+
+    private void suppressTradeGreeting(UUID npcId, UUID playerId, long durationMillis) {
+        if (npcId == null || playerId == null || durationMillis <= 0L) {
+            return;
+        }
+        TradeSessionKey key = new TradeSessionKey(npcId, playerId);
+        long until = System.currentTimeMillis() + durationMillis;
+        long current = nextTradeGreetingAt.getOrDefault(key, 0L);
+        if (until > current) {
+            nextTradeGreetingAt.put(key, until);
+        }
+    }
+
+    private Entity findNearestSearchTarget(ServerLevel level, Villager villager, SearchTask task) {
+        List<Entity> nearby = level.getEntities(villager, villager.getBoundingBox().inflate(task.searchRadius));
+        Entity best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (Entity entity : nearby) {
+            if (entity == villager || !entity.isAlive() || !matchesSearchTarget(entity, task)) {
+                continue;
+            }
+            double distance = villager.distanceToSqr(entity);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = entity;
+            }
+        }
+        return best;
+    }
+
+    private BlockPos pickSearchPatrolTarget(ServerLevel level, BlockPos anchor, Villager villager, int radius) {
+        int minOffset = Math.max(6, radius / 3);
+        for (int i = 0; i < 20; i++) {
+            int dx = villager.getRandom().nextInt(radius * 2 + 1) - radius;
+            int dz = villager.getRandom().nextInt(radius * 2 + 1) - radius;
+            if (Math.abs(dx) + Math.abs(dz) < minOffset) {
+                continue;
+            }
+            BlockPos probe = anchor.offset(dx, 0, dz);
+            BlockPos surface = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, probe);
+            BlockPos candidate = surface.above();
+            if (!level.getBlockState(candidate).isAir() || !level.getBlockState(candidate.above()).isAir()) {
+                continue;
+            }
+            return candidate.immutable();
+        }
+        return anchor.above();
+    }
+
+    private boolean matchesSearchTarget(Entity entity, SearchTask task) {
+        String entityTypeId = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+        if (!task.entityTypeId.equals(entityTypeId)) {
+            return false;
+        }
+        if (task.requirePinkSheep) {
+            if (!(entity instanceof Sheep sheep)) {
+                return false;
+            }
+            return sheep.getColor() == DyeColor.PINK;
+        }
+        return true;
+    }
+
     private boolean hasActiveWork(UUID npcId) {
-        if (activeMineToPlayer.containsKey(npcId) || activeMineToChest.containsKey(npcId) || activeDeliveries.containsKey(npcId)) {
+        if (activeMineToPlayer.containsKey(npcId)
+                || activeMineToChest.containsKey(npcId)
+                || activeDeliveries.containsKey(npcId)
+                || activeSearchTasks.containsKey(npcId)) {
             return true;
         }
         List<JsonObject> queued = actionOutbox.get(npcId);
@@ -1782,6 +2241,36 @@ public final class AgentActionExecutor {
             case "minecraft:deepslate_diamond_ore", "deepslate_diamond_ore", "deepslate diamond ore" -> Blocks.DEEPSLATE_DIAMOND_ORE;
             default -> null;
         };
+    }
+
+    private SearchRequest parseSearchRequest(String instruction) {
+        String lower = instruction.toLowerCase(Locale.ROOT);
+        boolean searchVerb = lower.contains("find")
+                || lower.contains("locate")
+                || lower.contains("search for")
+                || lower.contains("look for");
+        if (!searchVerb) {
+            return null;
+        }
+        if (lower.contains("pink sheep")) {
+            return new SearchRequest("a pink sheep", "minecraft:sheep", true);
+        }
+        if (lower.contains("sheep")) {
+            return new SearchRequest("a sheep", "minecraft:sheep", false);
+        }
+        if (lower.contains("villager")) {
+            return new SearchRequest("a villager", "minecraft:villager", false);
+        }
+        if (lower.contains("zombie")) {
+            return new SearchRequest("a zombie", "minecraft:zombie", false);
+        }
+        if (lower.contains("skeleton")) {
+            return new SearchRequest("a skeleton", "minecraft:skeleton", false);
+        }
+        if (lower.contains("creeper")) {
+            return new SearchRequest("a creeper", "minecraft:creeper", false);
+        }
+        return null;
     }
 
     private boolean isRecipeQuery(String lower) {
@@ -2232,6 +2721,20 @@ public final class AgentActionExecutor {
         }
     }
 
+    private record SearchRequest(
+            String label,
+            String entityTypeId,
+            boolean requirePinkSheep
+    ) {
+    }
+
+    private enum SearchPhase {
+        FIND_TARGET,
+        MOVE_TO_TARGET,
+        BEACON,
+        DONE
+    }
+
     private enum MineToChestPhase {
         FIND_OR_MOVE_TO_BLOCK,
         MINE_TARGET_BLOCK,
@@ -2271,6 +2774,32 @@ public final class AgentActionExecutor {
             this.count = count;
             this.chestPos = chestPos;
             this.targetPlayerId = targetPlayerId;
+        }
+    }
+
+    private static final class SearchTask {
+        private final String targetLabel;
+        private final String entityTypeId;
+        private final boolean requirePinkSheep;
+        private final UUID requesterId;
+        private int searchRadius = SEARCH_BASE_RADIUS;
+        private int scanTickCounter = 0;
+        private int failedScans = 0;
+        private int lastAnnouncedRadius = SEARCH_BASE_RADIUS;
+        private long nextStatusAtMillis = 0L;
+        private int lastPatrolAssignTick = 0;
+        private int patrolNoProgressTicks = 0;
+        private double lastPatrolDistance = Double.MAX_VALUE;
+        private UUID targetEntityId;
+        private BlockPos patrolTarget;
+        private SearchPhase phase = SearchPhase.FIND_TARGET;
+        private int beaconTicksRemaining = 0;
+
+        private SearchTask(String targetLabel, String entityTypeId, boolean requirePinkSheep, UUID requesterId) {
+            this.targetLabel = targetLabel;
+            this.entityTypeId = entityTypeId;
+            this.requirePinkSheep = requirePinkSheep;
+            this.requesterId = requesterId;
         }
     }
 

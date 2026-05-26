@@ -117,6 +117,23 @@ public final class AutonomousNpcRuntime {
                 continue;
             }
 
+            if (actionExecutor.tryHandleSearchInstruction(
+                    server,
+                    npcId,
+                    handle.npcName(),
+                    speaker,
+                    handle.ownerPlayerId(),
+                    latestInstruction
+            )) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(
+                        npcId,
+                        MemoryEntry.episodic("search", "Handled search instruction from " + speaker + ": " + latestInstruction)
+                );
+                continue;
+            }
+
             if (actionExecutor.tryHandleTradeInstruction(
                     server,
                     npcId,
