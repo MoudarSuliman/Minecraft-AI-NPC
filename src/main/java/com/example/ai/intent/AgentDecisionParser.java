@@ -37,7 +37,7 @@ public final class AgentDecisionParser {
         JsonObject schema = new JsonObject();
         schema.addProperty("type", "object");
         JsonObject properties = new JsonObject();
-        properties.addProperty("intent", "string enum: idle|dialogue_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure");
+        properties.addProperty("intent", "string enum: idle|dialogue_reply|recipe_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure");
         properties.addProperty("parameters", "object");
         properties.addProperty("reasoning", "string");
         properties.addProperty("priority", "number 0..1");
@@ -60,8 +60,9 @@ public final class AgentDecisionParser {
             case "TRADE_COUNTER" -> AgentIntentType.TRADE_COUNTER;
             case "PLACE_BLOCK" -> AgentIntentType.PLACE_BLOCK;
             case "BREAK_BLOCK" -> AgentIntentType.BREAK_BLOCK;
-            case "BUILD_STRUCTURE" -> AgentIntentType.BUILD_STRUCTURE;
-            default -> AgentIntentType.IDLE;
+                        case "RECIPE_REPLY" -> AgentIntentType.RECIPE_REPLY;
+                        case "BUILD_STRUCTURE" -> AgentIntentType.BUILD_STRUCTURE;
+                        default -> AgentIntentType.IDLE;
         };
     }
 

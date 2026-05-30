@@ -24,7 +24,7 @@ public final class PromptFactory {
         payload.addProperty("expected_intent", expectedIntent);
         payload.addProperty("target_hint", targetHint);
         payload.addProperty("required_schema",
-                "{\"intent\":\"idle|dialogue_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
+                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
         payload.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
@@ -117,9 +117,51 @@ public final class PromptFactory {
         payload.add("memory", memoryToJson(memory));
         payload.addProperty("format", "{\"response_text\":\"...\"}");
         payload.addProperty("constraints",
-                "Return strict JSON only. Keep response_text concise and natural. "
+                "Return strict JSON only. Keep response_text concise (max 2 sentences) and natural. "
                         + "Do not invent quantities, items, stock, or prices not in required_facts. "
-                        + "If required_facts includes an active_offer, mention the exact offer and emerald currency.");
+                        + "You MUST include the recipe requirements from required_facts. "
+                        + "You MUST include the nearby ingredient status from required_facts, but only describe what is actually present. "
+                        + "If required_facts active_offer is \"none\", do NOT claim you can trade or provide items from stock. "
+                        + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.");
+        return payload.toString();
+    }
+
+    public String recipeIntentClassifierPrompt(
+            String npcName,
+            String playerName,
+            String playerText
+    ) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "recipe_intent_classifier");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("player_utterance", playerText);
+        payload.addProperty("format", "{\"is_recipe\":true,\"confidence\":0.0}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. "
+                        + "Set is_recipe=true only when the player is asking about crafting, recipes, or how to make an item (e.g. \\\"what is the recipe for a diamond pickaxe\\\", \\\"how do I craft a furnace\\\"). "
+                        + "Set is_recipe=false for trade requests, stock questions, or unrelated chat.");
+        return payload.toString();
+    }
+
+    public String recipeTargetResolverPrompt(
+            String npcName,
+            String playerName,
+            String playerText
+    ) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "recipe_target_resolution");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("player_utterance", playerText);
+        payload.addProperty("format", "{\"target_phrase\":\"...\",\"item_id\":\"minecraft:...\",\"confidence\":0.0}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. "
+                        + "Extract the intended craftable target from player_utterance. "
+                        + "Set target_phrase to a short noun phrase like 'diamond pickaxe'. "
+                        + "Set item_id only if reasonably sure (minecraft namespace). "
+                        + "If uncertain, keep item_id empty and still provide best target_phrase. "
+                        + "Do not include extra text.");
         return payload.toString();
     }
 
@@ -199,7 +241,10 @@ public final class PromptFactory {
                 "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
                         + "Treat availability/count/price/payment questions as trade intents. "
                         + "Examples that should map to inquire_stock: 'do you have sticks', 'how many sticks do you have', 'what do you sell'. "
+                        + "Location/availability follow-ups like 'where are the sticks', 'where can I find sticks', "
+                        + "'but you said you had sticks' MUST map to inquire_stock, not request_offer. "
                         + "Examples that should map to request_offer: 'can I get 2 sticks', 'offer for 3 glass'. "
+                        + "request_offer only when player explicitly asks to buy/get/trade now. Recipe/crafting/how-to-make questions (e.g. 'what is the recipe for a diamond pickaxe') are NOT trade; return intent none. "
                         + "If active_offer is present and player indicates agreement (deal/yes/sure/go ahead/take it), map to accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
@@ -227,7 +272,8 @@ public final class PromptFactory {
                 + "Last requested item id: " + safeLastItem + "\n"
                 + "Rules:\n"
                 + "- 'do you have X', 'how many X', 'what do you sell' => inquire_stock.\n"
-                + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n"
+                + "- 'where are X', 'where can i find X', 'you said you had X' => inquire_stock.\n"
+                + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n- 'what is the recipe for X', 'how do I craft X', 'how to make X' => none (not trade).\n"
                 + "- active offer + 'deal/yes/sure' => accept_offer.\n"
                 + "- active offer + 'no/nope/not now' => decline_offer.\n"
                 + "- explicit emerald counter => counter_offer with counter_total_price.\n"
@@ -270,6 +316,9 @@ public final class PromptFactory {
                 + "Rules:\n"
                 + "- Use request_offer when player asks to receive/get/buy now (e.g. 'give me 1 stick', 'can I get 2 sticks', 'i want 1 stick').\n"
                 + "- Use inquire_stock only for availability/count questions (e.g. 'do you have sticks', 'how many sticks').\n"
+                + "- Use inquire_stock for location/availability follow-ups (e.g. 'where are the sticks', 'you said you had sticks').\n"
+                + "- Use inquire_session_status for clarification/confusion about the current offer or last trade statement (e.g. 'what does that mean', 'can you explain', 'why 2 emeralds', 'what do you mean').\n- Use none for recipe/crafting/how-to-make questions (e.g. 'what is the recipe for a diamond pickaxe').\n"
+                + "- Do NOT use request_offer for clarification or stock/location follow-ups.\n"
                 + "- If follow-up omits item and last requested item id exists, reuse it.\n"
                 + "- Use none only if unrelated to trade.\n"
                 + "Return ONLY this JSON object with no extra text:\n"
@@ -293,3 +342,6 @@ public final class PromptFactory {
         return array;
     }
 }
+
+
+
