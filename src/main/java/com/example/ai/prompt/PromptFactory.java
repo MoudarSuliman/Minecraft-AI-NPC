@@ -24,7 +24,7 @@ public final class PromptFactory {
         payload.addProperty("expected_intent", expectedIntent);
         payload.addProperty("target_hint", targetHint);
         payload.addProperty("required_schema",
-                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
+                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
         payload.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
@@ -37,6 +37,8 @@ public final class PromptFactory {
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}. "
                 + "If latest_instruction asks to mine and give to player, use intent mine_to_player with "
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}. "
+                + "If latest_instruction asks to scout, explore, check an area, or report back after looking around, use intent scout_explorer with "
+                + "parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
                 + "If expected_intent is non-empty, you MUST set intent exactly to expected_intent. "
                 + "If target_hint is non-empty, use it in parameters.block or parameters.item_id. "
                 + "For dialogue_reply, parameters.text is REQUIRED."
@@ -62,6 +64,101 @@ public final class PromptFactory {
         payload.add("memory", memoryToJson(memory));
         payload.addProperty("format",
                 "{\"intent\":\"build_structure\",\"parameters\":{\"steps\":[{\"intent\":\"move_to\",\"parameters\":{}},{\"intent\":\"place_block\",\"parameters\":{}}]},\"reasoning\":\"...\",\"priority\":0.0}");
+        return payload.toString();
+    }
+
+    public String scoutIntentPrompt(
+            String npcName,
+            String playerName,
+            String playerText,
+            WorldSnapshot snapshot,
+            MemoryContext memory) {
+        String direction = "around";
+        String lower = playerText == null ? "" : playerText.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("north")) direction = "north";
+        else if (lower.contains("south")) direction = "south";
+        else if (lower.contains("east")) direction = "east";
+        else if (lower.contains("west")) direction = "west";
+        return "Classify this Minecraft player instruction.\n"
+                + "Player (" + playerName + ") said to NPC (" + npcName + "): \"" + playerText + "\"\n"
+                + "\n"
+                + "Question: Is the player asking the NPC to physically go to a location, look around, and report back?\n"
+                + "\n"
+                + "YES examples (scout_explorer):\n"
+                + "  'go check out east and let me know what you see' -> scout_explorer, direction=east\n"
+                + "  'go check out east' -> scout_explorer, direction=east\n"
+                + "  'scout north for me' -> scout_explorer, direction=north\n"
+                + "  'go look around and tell me what you find' -> scout_explorer, direction=around\n"
+                + "  'explore to the west' -> scout_explorer, direction=west\n"
+                + "  'go see what is over there and report back' -> scout_explorer, direction=around\n"
+                + "\n"
+                + "NO examples (idle):\n"
+                + "  'do you have sticks' -> idle\n"
+                + "  'how much does glass cost' -> idle\n"
+                + "  'craft me a pickaxe' -> idle\n"
+                + "\n"
+                + "The instruction above contains the word(s): "
+                + (lower.contains("check") ? "check " : "")
+                + (lower.contains("go") ? "go " : "")
+                + (lower.contains("look") ? "look " : "")
+                + (lower.contains("see") ? "see " : "")
+                + (lower.contains("east") || lower.contains("west") || lower.contains("north") || lower.contains("south") ? "direction=" + direction + " " : "")
+                + "\n"
+                + "Return ONLY valid JSON, no extra text:\n"
+                + "{\"intent\":\"scout_explorer\",\"parameters\":{\"direction\":\"" + direction + "\",\"distance\":48,\"focus\":\"anything\",\"return_report\":true},\"reasoning\":\"player asked to explore\",\"priority\":0.8}\n"
+                + "OR if this is NOT a scouting request:\n"
+                + "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"not a scout request\",\"priority\":0.0}";
+    }
+
+    public String scoutReportPrompt(
+            String npcName,
+            String playerName,
+            String objective,
+            String direction,
+            String distance,
+            String surveyFacts) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "scout_report");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("objective", objective);
+        payload.addProperty("direction", direction);
+        payload.addProperty("distance", distance);
+        payload.addProperty("survey_facts", surveyFacts);
+        payload.addProperty("role", "You are a Minecraft NPC who just returned from a scouting mission. Your ONLY job is to report what you observed.");
+        payload.addProperty("format", "{\"response_text\":\"I went <direction> about <distance> blocks. <what you observed based on survey_facts>.\"}");
+        payload.addProperty("constraints",
+                "You MUST return ONLY this exact JSON structure with a single key: {\"response_text\":\"...\"}. "
+                        + "Do NOT use 'intent', 'parameters', 'reasoning', 'priority', or any other key. "
+                        + "Fill response_text with 1-3 short first-person NPC sentences. "
+                        + "Begin by stating the direction and approximate distance you traveled. "
+                        + "Then describe what was found using ONLY the facts in survey_facts: mention biome, threat level, notable entities, and block types. "
+                        + "If the area was calm and safe, say so plainly. "
+                        + "Do not invent locations, structures, mobs, or events not present in survey_facts.");
+        return payload.toString();
+    }
+
+    public String scoutStatusPrompt(
+            String npcName,
+            String playerName,
+            String eventType,
+            String requiredFacts) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "scout_status_dialogue");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("event_type", eventType);
+        payload.addProperty("required_facts", requiredFacts);
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
+                        "Return strict JSON only. Keep response_text to one short sentence. "
+                                + "Use first-person NPC speech. "
+                                + "Do not invent locations, hostiles, or structures. "
+                                + "For scout_start acknowledge the plan and say you will report back. "
+                                + "For scout_return mention that you are coming back or have returned. "
+                                + "For scout_abort say the scout was aborted. "
+                                + "For scout_complete state the scouting is complete. "
+                                + "Only use facts supplied in required_facts.");
         return payload.toString();
     }
 
@@ -272,6 +369,15 @@ public final class PromptFactory {
                         + "'but you said you had sticks' MUST map to inquire_stock, not request_offer. "
                         + "Examples that should map to request_offer: 'can I get 2 sticks', 'offer for 3 glass'. "
                         + "request_offer only when player explicitly asks to buy/get/trade now. Recipe/crafting/how-to-make questions (e.g. 'what is the recipe for a diamond pickaxe') are NOT trade; return intent none. "
+                        + "IMPORTANT - instructions asking the NPC to physically GO somewhere and look around are NOT trade; return intent none. "
+                        + "Examples that MUST return none: "
+                        + "'go check out east and let me know what you see' => none; "
+                        + "'go check out east' => none; "
+                        + "'scout north' => none; "
+                        + "'go look around' => none; "
+                        + "'go see what is there' => none; "
+                        + "'explore that area' => none; "
+                        + "'go and report back' => none. "
                         + "If active_offer is present and player indicates agreement (deal/yes/sure/go ahead/take it), map to accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
@@ -301,11 +407,13 @@ public final class PromptFactory {
                 + "- 'do you have X', 'how many X', 'what do you sell' => inquire_stock.\n"
                 + "- 'where are X', 'where can i find X', 'you said you had X' => inquire_stock.\n"
                 + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n- 'what is the recipe for X', 'how do I craft X', 'how to make X' => none (not trade).\n"
+                + "- 'scout X', 'explore ahead', 'check the area', 'report back', 'go check out east', 'go look around', 'go see what is there', 'go check out X and let me know', 'go have a look' => none (not trade, it is a scouting request).\n"
                 + "- active offer + 'deal/yes/sure' => accept_offer.\n"
                 + "- active offer + 'no/nope/not now' => decline_offer.\n"
                 + "- explicit emerald counter => counter_offer with counter_total_price.\n"
                 + "- If follow-up omits item and last requested item exists, reuse it.\n"
                 + "- Use none only if unrelated to trade.\n"
+                + "- Scout/explore/check area instructions are not trade.\n"
                 + "Return ONLY this JSON object with no extra text:\n"
                 + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
                 + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
@@ -369,6 +477,3 @@ public final class PromptFactory {
         return array;
     }
 }
-
-
-

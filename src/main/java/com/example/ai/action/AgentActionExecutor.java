@@ -36,6 +36,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Method;
@@ -60,6 +61,10 @@ public final class AgentActionExecutor {
     private static final int SEARCH_PATROL_STALL_TICKS = 40;
     private static final long SEARCH_STATUS_COOLDOWN_MILLIS = 6_000L;
     private static final long SEARCH_TRADE_SUPPRESS_MILLIS = 60_000L;
+    private static final int SCOUT_BASE_DISTANCE = 48;
+    private static final int SCOUT_MAX_DISTANCE = 96;
+    private static final int SCOUT_SURVEY_TICKS = 20;
+    private static final long SCOUT_STATUS_COOLDOWN_MILLIS = 6_000L;
     private static final double TRADE_INTENT_CONFIDENCE_THRESHOLD = 0.6;
     private static final boolean TRADE_DEBUG_CHAT = true;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
@@ -81,6 +86,7 @@ public final class AgentActionExecutor {
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
     private final Map<UUID, SearchTask> activeSearchTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, ScoutTask> activeScoutTasks = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
@@ -277,6 +283,15 @@ public final class AgentActionExecutor {
             return active;
         }
 
+        ScoutTask scoutTask = activeScoutTasks.get(npcId);
+        if (scoutTask != null) {
+            boolean active = advanceScoutTask(server, villager, fallbackName, scoutTask);
+            if (!active) {
+                activeScoutTasks.remove(npcId);
+            }
+            return active;
+        }
+
         JsonObject next = pollNextAction(npcId);
         if (next == null) {
             return false;
@@ -291,6 +306,7 @@ public final class AgentActionExecutor {
         boolean success = switch (intent) {
             case "dialogue_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
                     case "recipe_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
+                    case "scout_explorer" -> startScoutTask(server, npcId, villager, parameters);
                     case "move_to" -> executeMove(server, villager, parameters);
                     case "fetch_from_chest" -> startFetchTask(server, npcId, villager, parameters);
                     case "mine_block" -> executeMineBlock(server, villager, parameters);
@@ -305,6 +321,9 @@ public final class AgentActionExecutor {
 
     public void enforceOwnerLeash(MinecraftServer server, UUID npcId, UUID ownerPlayerId, String fallbackName) {
         if (ownerPlayerId == null) {
+            return;
+        }
+        if (activeScoutTasks.containsKey(npcId)) {
             return;
         }
         if (activeSearchTasks.containsKey(npcId)) {
@@ -629,6 +648,68 @@ public final class AgentActionExecutor {
         return true;
     }
 
+    public boolean tryHandleScoutInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot) {
+        if (instruction == null || instruction.isBlank()) {
+            return false;
+        }
+
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel)) {
+            return false;
+        }
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) {
+            return false;
+        }
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
+            return false;
+        }
+        if (activeScoutTasks.containsKey(npcId)) {
+            speakAsNpc(server, villager, fallbackName, "I am already scouting.");
+            return true;
+        }
+
+        String prompt = promptFactory.scoutIntentPrompt(
+                villager.getName().getString(),
+                player.getName().getString(),
+                instruction,
+                snapshot,
+                memory);
+        AgentDecision scoutDecision = new com.example.ai.intent.AgentDecisionParser().parse(llmRouter.generate(prompt));
+        if (scoutDecision.intent() != com.example.ai.intent.AgentIntentType.SCOUT_EXPLORER) {
+            return false;
+        }
+
+        if (!startScoutTask(server, npcId, villager, player.getUUID(), player.getName().getString(), instruction,
+                scoutDecision.parameters())) {
+            return false;
+        }
+
+        String direction = scoutDecision.parameters().has("direction")
+                ? scoutDecision.parameters().get("direction").getAsString()
+                : "around";
+        String distance = scoutDecision.parameters().has("distance")
+                ? String.valueOf(Math.max(24, scoutDecision.parameters().get("distance").getAsInt()))
+                : String.valueOf(SCOUT_BASE_DISTANCE);
+        speakScoutStatus(
+                server,
+                villager,
+                fallbackName,
+                player.getName().getString(),
+                "scout_start",
+                "direction=" + direction + "; distance=" + distance + "; objective=" + instruction,
+                "I will scout the area and report back.");
+        return true;
+    }
+
     public boolean tryHandleTradeInstruction(
             MinecraftServer server,
             UUID npcId,
@@ -729,6 +810,260 @@ public final class AgentActionExecutor {
             case ACCEPT_OFFER, DECLINE_OFFER -> false; // Already handled above
             case NONE -> false;
         };
+    }
+
+    private boolean startScoutTask(
+            MinecraftServer server,
+            UUID npcId,
+            Villager villager,
+            UUID requesterId,
+            String requesterName,
+            String objective,
+            JsonObject parameters) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return false;
+        }
+        if (requesterId == null) {
+            return false;
+        }
+        ServerPlayer requester = server.getPlayerList().getPlayer(requesterId);
+        if (requester == null || requester.level() != villager.level()) {
+            return false;
+        }
+
+        String direction = normalizeScoutDirection(parameters, requester);
+        int distance = normalizeScoutDistance(parameters);
+        String focus = parameters != null && parameters.has("focus") ? parameters.get("focus").getAsString() : "anything";
+        BlockPos waypoint = pickScoutWaypoint(level, requester, direction, distance);
+        ScoutTask task = new ScoutTask(requesterId, requesterName, objective, direction, distance, focus, waypoint);
+        activeScoutTasks.put(npcId, task);
+        task.nextStatusAtMillis = System.currentTimeMillis() + SCOUT_STATUS_COOLDOWN_MILLIS;
+        return true;
+    }
+
+    private boolean startScoutTask(
+            MinecraftServer server,
+            UUID npcId,
+            Villager villager,
+            JsonObject parameters) {
+        ServerPlayer requester = nearestPlayer(server, villager);
+        if (requester == null) {
+            return false;
+        }
+        String objective = parameters != null && parameters.has("objective")
+                ? parameters.get("objective").getAsString()
+                : "";
+        return startScoutTask(
+                server,
+                npcId,
+                villager,
+                requester.getUUID(),
+                requester.getName().getString(),
+                objective,
+                parameters);
+    }
+
+    private boolean advanceScoutTask(MinecraftServer server, Villager villager, String fallbackName, ScoutTask task) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return false;
+        }
+        ServerPlayer requester = server.getPlayerList().getPlayer(task.requesterId);
+        if (requester == null || requester.level() != villager.level()) {
+            speakAsNpc(server, villager, fallbackName, "I lost track of the requester, so I am stopping the scout.");
+            return false;
+        }
+
+        return switch (task.phase) {
+            case TRAVEL_OUTBOUND -> {
+                long nowMs = System.currentTimeMillis();
+                if (task.outboundDeadlineMillis == 0L) {
+                    task.outboundDeadlineMillis = nowMs + 45_000L;
+                }
+                boolean moving = villager.getNavigation().moveTo(
+                        task.waypoint.getX() + 0.5,
+                        task.waypoint.getY() + 0.5,
+                        task.waypoint.getZ() + 0.5,
+                        0.9);
+                double distance = villager.distanceToSqr(
+                        task.waypoint.getX() + 0.5,
+                        task.waypoint.getY() + 0.5,
+                        task.waypoint.getZ() + 0.5);
+                boolean arrived = distance <= 9.0 || (!moving && distance <= 36.0);
+                boolean timedOut = nowMs >= task.outboundDeadlineMillis;
+                if (arrived || timedOut) {
+                    task.surveySnapshot = captureWorldSnapshot(server, villager.getUUID(), fallbackName);
+                    task.surveyTicksRemaining = SCOUT_SURVEY_TICKS;
+                    task.phase = ScoutPhase.SURVEY_AREA;
+                    speakScoutStatus(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "scout_scan",
+                            "direction=" + task.direction + "; distance=" + task.distance + "; focus=" + task.focus,
+                            "I have reached the area and am scanning now.");
+                }
+                yield true;
+            }
+            case SURVEY_AREA -> {
+                if (task.surveySnapshot == null) {
+                    task.surveySnapshot = captureWorldSnapshot(server, villager.getUUID(), fallbackName);
+                }
+                task.surveyTicksRemaining -= 1;
+                if (task.surveyTicksRemaining <= 0) {
+                    task.phase = ScoutPhase.RETURN_TO_PLAYER;
+                    speakScoutStatus(
+                            server,
+                            villager,
+                            fallbackName,
+                            requester.getName().getString(),
+                            "scout_return",
+                            "direction=" + task.direction + "; distance=" + task.distance,
+                            "I am heading back with what I found.");
+                }
+                yield true;
+            }
+            case RETURN_TO_PLAYER -> {
+                long nowMs = System.currentTimeMillis();
+                if (task.returnDeadlineMillis == 0L) {
+                    task.returnDeadlineMillis = nowMs + 45_000L;
+                }
+                if (villager.getNavigation().isDone()) {
+                    villager.getNavigation().moveTo(requester.getX(), requester.getY(), requester.getZ(), 0.9);
+                }
+                if (villager.distanceToSqr(requester) <= 9.0) {
+                    task.phase = ScoutPhase.REPORT;
+                } else if (nowMs >= task.returnDeadlineMillis) {
+                    villager.teleportTo(requester.getX() + 1.0, requester.getY(), requester.getZ());
+                    task.phase = ScoutPhase.REPORT;
+                }
+                yield true;
+            }
+            case REPORT -> {
+                String surveyFacts = buildScoutFacts(task.surveySnapshot);
+                String prompt = promptFactory.scoutReportPrompt(
+                        villager.getName().getString(),
+                        requester.getName().getString(),
+                        task.objective,
+                        task.direction,
+                        String.valueOf(task.distance),
+                        surveyFacts);
+                String response = parseScoutReportText(llmRouter.generate(prompt));
+                String text = response.isBlank() ? "I scouted the area and returned." : response;
+                speakAsNpc(server, villager, fallbackName, text);
+                task.phase = ScoutPhase.DONE;
+                yield false;
+            }
+            case DONE -> false;
+        };
+    }
+
+    private String parseScoutReportText(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        try {
+            JsonObject root = JsonParser.parseString(raw).getAsJsonObject();
+            for (String key : new String[]{"response_text", "text", "reply", "message", "report"}) {
+                if (root.has(key) && root.get(key).isJsonPrimitive()) {
+                    String val = root.get(key).getAsString().trim();
+                    if (!val.isBlank()) return val;
+                }
+            }
+            return "";
+        } catch (Exception ignored) {
+            return raw.trim();
+        }
+    }
+
+    private String buildScoutFacts(WorldSnapshot snapshot) {
+        if (snapshot == null) {
+            return "none";
+        }
+        List<String> parts = new ArrayList<>();
+        if (snapshot.environment() != null) {
+            parts.add("biome=" + snapshot.environment().biome());
+            parts.add("threat_level=" + snapshot.environment().threatLevel());
+            parts.add("weather=" + snapshot.environment().weather());
+        }
+        if (snapshot.nearbyEntities() != null && !snapshot.nearbyEntities().isEmpty()) {
+            List<String> entities = new ArrayList<>();
+            for (WorldSnapshot.SeenEntity entity : snapshot.nearbyEntities()) {
+                entities.add(entity.type() + "@" + (int) Math.round(entity.distance()));
+            }
+            parts.add("nearby_entities=" + String.join(", ", entities));
+        }
+        if (snapshot.nearbyBlockHistogram() != null && !snapshot.nearbyBlockHistogram().isEmpty()) {
+            List<String> blocks = new ArrayList<>();
+            for (Map.Entry<String, Integer> entry : snapshot.nearbyBlockHistogram().entrySet()) {
+                blocks.add(entry.getKey() + "=" + entry.getValue());
+                if (blocks.size() >= 6) {
+                    break;
+                }
+            }
+            parts.add("nearby_blocks=" + String.join(", ", blocks));
+        }
+        return parts.isEmpty() ? "none" : String.join("; ", parts);
+    }
+
+    private String normalizeScoutDirection(JsonObject parameters, ServerPlayer requester) {
+        if (parameters == null || !parameters.has("direction")) {
+            return "around";
+        }
+        String direction = parameters.get("direction").getAsString().toLowerCase(Locale.ROOT).trim();
+        return switch (direction) {
+            case "north", "south", "east", "west", "forward", "around" -> direction;
+            default -> "around";
+        };
+    }
+
+    private int normalizeScoutDistance(JsonObject parameters) {
+        if (parameters == null || !parameters.has("distance")) {
+            return SCOUT_BASE_DISTANCE;
+        }
+        int distance = Math.max(24, parameters.get("distance").getAsInt());
+        return Math.min(SCOUT_MAX_DISTANCE, distance);
+    }
+
+    private BlockPos pickScoutWaypoint(ServerLevel level, ServerPlayer requester, String direction, int distance) {
+        BlockPos anchor = requester.blockPosition();
+        Vec3 vector = switch (direction) {
+            case "north" -> new Vec3(0, 0, -1);
+            case "south" -> new Vec3(0, 0, 1);
+            case "east" -> new Vec3(1, 0, 0);
+            case "west" -> new Vec3(-1, 0, 0);
+            case "forward" -> {
+                Vec3 look = requester.getLookAngle();
+                yield new Vec3(look.x, 0, look.z);
+            }
+            default -> {
+                double angle = requester.getRandom().nextDouble() * Math.PI * 2.0;
+                yield new Vec3(Math.cos(angle), 0, Math.sin(angle));
+            }
+        };
+        Vec3 normalized = vector.lengthSqr() < 0.0001 ? new Vec3(1, 0, 0) : vector.normalize();
+        int dx = (int) Math.round(normalized.x * distance);
+        int dz = (int) Math.round(normalized.z * distance);
+        BlockPos probe = anchor.offset(dx, 0, dz);
+        BlockPos surface = level.getHeightmapPos(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, probe);
+        return surface.above();
+    }
+
+    private void speakScoutStatus(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            String playerName,
+            String eventType,
+            String requiredFacts,
+            String fallbackText) {
+        String prompt = promptFactory.scoutStatusPrompt(
+                villager.getName().getString(),
+                playerName,
+                eventType,
+                requiredFacts);
+        String response = parseScoutReportText(llmRouter.generate(prompt));
+        speakAsNpc(server, villager, fallbackName, response.isBlank() ? fallbackText : response);
     }
 
     private boolean handleSessionStatusInquiry(
@@ -1299,6 +1634,11 @@ public final class AgentActionExecutor {
         if (mineToPlayer != null) {
             return "mine_to_player:" + mineToPlayer.phase.name().toLowerCase(Locale.ROOT)
                     + " (" + mineToPlayer.minedCount + "/" + mineToPlayer.count + ")";
+        }
+        ScoutTask scoutTask = activeScoutTasks.get(npcId);
+        if (scoutTask != null) {
+            return "scout:" + scoutTask.phase.name().toLowerCase(Locale.ROOT)
+                    + " (" + scoutTask.direction + ", r=" + scoutTask.distance + ")";
         }
         MineToChestTask mineToChest = activeMineToChest.get(npcId);
         if (mineToChest != null) {
@@ -2143,7 +2483,8 @@ public final class AgentActionExecutor {
         if (activeMineToPlayer.containsKey(npcId)
                 || activeMineToChest.containsKey(npcId)
                 || activeDeliveries.containsKey(npcId)
-                || activeSearchTasks.containsKey(npcId)) {
+                || activeSearchTasks.containsKey(npcId)
+                || activeScoutTasks.containsKey(npcId)) {
             return true;
         }
         List<JsonObject> queued = actionOutbox.get(npcId);
@@ -2720,7 +3061,7 @@ public final class AgentActionExecutor {
         }
         Component message = Component.literal("[" + npcName + "] " + text);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() == villager.level() && player.distanceToSqr(villager) <= 400.0) {
+            if (player.level() == villager.level() && player.distanceToSqr(villager) <= 160_000.0) {
                 player.sendSystemMessage(message);
             }
         }
@@ -2963,7 +3304,7 @@ public final class AgentActionExecutor {
     private void notifyNearbyPlayers(MinecraftServer server, Villager villager, String text) {
         Component message = Component.literal(text);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            if (player.level() == villager.level() && player.distanceToSqr(villager) <= 400.0) {
+            if (player.level() == villager.level() && player.distanceToSqr(villager) <= 160_000.0) {
                 player.sendSystemMessage(message);
             }
         }
@@ -3123,6 +3464,47 @@ public final class AgentActionExecutor {
         }
     }
 
+    private enum ScoutPhase {
+        TRAVEL_OUTBOUND,
+        SURVEY_AREA,
+        RETURN_TO_PLAYER,
+        REPORT,
+        DONE
+    }
+
+    private static final class ScoutTask {
+        private final UUID requesterId;
+        private final String requesterName;
+        private final String objective;
+        private final String direction;
+        private final int distance;
+        private final String focus;
+        private final BlockPos waypoint;
+        private ScoutPhase phase = ScoutPhase.TRAVEL_OUTBOUND;
+        private WorldSnapshot surveySnapshot;
+        private int surveyTicksRemaining = SCOUT_SURVEY_TICKS;
+        private long nextStatusAtMillis = 0L;
+        private long outboundDeadlineMillis = 0L;
+        private long returnDeadlineMillis = 0L;
+
+        private ScoutTask(
+                UUID requesterId,
+                String requesterName,
+                String objective,
+                String direction,
+                int distance,
+                String focus,
+                BlockPos waypoint) {
+            this.requesterId = requesterId;
+            this.requesterName = requesterName;
+            this.objective = objective;
+            this.direction = direction;
+            this.distance = distance;
+            this.focus = focus;
+            this.waypoint = waypoint;
+        }
+    }
+
     private static final class MineToChestTask {
         private final Block block;
         private final Item item;
@@ -3166,6 +3548,3 @@ public final class AgentActionExecutor {
         }
     }
 }
-
-
-
