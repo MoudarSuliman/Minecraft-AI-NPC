@@ -13,6 +13,9 @@ import com.example.ai.perception.WorldSnapshot;
 import com.example.ai.prompt.PromptFactory;
 import com.example.ai.safety.SafetyPolicy;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.npc.villager.Villager;
 import org.slf4j.Logger;
 
 import java.util.ArrayList;
@@ -31,6 +34,7 @@ public final class AutonomousNpcRuntime {
     private final AgentActionExecutor actionExecutor;
     private final AgentMemoryStore memoryStore;
     private final SafetyPolicy safetyPolicy;
+    private final NpcBindingStore bindingStore;
 
     private final Map<UUID, AgentHandle> agents = new ConcurrentHashMap<>();
     private final Map<UUID, Long> nextThinkAt = new ConcurrentHashMap<>();
@@ -48,7 +52,8 @@ public final class AutonomousNpcRuntime {
             AgentDecisionParser decisionParser,
             AgentActionExecutor actionExecutor,
             AgentMemoryStore memoryStore,
-            SafetyPolicy safetyPolicy
+            SafetyPolicy safetyPolicy,
+            NpcBindingStore bindingStore
     ) {
         this.logger = logger;
         this.perceptionService = perceptionService;
@@ -58,10 +63,12 @@ public final class AutonomousNpcRuntime {
         this.actionExecutor = actionExecutor;
         this.memoryStore = memoryStore;
         this.safetyPolicy = safetyPolicy;
+        this.bindingStore = bindingStore;
     }
 
     public static AutonomousNpcRuntime createDefault(Logger logger) {
         var memoryStore = AgentMemoryStore.createDefault(logger);
+        var bindingStore = NpcBindingStore.createDefault(logger);
         var promptFactory = new PromptFactory();
         var llmRouter = LlmRouter.defaultRouter();
         return new AutonomousNpcRuntime(
@@ -72,17 +79,20 @@ public final class AutonomousNpcRuntime {
                 new AgentDecisionParser(),
                 new AgentActionExecutor(logger, promptFactory, llmRouter),
                 memoryStore,
-                SafetyPolicy.defaultPolicy()
+                SafetyPolicy.defaultPolicy(),
+                bindingStore
         );
     }
 
     public void onServerTick(MinecraftServer server) {
         long now = System.currentTimeMillis();
+        restorePersistedBindings(server);
         for (AgentHandle handle : agents.values()) {
             UUID npcId = handle.npcId();
             MemoryContext memory = memoryStore.getContext(npcId);
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
             actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
+            actionExecutor.maybeSendEnvironmentalAdvisory(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
             boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
@@ -269,6 +279,7 @@ public final class AutonomousNpcRuntime {
     public void registerAgent(UUID npcId, String npcName, UUID ownerPlayerId) {
         agents.put(npcId, new AgentHandle(npcId, npcName, ownerPlayerId));
         pendingInstruction.put(npcId, false);
+        bindingStore.rememberBinding(npcId, npcName, ownerPlayerId);
         logger.info("Registered embodied AI agent {}", npcName);
     }
 
@@ -425,6 +436,44 @@ public final class AutonomousNpcRuntime {
             return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:oak_log" : "minecraft:oak_log";
         }
         return "";
+    }
+
+    private void restorePersistedBindings(MinecraftServer server) {
+        for (Map.Entry<UUID, NpcBindingStore.BoundNpc> entry : bindingStore.snapshot().entrySet()) {
+            UUID npcId = entry.getKey();
+            if (agents.containsKey(npcId)) {
+                continue;
+            }
+
+            Entity entity = null;
+            for (ServerLevel level : server.getAllLevels()) {
+                entity = level.getEntity(npcId);
+                if (entity != null) {
+                    break;
+                }
+            }
+            if (!(entity instanceof Villager villager) || !villager.isAlive()) {
+                continue;
+            }
+
+            String npcName = villager.getName().getString();
+            if (npcName == null || npcName.isBlank()) {
+                npcName = entry.getValue().npcName();
+            }
+            UUID ownerPlayerId = null;
+            String ownerPlayerIdText = entry.getValue().ownerPlayerId();
+            if (ownerPlayerIdText != null && !ownerPlayerIdText.isBlank()) {
+                try {
+                    ownerPlayerId = UUID.fromString(ownerPlayerIdText);
+                } catch (IllegalArgumentException ignored) {
+                    ownerPlayerId = null;
+                }
+            }
+
+            agents.put(npcId, new AgentHandle(npcId, npcName, ownerPlayerId));
+            pendingInstruction.put(npcId, false);
+            logger.info("Restored embodied AI agent {} from saved binding", npcName);
+        }
     }
 
     private record AgentHandle(UUID npcId, String npcName, UUID ownerPlayerId) {

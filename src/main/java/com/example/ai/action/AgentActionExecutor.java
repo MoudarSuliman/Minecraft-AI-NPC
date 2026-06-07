@@ -47,6 +47,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 
 public final class AgentActionExecutor {
     private static final int CHEST_SCAN_RADIUS = 16;
@@ -84,6 +85,14 @@ public final class AgentActionExecutor {
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, Long> nextTradeGreetingAt = new ConcurrentHashMap<>();
+
+    private static final long ENV_ADVISORY_COOLDOWN_MILLIS = 120_000L; 
+    private final Map<UUID, Long> nextEnvironmentalAdvisoryAt = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> environmentalLlmInFlightByNpc = new ConcurrentHashMap<>();
+
+
+    private final Map<UUID, String> lastEnvironmentalSignature = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastEnvironmentalThreatLevel = new ConcurrentHashMap<>();
 
     public AgentActionExecutor(Logger logger, PromptFactory promptFactory, LlmRouter llmRouter) {
         this.logger = logger;
@@ -381,6 +390,70 @@ public final class AgentActionExecutor {
         speakAsNpc(server, villager, fallbackName, "You looking to trade?");
     }
 
+    public void maybeSendEnvironmentalAdvisory(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            UUID ownerPlayerId,
+            MemoryContext memory) {
+        if (ownerPlayerId == null) return;
+        if (hasActiveWork(npcId)) return;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return;
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerPlayerId);
+        if (owner == null || owner.level() != villager.level()) return;
+
+        if (villager.distanceTo(owner) > 32.0) return;
+
+        long now = System.currentTimeMillis();
+        Long allowed = nextEnvironmentalAdvisoryAt.getOrDefault(npcId, 0L);
+        if (now < allowed) return;
+        if (Boolean.TRUE.equals(environmentalLlmInFlightByNpc.get(npcId))) return;
+
+        WorldSnapshot snapshot = captureWorldSnapshot(server, npcId, fallbackName);
+
+        String signature = buildEnvironmentalSignature(snapshot);
+        String previousSignature = lastEnvironmentalSignature.get(npcId);
+        String prevThreat = lastEnvironmentalThreatLevel.getOrDefault(npcId, "low");
+        String currentThreat = snapshot.environment() == null ? "low" : snapshot.environment().threatLevel();
+
+        boolean threatIncreased = threatOrdinal(currentThreat) > threatOrdinal(prevThreat);
+        if (!threatIncreased && previousSignature != null && previousSignature.equals(signature)) {
+            return; // no meaningful change
+        }
+
+        String prompt = promptFactory.environmentalAwarenessPrompt(fallbackName, owner.getName().getString(), snapshot, memory);
+
+        nextEnvironmentalAdvisoryAt.put(npcId, now + ENV_ADVISORY_COOLDOWN_MILLIS);
+        environmentalLlmInFlightByNpc.put(npcId, true);
+
+        CompletableFuture.runAsync(() -> {
+            try {
+                String raw = llmRouter.generate(prompt);
+                EnvironmentalAdvice advice = parseEnvironmentalAdvice(raw);
+                if (advice != null && advice.severity != null && ("medium".equalsIgnoreCase(advice.severity)
+                        || "high".equalsIgnoreCase(advice.severity))) {
+                    String text = advice.responseText == null ? "" : advice.responseText;
+                    if (!text.isBlank()) {
+                        speakAsNpc(server, villager, fallbackName, text);
+                        logger.info("(llm_npc) [ENV-ADVISORY] npc={} severity={} evidence={} advisory=\"{}\"",
+                                fallbackName, advice.severity, advice.evidence, text);
+                    }
+                } else {
+                    logger.debug("(llm_npc) [ENV-ADVISORY] npc={} low-or-no-advisory -> {}", fallbackName, raw);
+                }
+
+                lastEnvironmentalSignature.put(npcId, signature);
+                lastEnvironmentalThreatLevel.put(npcId, currentThreat);
+
+            } catch (Exception e) {
+                logger.warn("(llm_npc) environmental advisory failed for npc={}: {}", fallbackName, e.getMessage());
+            } finally {
+                environmentalLlmInFlightByNpc.put(npcId, false);
+            }
+        });
+    }
+
     public boolean tryHandleRecipeInstruction(
             MinecraftServer server,
             UUID npcId,
@@ -605,7 +678,6 @@ public final class AgentActionExecutor {
         }
         lastTradeIntentByNpc.put(npcId, tradeIntent.type().name().toLowerCase());
 
-        // For accept/decline, don't call LLM - these are binary outcomes
         if (tradeIntent.type() == TradeIntentType.ACCEPT_OFFER) {
             return handleTradeAccept(server, villager, fallbackName, player, session, null);
         }
@@ -2004,6 +2076,67 @@ public final class AgentActionExecutor {
             return sheep.getColor() == DyeColor.PINK;
         }
         return true;
+    }
+
+    private String buildEnvironmentalSignature(WorldSnapshot snapshot) {
+        if (snapshot == null) return "";
+        StringBuilder sb = new StringBuilder();
+        WorldSnapshot.EnvironmentContext env = snapshot.environment();
+        if (env != null) {
+            sb.append(env.biome()).append('|').append(env.threatLevel()).append('|').append(env.isNight());
+        }
+        if (snapshot.nearbyEntities() != null && !snapshot.nearbyEntities().isEmpty()) {
+            for (WorldSnapshot.SeenEntity e : snapshot.nearbyEntities()) {
+                sb.append('|').append(e.type()).append(':').append((int) Math.round(e.distance()));
+            }
+        }
+        if (snapshot.nearbyBlockHistogram() != null && !snapshot.nearbyBlockHistogram().isEmpty()) {
+            int i = 0;
+            for (Map.Entry<String, Integer> entry : snapshot.nearbyBlockHistogram().entrySet()) {
+                sb.append('|').append(entry.getKey()).append('=').append(entry.getValue());
+                if (++i >= 5) break;
+            }
+        }
+        return sb.toString();
+    }
+
+    private record EnvironmentalAdvice(String responseText, String severity, java.util.List<String> evidence) {}
+
+    private EnvironmentalAdvice parseEnvironmentalAdvice(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            JsonObject root = JsonParser.parseString(raw).getAsJsonObject();
+            String response = root.has("response_text") ? root.get("response_text").getAsString() : "";
+            String severity = root.has("severity") ? root.get("severity").getAsString() : "low";
+            java.util.List<String> evidence = new java.util.ArrayList<>();
+            if (root.has("evidence") && root.get("evidence").isJsonArray()) {
+                for (var el : root.getAsJsonArray("evidence")) {
+                    try { evidence.add(el.getAsString()); } catch (Exception ignored) {}
+                }
+            }
+            return new EnvironmentalAdvice(response, severity, evidence);
+        } catch (Exception e) {
+            String text = raw.trim();
+            if (text.isEmpty()) return null;
+            return new EnvironmentalAdvice(text, "medium", java.util.List.of());
+        }
+    }
+
+    private String buildEvidenceSuffix(java.util.List<String> evidence) {
+        if (evidence == null || evidence.isEmpty()) return "";
+        try {
+            return " (evidence: " + String.join(", ", evidence) + ")";
+        } catch (Exception ignored) { return ""; }
+    }
+
+    private int threatOrdinal(String t) {
+        if (t == null) return 0;
+        String low = t.toLowerCase(Locale.ROOT);
+        return switch (low) {
+            case "high" -> 2;
+            case "medium" -> 1;
+            default -> 0;
+        };
     }
 
     private boolean hasActiveWork(UUID npcId) {

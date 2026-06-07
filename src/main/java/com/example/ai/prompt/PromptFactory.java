@@ -186,6 +186,33 @@ public final class PromptFactory {
         return payload.toString();
     }
 
+    public String environmentalAwarenessPrompt(
+            String npcName,
+            String playerName,
+            WorldSnapshot snapshot,
+            MemoryContext memory
+    ) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "environmental_advisory");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName == null || playerName.isBlank() ? "player" : playerName);
+        payload.add("perception", snapshot.toJson());
+        payload.add("memory", memoryToJson(memory));
+        payload.addProperty("format", "{\"response_text\":\"...\", \"severity\":\"low|medium|high\", \"evidence\":[]}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. Produce a concise, proactive environment-aware advisory (max 2 short sentences). "
+                        + "ONLY mention entities, hazards, or features that are directly supported by the provided 'perception' JSON. "
+                        + "Do NOT invent or infer absent entities, mobs, or events. If you are unsure, return severity 'low' and response_text empty. "
+                        + "Classification rules: set severity='high' only when evidence includes hostile mobs present (zombie, creeper, skeleton, warden, blaze, pillager, vindicator, phantom, enderman) OR threat_level=='high'. "
+                        + "Set severity='medium' when evidence includes at least one hostile mob within 16 blocks or environmental hazards (low light + hostile nearby) or biome-specific dangerous mobs (e.g., 'end' + shulker present). "
+                        + "Set severity='low' for passive mobs, decorative items, plants, trader llamas, or item entities (e.g., 'Pink Petals'). If evidence contains only non-hostile entities/items, return severity 'low' and response_text empty. "
+                        + "Include an 'evidence' array listing zero-or-more facts copied verbatim from perception that justify the advisory (examples: 'nearby_entities:zombie', 'biome:end', 'threat_level:high'). "
+                        + "Only return a non-empty response_text when severity is 'medium' or 'high'. "
+                        + "Return strict JSON in this exact format: {\"response_text\":\"...\", \"severity\":\"medium|high|low\", \"evidence\":[\"...\"]}. "
+                        + "Do NOT suggest trades, inventory, prices, or cause the NPC to take actions. If nothing noteworthy, return response_text empty and severity 'low'.");
+        return payload.toString();
+    }
+
     public String searchStatusPrompt(
             String npcName,
             String playerName,
