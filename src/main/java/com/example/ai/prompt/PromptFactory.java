@@ -536,9 +536,13 @@ public final class PromptFactory {
             sb.append("\n");
         }
         sb.append("Player said: \"").append(playerText).append("\"\n\n");
-        sb.append("Is this a request to find, locate, or lead to a specific creature or entity?\n");
+        sb.append("Is this a NEW request to find, locate, or lead to a specific creature or entity?\n");
         sb.append("Qualifies as a search: find, locate, search for, look for, lead me to, take me to,\n");
         sb.append("show me, where is, guide me to, bring me to, walk me to.\n\n");
+        sb.append("Do NOT classify as search if the player is asking about the result of a previous search.\n");
+        sb.append("Examples that are NOT searches: 'did you find it?', 'did you find anything?',\n");
+        sb.append("'have you found it?', 'what did you find?', 'any luck?', 'found it yet?'.\n");
+        sb.append("Those should return {\"is_search\": false}.\n\n");
         sb.append("If yes, identify the target creature and its Minecraft entity ID.\n");
         sb.append("Use the full Minecraft entity ID format: minecraft:<name>\n");
         sb.append("Examples: minecraft:chicken, minecraft:cow, minecraft:pig, minecraft:sheep,\n");
