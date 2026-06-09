@@ -91,7 +91,7 @@ public final class AutonomousNpcRuntime {
             UUID npcId = handle.npcId();
             MemoryContext memory = memoryStore.getContext(npcId);
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
-            actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
+            // actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.maybeSendEnvironmentalAdvisory(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
@@ -107,6 +107,9 @@ public final class AutonomousNpcRuntime {
             String speaker = speakerFromEntry(latestEntry);
             String latestInstruction = instructionTextFromEntry(latestEntry);
             WorldSnapshot snapshot = actionExecutor.captureWorldSnapshot(server, npcId, handle.npcName());
+
+            InstructionDemand demand = classifyDemand(latestInstruction);
+            logger.info("[THINK] npc={} instruction='{}' speaker='{}' demand={}", handle.npcName(), latestInstruction, speaker, demand);
 
             if (actionExecutor.tryHandleRecipeInstruction(
                     server,
@@ -133,7 +136,8 @@ public final class AutonomousNpcRuntime {
                     handle.npcName(),
                     speaker,
                     handle.ownerPlayerId(),
-                    latestInstruction
+                    latestInstruction,
+                    memory
             )) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
@@ -163,7 +167,27 @@ public final class AutonomousNpcRuntime {
                 continue;
             }
 
-            if (actionExecutor.tryHandleTradeInstruction(
+            if (demand == InstructionDemand.REQUIRE_BUILD && actionExecutor.tryHandleScenarioInstruction(
+                    server,
+                    npcId,
+                    handle.npcName(),
+                    speaker,
+                    handle.ownerPlayerId(),
+                    latestInstruction,
+                    memory,
+                    snapshot,
+                    true
+            )) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(
+                        npcId,
+                        MemoryEntry.episodic("scenario", "Handled scenario instruction from " + speaker + ": " + latestInstruction)
+                );
+                continue;
+            }
+
+            if (demand == InstructionDemand.REQUIRE_TRADE && actionExecutor.tryHandleTradeInstruction(
                     server,
                     npcId,
                     handle.npcName(),
@@ -182,7 +206,25 @@ public final class AutonomousNpcRuntime {
                 continue;
             }
 
-            InstructionDemand demand = classifyDemand(latestInstruction);
+            if (demand == InstructionDemand.NONE && actionExecutor.tryHandleDialogueInstruction(
+                    server,
+                    npcId,
+                    handle.npcName(),
+                    speaker,
+                    handle.ownerPlayerId(),
+                    latestInstruction,
+                    memory,
+                    snapshot
+            )) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(
+                        npcId,
+                        MemoryEntry.episodic("dialogue", "Handled dialogue from " + speaker + ": " + latestInstruction)
+                );
+                continue;
+            }
+
             String expectedIntent = expectedIntentForDemand(demand);
             lastDemandByNpc.put(npcId, demand.name().toLowerCase(Locale.ROOT));
             lastExpectedIntentByNpc.put(npcId, expectedIntent.isBlank() ? "none" : expectedIntent);
@@ -271,6 +313,12 @@ public final class AutonomousNpcRuntime {
             }
             if (demand == InstructionDemand.REQUIRE_FETCH && decision.intent() != AgentIntentType.FETCH_FROM_CHEST) {
                 logger.info("Fetch instruction requires FETCH_FROM_CHEST intent for agent {}. Got {}. Retrying.",
+                        handle.npcName(), decision.intent());
+                nextThinkAt.put(npcId, now + 1200L);
+                continue;
+            }
+            if (demand == InstructionDemand.REQUIRE_BUILD && decision.intent() != AgentIntentType.BUILD_STRUCTURE) {
+                logger.info("Build instruction requires BUILD_STRUCTURE intent for agent {}. Got {}. Retrying.",
                         handle.npcName(), decision.intent());
                 nextThinkAt.put(npcId, now + 1200L);
                 continue;
@@ -417,6 +465,13 @@ public final class AutonomousNpcRuntime {
         if (lower.contains("bring") || lower.contains("fetch") || lower.contains("get me")) {
             return InstructionDemand.REQUIRE_FETCH;
         }
+        if (lower.contains("build") || lower.contains("construct")
+                || lower.contains("place a") || lower.contains("place the")
+                || lower.contains("make a") || lower.contains("create a")
+                || lower.contains("lay a") || lower.contains("lay the")
+                || lower.contains("set up a") || lower.contains("put down a")) {
+            return InstructionDemand.REQUIRE_BUILD;
+        }
         return InstructionDemand.NONE;
     }
 
@@ -436,6 +491,7 @@ public final class AutonomousNpcRuntime {
             case REQUIRE_MINE_TO_CHEST -> "mine_to_chest";
             case REQUIRE_MINE_TO_PLAYER -> "mine_to_player";
             case REQUIRE_TRADE -> "dialogue_reply";
+            case REQUIRE_BUILD -> "build_structure";
             case NONE -> "";
         };
     }
@@ -504,6 +560,7 @@ public final class AutonomousNpcRuntime {
         REQUIRE_MINE_TO_CHEST,
         REQUIRE_MINE_TO_PLAYER,
         REQUIRE_TRADE,
-        REQUIRE_FETCH
+        REQUIRE_FETCH,
+        REQUIRE_BUILD
     }
 }

@@ -5,6 +5,7 @@ import com.example.ai.memory.MemoryEntry;
 import com.example.ai.perception.WorldSnapshot;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import java.util.Map;
 
 public final class PromptFactory {
     public String actionSelectionPrompt(
@@ -28,20 +29,31 @@ public final class PromptFactory {
         payload.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
-                + "Choose an actionable intent that advances latest_instruction. "
-                + "If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
-                + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}. "
-                + "If latest_instruction asks to mine a block, use intent mine_block with "
-                + "parameters {\"block\":\"minecraft:...\"}. "
-                + "If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}. "
-                + "If latest_instruction asks to mine and give to player, use intent mine_to_player with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}. "
-                + "If latest_instruction asks to scout, explore, check an area, or report back after looking around, use intent scout_explorer with "
-                + "parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
-                + "If expected_intent is non-empty, you MUST set intent exactly to expected_intent. "
-                + "If target_hint is non-empty, use it in parameters.block or parameters.item_id. "
-                + "For dialogue_reply, parameters.text is REQUIRED."
+                + "IMPORTANT — intent selection rules in priority order:\n"
+                + "1. Greetings, questions, or any conversational message that is NOT a physical task MUST use dialogue_reply. "
+                + "   Examples: 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. 'hey' -> dialogue_reply. "
+                + "   'how are you' -> dialogue_reply. 'what are you doing' -> dialogue_reply.\n"
+                + "2. If latest_instruction asks to build, construct, place, or create a structure or floor or wall of blocks, "
+                + "use intent build_structure with parameters {\"description\":\"...\"}. "
+                + "Examples: 'build a 3x3 cobblestone floor' -> build_structure. 'construct a wall' -> build_structure.\n"
+                + "3. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
+                + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
+                + "4. If latest_instruction asks to mine a block, use intent mine_block with "
+                + "parameters {\"block\":\"minecraft:...\"}.\n"
+                + "5. If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
+                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "6. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
+                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "7. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
+                + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
+                + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
+                + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb.\n"
+                + "8. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
+                + "9. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
+                + "10. For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
+                + "NEVER repeat or echo the player's message. "
+                + "Example: player says 'you there?' -> parameters.text = 'Yes, I am here. What do you need?' "
+                + "Example: player says 'hello' -> parameters.text = 'Hello there! How can I help you?'"
                 : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
         return payload.toString();
     }
@@ -82,9 +94,21 @@ public final class PromptFactory {
         return "Classify this Minecraft player instruction.\n"
                 + "Player (" + playerName + ") said to NPC (" + npcName + "): \"" + playerText + "\"\n"
                 + "\n"
-                + "Question: Is the player asking the NPC to physically go to a location, look around, and report back?\n"
+                + "RULE: Only classify as scout_explorer if the player is explicitly asking the NPC to physically\n"
+                + "TRAVEL to a location, look around there, and COME BACK to report. Everything else is idle.\n"
                 + "\n"
-                + "YES examples (scout_explorer):\n"
+                + "idle examples (NOT scouting):\n"
+                + "  'you there?' -> idle\n"
+                + "  'hey' -> idle\n"
+                + "  'hello' -> idle\n"
+                + "  'are you there?' -> idle\n"
+                + "  'what are you doing?' -> idle\n"
+                + "  'do you have sticks' -> idle\n"
+                + "  'how much does glass cost' -> idle\n"
+                + "  'craft me a pickaxe' -> idle\n"
+                + "  'can you help me' -> idle\n"
+                + "\n"
+                + "scout_explorer examples (scouting ONLY):\n"
                 + "  'go check out east and let me know what you see' -> scout_explorer, direction=east\n"
                 + "  'go check out east' -> scout_explorer, direction=east\n"
                 + "  'scout north for me' -> scout_explorer, direction=north\n"
@@ -92,22 +116,17 @@ public final class PromptFactory {
                 + "  'explore to the west' -> scout_explorer, direction=west\n"
                 + "  'go see what is over there and report back' -> scout_explorer, direction=around\n"
                 + "\n"
-                + "NO examples (idle):\n"
-                + "  'do you have sticks' -> idle\n"
-                + "  'how much does glass cost' -> idle\n"
-                + "  'craft me a pickaxe' -> idle\n"
-                + "\n"
-                + "The instruction above contains the word(s): "
-                + (lower.contains("check") ? "check " : "")
-                + (lower.contains("go") ? "go " : "")
-                + (lower.contains("look") ? "look " : "")
-                + (lower.contains("see") ? "see " : "")
-                + (lower.contains("east") || lower.contains("west") || lower.contains("north") || lower.contains("south") ? "direction=" + direction + " " : "")
-                + "\n"
-                + "Return ONLY valid JSON, no extra text:\n"
-                + "{\"intent\":\"scout_explorer\",\"parameters\":{\"direction\":\"" + direction + "\",\"distance\":48,\"focus\":\"anything\",\"return_report\":true},\"reasoning\":\"player asked to explore\",\"priority\":0.8}\n"
-                + "OR if this is NOT a scouting request:\n"
-                + "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"not a scout request\",\"priority\":0.0}";
+                + "The player said: \"" + playerText + "\"\n"
+                + "Does this instruction require the NPC to physically TRAVEL somewhere and come back? "
+                + (lower.contains("go") || lower.contains("scout") || lower.contains("explore") || lower.contains("check out")
+                        ? "The message contains a movement/scout verb."
+                        : "The message does NOT contain a movement or scouting verb — default to idle.")
+                + "\n\n"
+                + "Return ONLY valid JSON, no extra text.\n"
+                + "If this is NOT a scouting request (the default):\n"
+                + "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"not a scout request\",\"priority\":0.0}\n"
+                + "If this IS explicitly a scouting request:\n"
+                + "{\"intent\":\"scout_explorer\",\"parameters\":{\"direction\":\"" + direction + "\",\"distance\":48,\"focus\":\"anything\",\"return_report\":true},\"reasoning\":\"player asked to explore\",\"priority\":0.8}";
     }
 
     public String scoutReportPrompt(
@@ -459,6 +478,178 @@ public final class PromptFactory {
                 + "Return ONLY this JSON object with no extra text:\n"
                 + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
                 + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
+    }
+
+    public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
+            WorldSnapshot snapshot, MemoryContext memory) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
+        sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
+
+        if (snapshot != null) {
+            if (snapshot.npcPosition() != null) {
+                sb.append("NPC position: x=").append((int) snapshot.npcPosition().x())
+                  .append(" y=").append((int) snapshot.npcPosition().y())
+                  .append(" z=").append((int) snapshot.npcPosition().z()).append("\n");
+            }
+            if (snapshot.nearbyEntities() != null && !snapshot.nearbyEntities().isEmpty()) {
+                sb.append("Nearby entities (what I can see right now):\n");
+                for (WorldSnapshot.SeenEntity e : snapshot.nearbyEntities()) {
+                    sb.append("  - ").append(e.name()).append(" (").append(e.type()).append(")")
+                      .append(" at ").append(String.format("%.1f", e.distance())).append(" blocks\n");
+                }
+            } else {
+                sb.append("Nearby entities: none visible\n");
+            }
+            if (snapshot.nearbyBlockHistogram() != null && !snapshot.nearbyBlockHistogram().isEmpty()) {
+                sb.append("Nearby blocks (counts within ~8 blocks):\n");
+                snapshot.nearbyBlockHistogram().entrySet().stream()
+                        .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+                        .limit(8)
+                        .forEach(e -> sb.append("  - ").append(e.getKey()).append(": ").append(e.getValue()).append("\n"));
+            }
+            if (snapshot.environment() != null) {
+                sb.append("Time: ").append(snapshot.environment().isNight() ? "night" : "day")
+                  .append(", weather: ").append(snapshot.environment().weather())
+                  .append(", biome: ").append(snapshot.environment().biome())
+                  .append(", threat level: ").append(snapshot.environment().threatLevel()).append("\n");
+            }
+        }
+
+        sb.append("IMPORTANT: If the player asks about anything in the surroundings — entities, time, weather, threat level, or what is nearby — answer ONLY from the data provided above. Do not invent, assume, or use outside knowledge.\n");
+        sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
+        sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
+        sb.append("Return ONLY this JSON with no extra text:\n");
+        sb.append("{\"text\":\"your reply here\"}");
+        return sb.toString();
+    }
+
+    public String searchRequestPrompt(String playerText, MemoryContext memory) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are helping a Minecraft NPC understand a player's request.\n\n");
+        if (memory != null && !memory.shortTerm().isEmpty()) {
+            sb.append("Recent conversation (for resolving pronouns like 'it', 'there', 'that one'):\n");
+            int start = Math.max(0, memory.shortTerm().size() - 4);
+            for (int i = start; i < memory.shortTerm().size(); i++) {
+                sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
+            }
+            sb.append("\n");
+        }
+        sb.append("Player said: \"").append(playerText).append("\"\n\n");
+        sb.append("Is this a request to find, locate, or lead to a specific creature or entity?\n");
+        sb.append("Qualifies as a search: find, locate, search for, look for, lead me to, take me to,\n");
+        sb.append("show me, where is, guide me to, bring me to, walk me to.\n\n");
+        sb.append("If yes, identify the target creature and its Minecraft entity ID.\n");
+        sb.append("Use the full Minecraft entity ID format: minecraft:<name>\n");
+        sb.append("Examples: minecraft:chicken, minecraft:cow, minecraft:pig, minecraft:sheep,\n");
+        sb.append("minecraft:horse, minecraft:zombie, minecraft:skeleton, minecraft:creeper,\n");
+        sb.append("minecraft:spider, minecraft:enderman, minecraft:villager, minecraft:wolf,\n");
+        sb.append("minecraft:cat, minecraft:fox, minecraft:rabbit, minecraft:bee, minecraft:bat,\n");
+        sb.append("minecraft:squid, minecraft:dolphin, minecraft:cod, minecraft:salmon,\n");
+        sb.append("minecraft:llama, minecraft:parrot, minecraft:ocelot, minecraft:panda,\n");
+        sb.append("minecraft:polar_bear, minecraft:turtle, minecraft:witch, minecraft:pillager.\n\n");
+        sb.append("If the player refers to 'it' or 'that one', resolve from the recent conversation above.\n\n");
+        sb.append("Return ONLY this JSON with no extra text:\n");
+        sb.append("{\"is_search\": true, \"entity_label\": \"a chicken\", \"entity_id\": \"minecraft:chicken\"}\n");
+        sb.append("Or if not a search request:\n");
+        sb.append("{\"is_search\": false}");
+        return sb.toString();
+    }
+
+    public String scenarioIntentPrompt(String npcName, String playerName, String playerText) {
+        String lower = playerText == null ? "" : playerText.toLowerCase(java.util.Locale.ROOT);
+        boolean hasBuildVerb = lower.contains("build") || lower.contains("construct")
+                || lower.contains("make a") || lower.contains("create a") || lower.contains("place a")
+                || lower.contains("set up") || lower.contains("lay a") || lower.contains("put down");
+        return "Classify this Minecraft player instruction.\n"
+                + "Player (" + playerName + ") said to NPC (" + npcName + "): \"" + playerText + "\"\n"
+                + "\n"
+                + "RULE: classify as scenario_builder ONLY when the player asks the NPC to build, construct,\n"
+                + "place, or create a physical structure or pattern of blocks in the world.\n"
+                + "\n"
+                + "scenario_builder examples:\n"
+                + "  'build a 3x3 cobblestone floor' -> scenario_builder\n"
+                + "  'build a small shelter here' -> scenario_builder\n"
+                + "  'construct a wall to the north' -> scenario_builder\n"
+                + "  'make a 3x3 platform out of oak planks' -> scenario_builder\n"
+                + "  'place a cobblestone floor here' -> scenario_builder\n"
+                + "  'build me a watchtower' -> scenario_builder\n"
+                + "  'set up a small outpost' -> scenario_builder\n"
+                + "\n"
+                + "none examples (NOT scenario_builder):\n"
+                + "  'go check out east' -> none\n"
+                + "  'mine some cobblestone' -> none\n"
+                + "  'fetch me some glass' -> none\n"
+                + "  'do you have sticks' -> none\n"
+                + "  'you there?' -> none\n"
+                + "\n"
+                + "The player said: \"" + playerText + "\"\n"
+                + (hasBuildVerb
+                        ? "The message contains a build/construct/place verb — this is likely scenario_builder.\n"
+                        : "The message does NOT contain a build or construction verb — default to none.\n")
+                + "\n"
+                + "Return ONLY valid JSON, no extra text.\n"
+                + "If this is NOT a build request (the default):\n"
+                + "{\"intent\":\"none\",\"reasoning\":\"not a build request\",\"confidence\":0.9}\n"
+                + "If this IS a build/construct/place request:\n"
+                + "{\"intent\":\"scenario_builder\",\"reasoning\":\"player asked to build\",\"confidence\":0.9}";
+    }
+
+    public String scenarioPlanningPrompt(
+            String npcName,
+            String playerName,
+            String instruction,
+            WorldSnapshot snapshot) {
+        String posStr = "unknown";
+        if (snapshot != null && snapshot.npcPosition() != null) {
+            WorldSnapshot.Position p = snapshot.npcPosition();
+            posStr = "x=" + (int) p.x() + " y=" + (int) p.y() + " z=" + (int) p.z();
+        }
+        return "You are planning a multi-step task for a Minecraft NPC named " + npcName + ".\n"
+                + "Player (" + playerName + ") requested: \"" + instruction + "\"\n"
+                + "NPC current position: " + posStr + "\n"
+                + "\n"
+                + "Available step intents and their parameter formats:\n"
+                + "  fetch_from_chest: {\"item_id\":\"minecraft:cobblestone\", \"count\":9}\n"
+                + "  move_to:          {\"direction\":\"north|south|east|west\", \"distance\":10}\n"
+                + "                 OR {\"x\":100, \"y\":64, \"z\":200}\n"
+                + "  place_block:      {\"block\":\"minecraft:oak_planks\", \"relative_x\":0, \"relative_y\":0, \"relative_z\":0}\n"
+                + "  place_pattern:    {\"block\":\"minecraft:oak_planks\", \"pattern\":\"floor|wall|pillar|outline\","
+                + "                     \"width\":3, \"height\":1, \"length\":3,"
+                + "                     \"relative_x\":0, \"relative_y\":0, \"relative_z\":0}\n"
+                + "  mine_to_player:   {\"block\":\"minecraft:cobblestone\", \"count\":5}\n"
+                + "  dialogue_reply:   {\"text\":\"I have completed the task.\"}\n"
+                + "\n"
+                + "Planning rules:\n"
+                + "- Plan exactly 2 to 4 steps.\n"
+                + "- For building: first fetch_from_chest the required material, then place_pattern, then dialogue_reply.\n"
+                + "- Only add move_to if the player explicitly named a direction or location.\n"
+                + "- relative_x/y/z are offsets from the NPC's current position. Use relative_x=0, relative_y=0,\n"
+                + "  relative_z=0 to build centred on the NPC. relative_y=0 is correct for floors and walls.\n"
+                + "- Always end with a dialogue_reply step that reports what was accomplished.\n"
+                + "- Keep each description under 8 words.\n"
+                + "- announce is one sentence summarising what will be done.\n"
+                + "- Supported block ids: oak_planks, cobblestone, stone, dirt, glass, oak_log, sand, bricks, stone_bricks.\n"
+                + "- ALWAYS use the block type the player specified in their request. Do NOT default to cobblestone.\n"
+                + "  If the player says 'oak planks floor', use minecraft:oak_planks. If they say 'stone wall', use minecraft:stone.\n"
+                + "\n"
+                + "Example (for 'build a 3x3 cobblestone floor' — substitute the correct block for other requests):\n"
+                + "{\"scenario\":\"cobblestone floor\","
+                + "\"announce\":\"I will fetch cobblestone and lay a 3x3 floor here.\","
+                + "\"steps\":["
+                + "{\"intent\":\"fetch_from_chest\",\"parameters\":{\"item_id\":\"minecraft:cobblestone\",\"count\":9},"
+                + "\"description\":\"Fetch 9 cobblestone from chest.\"},"
+                + "{\"intent\":\"place_pattern\",\"parameters\":{\"block\":\"minecraft:cobblestone\",\"pattern\":\"floor\","
+                + "\"width\":3,\"height\":1,\"length\":3,\"relative_x\":0,\"relative_y\":0,\"relative_z\":0},"
+                + "\"description\":\"Place 3x3 cobblestone floor.\"},"
+                + "{\"intent\":\"dialogue_reply\",\"parameters\":{\"text\":\"Done! I laid a 3x3 cobblestone floor.\"},"
+                + "\"description\":\"Report completion.\"}]}\n"
+                + "\n"
+                + "Return ONLY this JSON with no extra text:\n"
+                + "{\"scenario\":\"short task name\","
+                + "\"announce\":\"one sentence plan\","
+                + "\"steps\":["
+                + "{\"intent\":\"step_intent\",\"parameters\":{},\"description\":\"short description\"}]}";
     }
 
     private JsonObject memoryToJson(MemoryContext memory) {

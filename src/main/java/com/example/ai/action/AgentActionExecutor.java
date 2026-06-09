@@ -6,6 +6,9 @@ import com.example.ai.memory.MemoryContext;
 import com.example.ai.perception.SemanticPerceptionService;
 import com.example.ai.perception.WorldSnapshot;
 import com.example.ai.prompt.PromptFactory;
+import com.example.ai.scenario.ScenarioPlan;
+import com.example.ai.scenario.ScenarioPlanParser;
+import com.example.ai.scenario.ScenarioStep;
 import com.example.ai.trade.ParsedTradeIntent;
 import com.example.ai.trade.TradeNegotiationDraft;
 import com.example.ai.trade.TradeNegotiationParser;
@@ -87,6 +90,8 @@ public final class AgentActionExecutor {
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
     private final Map<UUID, SearchTask> activeSearchTasks = new ConcurrentHashMap<>();
     private final Map<UUID, ScoutTask> activeScoutTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, ScenarioTask> activeScenarioTasks = new ConcurrentHashMap<>();
+    private final ScenarioPlanParser scenarioPlanParser = new ScenarioPlanParser();
     private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
@@ -292,6 +297,15 @@ public final class AgentActionExecutor {
             return active;
         }
 
+        ScenarioTask scenarioTask = activeScenarioTasks.get(npcId);
+        if (scenarioTask != null) {
+            boolean active = advanceScenarioTask(server, villager, fallbackName, scenarioTask);
+            if (!active) {
+                activeScenarioTasks.remove(npcId);
+            }
+            return active;
+        }
+
         JsonObject next = pollNextAction(npcId);
         if (next == null) {
             return false;
@@ -312,6 +326,7 @@ public final class AgentActionExecutor {
                     case "mine_block" -> executeMineBlock(server, villager, parameters);
                     case "mine_to_chest" -> startMineToChestTask(server, npcId, villager, parameters);
                     case "mine_to_player" -> startMineToPlayerTask(server, npcId, villager, parameters);
+                    case "build_structure" -> startScenarioDirect(server, npcId, villager, fallbackName, parameters, reasoning);
                     default -> true;
                 };
 
@@ -327,6 +342,9 @@ public final class AgentActionExecutor {
             return;
         }
         if (activeSearchTasks.containsKey(npcId)) {
+            return;
+        }
+        if (activeScenarioTasks.containsKey(npcId)) {
             return;
         }
         Villager villager = findVillager(server, npcId);
@@ -597,11 +615,12 @@ public final class AgentActionExecutor {
             String fallbackName,
             String playerName,
             UUID ownerPlayerId,
-            String instruction) {
+            String instruction,
+            MemoryContext memory) {
         if (instruction == null || instruction.isBlank()) {
             return false;
         }
-        SearchRequest request = parseSearchRequest(instruction);
+        SearchRequest request = parseSearchRequestWithLlm(instruction, memory);
         if (request == null) {
             return false;
         }
@@ -1635,6 +1654,11 @@ public final class AgentActionExecutor {
             return "mine_to_player:" + mineToPlayer.phase.name().toLowerCase(Locale.ROOT)
                     + " (" + mineToPlayer.minedCount + "/" + mineToPlayer.count + ")";
         }
+        ScenarioTask scenarioTask = activeScenarioTasks.get(npcId);
+        if (scenarioTask != null) {
+            return "scenario:" + scenarioTask.scenarioName
+                    + " step=" + (scenarioTask.currentStepIndex + 1) + "/" + scenarioTask.steps.size();
+        }
         ScoutTask scoutTask = activeScoutTasks.get(npcId);
         if (scoutTask != null) {
             return "scout:" + scoutTask.phase.name().toLowerCase(Locale.ROOT)
@@ -2445,8 +2469,13 @@ public final class AgentActionExecutor {
     private EnvironmentalAdvice parseEnvironmentalAdvice(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try {
-            JsonObject root = JsonParser.parseString(raw).getAsJsonObject();
+            int start = raw.indexOf('{');
+            int end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
             String response = root.has("response_text") ? root.get("response_text").getAsString() : "";
+            // Reject if response_text is suspiciously long (LLM echoed the prompt)
+            if (response.length() > 300) return null;
             String severity = root.has("severity") ? root.get("severity").getAsString() : "low";
             java.util.List<String> evidence = new java.util.ArrayList<>();
             if (root.has("evidence") && root.get("evidence").isJsonArray()) {
@@ -2455,10 +2484,8 @@ public final class AgentActionExecutor {
                 }
             }
             return new EnvironmentalAdvice(response, severity, evidence);
-        } catch (Exception e) {
-            String text = raw.trim();
-            if (text.isEmpty()) return null;
-            return new EnvironmentalAdvice(text, "medium", java.util.List.of());
+        } catch (Exception ignored) {
+            return null;
         }
     }
 
@@ -2484,7 +2511,8 @@ public final class AgentActionExecutor {
                 || activeMineToChest.containsKey(npcId)
                 || activeDeliveries.containsKey(npcId)
                 || activeSearchTasks.containsKey(npcId)
-                || activeScoutTasks.containsKey(npcId)) {
+                || activeScoutTasks.containsKey(npcId)
+                || activeScenarioTasks.containsKey(npcId)) {
             return true;
         }
         List<JsonObject> queued = actionOutbox.get(npcId);
@@ -2751,34 +2779,28 @@ public final class AgentActionExecutor {
         };
     }
 
-    private SearchRequest parseSearchRequest(String instruction) {
-        String lower = instruction.toLowerCase(Locale.ROOT);
-        boolean searchVerb = lower.contains("find")
-                || lower.contains("locate")
-                || lower.contains("search for")
-                || lower.contains("look for");
-        if (!searchVerb) {
+    private SearchRequest parseSearchRequestWithLlm(String instruction, MemoryContext memory) {
+        String prompt = promptFactory.searchRequestPrompt(instruction, memory);
+        String raw = llmRouter.generate(prompt);
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            int start = raw.indexOf('{');
+            int end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
+            boolean isSearch = root.has("is_search") && root.get("is_search").getAsBoolean();
+            if (!isSearch) return null;
+            String label = root.has("entity_label") ? root.get("entity_label").getAsString() : "entity";
+            String entityId = root.has("entity_id") ? root.get("entity_id").getAsString() : null;
+            if (entityId == null || entityId.isBlank() || !entityId.startsWith("minecraft:")) return null;
+            boolean requirePink = label != null && label.toLowerCase(Locale.ROOT).contains("pink")
+                    && entityId.equals("minecraft:sheep");
+            logger.info("[SEARCH] parsed instruction='{}' entity_id={} label={}", instruction, entityId, label);
+            return new SearchRequest(label, entityId, requirePink);
+        } catch (Exception e) {
+            logger.warn("[SEARCH] failed to parse LLM response: {}", raw);
             return null;
         }
-        if (lower.contains("pink sheep")) {
-            return new SearchRequest("a pink sheep", "minecraft:sheep", true);
-        }
-        if (lower.contains("sheep")) {
-            return new SearchRequest("a sheep", "minecraft:sheep", false);
-        }
-        if (lower.contains("villager")) {
-            return new SearchRequest("a villager", "minecraft:villager", false);
-        }
-        if (lower.contains("zombie")) {
-            return new SearchRequest("a zombie", "minecraft:zombie", false);
-        }
-        if (lower.contains("skeleton")) {
-            return new SearchRequest("a skeleton", "minecraft:skeleton", false);
-        }
-        if (lower.contains("creeper")) {
-            return new SearchRequest("a creeper", "minecraft:creeper", false);
-        }
-        return null;
     }
 
 
@@ -3545,6 +3567,482 @@ public final class AgentActionExecutor {
             this.blockId = blockId;
             this.count = count;
             this.targetPlayerId = targetPlayerId;
+        }
+    }
+
+    // ── Dialogue Reply ───────────────────────────────────────────────────────
+
+    public boolean tryHandleDialogueInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot) {
+        if (instruction == null || instruction.isBlank()) return false;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) { logger.info("[DIALOGUE] skip: villager not found npc={}", npcId); return false; }
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null) { logger.info("[DIALOGUE] skip: player '{}' not found", playerName); return false; }
+        if (player.level() != villager.level()) { logger.info("[DIALOGUE] skip: player/villager in different levels"); return false; }
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
+            logger.info("[DIALOGUE] skip: speaker '{}' is not the owner {}", playerName, ownerPlayerId);
+            return false;
+        }
+
+        String replyPrompt = promptFactory.dialogueReplyPrompt(
+                villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory);
+        String replyRaw = llmRouter.generate(replyPrompt);
+        String text = parseDialogueText(replyRaw);
+        if (text == null || text.isBlank()) {
+            text = "Hmm, I'm not sure how to respond to that.";
+        }
+
+        speakAsNpc(server, villager, fallbackName, text);
+        logger.info("[DIALOGUE] npc={} player={} reply='{}'", fallbackName, playerName, text);
+        return true;
+    }
+
+    private String parseDialogueText(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            int start = raw.indexOf('{');
+            int end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) return null;
+            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
+            for (String key : new String[]{"text", "reply", "response", "message"}) {
+                if (root.has(key) && root.get(key).isJsonPrimitive()) {
+                    String val = root.get(key).getAsString().trim();
+                    if (!val.isBlank() && val.length() <= 300) return val;
+                }
+            }
+            // Handle action-selection format: {"intent":"dialogue_reply","parameters":{"text":"..."}}
+            // if (root.has("parameters") && root.get("parameters").isJsonObject()) {
+            //     JsonObject params = root.getAsJsonObject("parameters");
+            //     for (String key : new String[]{"text", "reply", "response", "message"}) {
+            //         if (params.has(key) && params.get(key).isJsonPrimitive()) {
+            //             String val = params.get(key).getAsString().trim();
+            //             if (!val.isBlank() && val.length() <= 300) return val;
+            //         }
+            //     }
+            // }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    // ── Scenario Builder ─────────────────────────────────────────────────────
+
+    private boolean startScenarioDirect(
+            MinecraftServer server,
+            UUID npcId,
+            Villager villager,
+            String fallbackName,
+            JsonObject parameters,
+            String reasoning) {
+        if (activeScenarioTasks.containsKey(npcId)) {
+            speakAsNpc(server, villager, fallbackName, "I am already working on a task.");
+            return true;
+        }
+        ServerPlayer nearest = nearestPlayer(server, villager);
+        if (nearest == null) return false;
+
+        String desc = parameters.has("description") && !parameters.get("description").getAsString().isBlank()
+                ? parameters.get("description").getAsString()
+                : reasoning;
+        if (desc == null || desc.isBlank()) return false;
+
+        WorldSnapshot snap = captureWorldSnapshot(server, npcId, fallbackName);
+        String planPrompt = promptFactory.scenarioPlanningPrompt(
+                villager.getName().getString(), nearest.getName().getString(), desc, snap);
+        ScenarioPlan plan = scenarioPlanParser.parse(llmRouter.generate(planPrompt));
+        if (!plan.isValid()) {
+            speakAsNpc(server, villager, fallbackName, "I could not plan that task. Could you be more specific?");
+            return true;
+        }
+
+        ScenarioTask task = new ScenarioTask(
+                nearest.getUUID(), nearest.getName().getString(), plan.scenario(), plan.steps());
+        activeScenarioTasks.put(npcId, task);
+        String announce = plan.announce() == null || plan.announce().isBlank()
+                ? "Starting " + plan.scenario() + "."
+                : plan.announce();
+        speakAsNpc(server, villager, fallbackName, announce);
+        logger.info("[SCENARIO] npc={} started via build_structure desc='{}' steps={}",
+                fallbackName, desc, plan.steps().size());
+        return true;
+    }
+
+    public boolean tryHandleScenarioInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot,
+            boolean forceStart) {
+        if (instruction == null || instruction.isBlank()) return false;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel)) return false;
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) return false;
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+        if (activeScenarioTasks.containsKey(npcId)) {
+            speakAsNpc(server, villager, fallbackName, "I am already working on a task.");
+            return true;
+        }
+
+        if (!forceStart) {
+            String classifyPrompt = promptFactory.scenarioIntentPrompt(
+                    villager.getName().getString(), player.getName().getString(), instruction);
+            String classifyRaw = llmRouter.generate(classifyPrompt);
+            if (!isScenarioIntent(classifyRaw)) return false;
+        }
+
+        String planPrompt = promptFactory.scenarioPlanningPrompt(
+                villager.getName().getString(), player.getName().getString(), instruction, snapshot);
+        String planRaw = llmRouter.generate(planPrompt);
+        ScenarioPlan plan = scenarioPlanParser.parse(planRaw);
+        if (!plan.isValid()) {
+            speakAsNpc(server, villager, fallbackName, "I could not plan that. Could you be more specific?");
+            return true;
+        }
+
+        ScenarioTask task = new ScenarioTask(
+                player.getUUID(), player.getName().getString(), plan.scenario(), plan.steps());
+        activeScenarioTasks.put(npcId, task);
+        String announce = plan.announce() == null || plan.announce().isBlank()
+                ? "Starting " + plan.scenario() + "."
+                : plan.announce();
+        speakAsNpc(server, villager, fallbackName, announce);
+        logger.info("[SCENARIO] npc={} player={} scenario='{}' steps={}",
+                fallbackName, playerName, plan.scenario(), plan.steps().size());
+        return true;
+    }
+
+    private boolean isScenarioIntent(String raw) {
+        if (raw == null || raw.isBlank()) return false;
+        try {
+            int start = raw.indexOf('{');
+            int end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) return false;
+            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
+            String intent = root.has("intent") ? root.get("intent").getAsString() : "";
+            return "scenario_builder".equalsIgnoreCase(intent);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean advanceScenarioTask(MinecraftServer server, Villager villager, String fallbackName, ScenarioTask task) {
+        if (!(villager.level() instanceof ServerLevel level)) return false;
+        if (task.cancelled) return false;
+        UUID npcId = villager.getUUID();
+
+        // Sub-task completion: advance the step index when delegated work finishes
+        if (task.waitingForDelivery) {
+            if (activeDeliveries.containsKey(npcId)) return true;
+            task.waitingForDelivery = false;
+            task.stepStarted = false;
+            task.currentStepIndex++;
+        }
+        if (task.waitingForMineToPlayer) {
+            if (activeMineToPlayer.containsKey(npcId)) return true;
+            task.waitingForMineToPlayer = false;
+            task.stepStarted = false;
+            task.currentStepIndex++;
+        }
+        if (task.waitingForMineToChest) {
+            if (activeMineToChest.containsKey(npcId)) return true;
+            task.waitingForMineToChest = false;
+            task.stepStarted = false;
+            task.currentStepIndex++;
+        }
+
+        // move_to tracking: stay in this step until arrived or timeout
+        if (task.isMoveStep) {
+            if (villager.getNavigation().isDone()) {
+                villager.getNavigation().moveTo(task.moveTargetX, task.moveTargetY, task.moveTargetZ, 0.9);
+            }
+            boolean arrived = villager.distanceToSqr(task.moveTargetX, task.moveTargetY, task.moveTargetZ) <= 9.0;
+            long nowMs = System.currentTimeMillis();
+            boolean timedOut = task.stepDeadlineMillis > 0 && nowMs >= task.stepDeadlineMillis;
+            if (!arrived && !timedOut) return true;
+            task.isMoveStep = false;
+            task.stepStarted = false;
+            task.stepDeadlineMillis = 0L;
+            task.currentStepIndex++;
+        }
+
+        if (task.currentStepIndex >= task.steps.size()) {
+            ServerPlayer requester = server.getPlayerList().getPlayer(task.requesterId);
+            if (requester != null) {
+                speakAsNpc(server, villager, fallbackName,
+                        "I have finished the " + task.scenarioName + " task.");
+            }
+            return false;
+        }
+
+        // Only execute the step if it hasn't been started yet
+        if (task.stepStarted) return true;
+
+        ScenarioStep step = task.steps.get(task.currentStepIndex);
+        logger.info("[SCENARIO] npc={} executing step {} intent={} desc={}",
+                fallbackName, task.currentStepIndex, step.intent(), step.description());
+        executeScenarioStep(server, npcId, villager, fallbackName, task, step);
+
+        // Delegated steps (move_to, fetch, mine) set a flag above; mark started so we don't re-execute
+        // Immediate steps (place_block, place_pattern, dialogue_reply) already incremented currentStepIndex
+        if (task.isMoveStep || task.waitingForDelivery || task.waitingForMineToPlayer || task.waitingForMineToChest) {
+            task.stepStarted = true;
+            task.stepDeadlineMillis = System.currentTimeMillis() + 30_000L;
+        }
+
+        return task.currentStepIndex < task.steps.size()
+                || task.isMoveStep || task.waitingForDelivery || task.waitingForMineToPlayer || task.waitingForMineToChest;
+    }
+
+    private void executeScenarioStep(
+            MinecraftServer server,
+            UUID npcId,
+            Villager villager,
+            String fallbackName,
+            ScenarioTask task,
+            ScenarioStep step) {
+        if (!(villager.level() instanceof ServerLevel level)) return;
+        logger.info("[SCENARIO] npc={} executing step {} intent={} desc={}",
+                fallbackName, task.currentStepIndex, step.intent(), step.description());
+
+        switch (step.intent()) {
+            case "move_to" -> {
+                JsonObject p = step.parameters();
+                if (p.has("direction")) {
+                    String dir = p.get("direction").getAsString().toLowerCase(Locale.ROOT);
+                    int dist = p.has("distance") ? p.get("distance").getAsInt() : 12;
+                    ServerPlayer requester = server.getPlayerList().getPlayer(task.requesterId);
+                    BlockPos anchor = requester != null ? requester.blockPosition() : villager.blockPosition();
+                    Vec3 vec = switch (dir) {
+                        case "north" -> new Vec3(0, 0, -1);
+                        case "south" -> new Vec3(0, 0, 1);
+                        case "east"  -> new Vec3(1, 0, 0);
+                        case "west"  -> new Vec3(-1, 0, 0);
+                        default      -> new Vec3(0, 0, 0);
+                    };
+                    task.moveTargetX = anchor.getX() + vec.x * dist;
+                    task.moveTargetY = anchor.getY();
+                    task.moveTargetZ = anchor.getZ() + vec.z * dist;
+                } else {
+                    task.moveTargetX = p.has("x") ? p.get("x").getAsDouble() : villager.getX();
+                    task.moveTargetY = p.has("y") ? p.get("y").getAsDouble() : villager.getY();
+                    task.moveTargetZ = p.has("z") ? p.get("z").getAsDouble() : villager.getZ();
+                }
+                task.isMoveStep = true;
+                villager.getNavigation().moveTo(task.moveTargetX, task.moveTargetY, task.moveTargetZ, 0.9);
+            }
+            case "place_block" -> {
+                JsonObject p = step.parameters();
+                String blockId = p.has("block") ? p.get("block").getAsString() : "minecraft:cobblestone";
+                int rx = p.has("relative_x") ? p.get("relative_x").getAsInt() : 0;
+                int ry = p.has("relative_y") ? p.get("relative_y").getAsInt() : 0;
+                int rz = p.has("relative_z") ? p.get("relative_z").getAsInt() : 0;
+                executePlaceBlock(level, villager, blockId, rx, ry, rz);
+                task.currentStepIndex++;
+            }
+            case "place_pattern" -> {
+                JsonObject p = step.parameters();
+                String blockId = p.has("block") ? p.get("block").getAsString() : "minecraft:cobblestone";
+                String pattern = p.has("pattern") ? p.get("pattern").getAsString() : "floor";
+                int width = p.has("width") ? Math.min(16, p.get("width").getAsInt()) : 3;
+                int height = p.has("height") ? Math.min(16, p.get("height").getAsInt()) : 1;
+                int length = p.has("length") ? Math.min(16, p.get("length").getAsInt()) : 3;
+                int rx = p.has("relative_x") ? p.get("relative_x").getAsInt() : 0;
+                int ry = p.has("relative_y") ? p.get("relative_y").getAsInt() : 0;
+                int rz = p.has("relative_z") ? p.get("relative_z").getAsInt() : 0;
+                executePlacePattern(level, villager, blockId, pattern, width, height, length, rx, ry, rz);
+                task.currentStepIndex++;
+            }
+            case "fetch_from_chest" -> {
+                JsonObject p = step.parameters();
+                if (p.has("item_id")) {
+                    if (startFetchTask(server, npcId, villager, p)) {
+                        task.waitingForDelivery = true;
+                    } else {
+                        task.cancelled = true;
+                    }
+                } else {
+                    task.currentStepIndex++;
+                }
+            }
+            case "mine_to_player" -> {
+                JsonObject p = step.parameters();
+                if (p.has("block")) {
+                    if (startMineToPlayerTask(server, npcId, villager, p)) {
+                        task.waitingForMineToPlayer = true;
+                    } else {
+                        task.cancelled = true;
+                    }
+                } else {
+                    task.currentStepIndex++;
+                }
+            }
+            case "mine_block" -> {
+                JsonObject p = step.parameters();
+                if (p.has("block")) {
+                    startMineToChestTask(server, npcId, villager, p);
+                    task.waitingForMineToChest = true;
+                } else {
+                    task.currentStepIndex++;
+                }
+            }
+            case "dialogue_reply" -> {
+                JsonObject p = step.parameters();
+                String text = p.has("text") ? p.get("text").getAsString() : step.description();
+                speakAsNpc(server, villager, fallbackName, text);
+                task.currentStepIndex++;
+            }
+            default -> {
+                logger.warn("[SCENARIO] npc={} unknown step intent={}, skipping", fallbackName, step.intent());
+                task.currentStepIndex++;
+            }
+        }
+    }
+
+    private void executePlaceBlock(ServerLevel level, Villager villager, String blockId, int rx, int ry, int rz) {
+        Block block = resolvePlaceableBlock(blockId);
+        if (block == null) {
+            logger.warn("[SCENARIO] Unknown block id for placement: {}", blockId);
+            return;
+        }
+        BlockPos npcPos = villager.blockPosition();
+        BlockPos target = npcPos.offset(rx, ry, rz);
+        level.setBlockAndUpdate(target, block.defaultBlockState());
+        logger.info("[SCENARIO] Placed {} at {}", blockId, target);
+    }
+
+    private void executePlacePattern(
+            ServerLevel level, Villager villager,
+            String blockId, String pattern,
+            int width, int height, int length,
+            int rx, int ry, int rz) {
+        Block block = resolvePlaceableBlock(blockId);
+        if (block == null) {
+            logger.warn("[SCENARIO] Unknown block id for pattern: {}", blockId);
+            return;
+        }
+        BlockPos origin = villager.blockPosition().offset(rx, ry, rz);
+        String patternKey = pattern.toLowerCase(Locale.ROOT);
+        List<BlockPos> positions = switch (patternKey) {
+            case "wall"    -> wallPositions(origin, width, height);
+            case "pillar"  -> pillarPositions(origin, height);
+            case "outline" -> outlinePositions(origin, width, length);
+            default        -> floorPositions(origin, width, length);
+        };
+        // Floors and outlines pave over existing ground; walls/pillars only fill air
+        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline");
+        int placed = 0;
+        for (BlockPos pos : positions) {
+            if (overwrite || level.getBlockState(pos).isAir()) {
+                level.setBlockAndUpdate(pos, block.defaultBlockState());
+                placed++;
+            }
+        }
+        logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+    }
+
+    private List<BlockPos> floorPositions(BlockPos origin, int width, int length) {
+        List<BlockPos> list = new ArrayList<>();
+        for (int dx = 0; dx < width; dx++) {
+            for (int dz = 0; dz < length; dz++) {
+                list.add(origin.offset(dx, 0, dz));
+            }
+        }
+        return list;
+    }
+
+    private List<BlockPos> wallPositions(BlockPos origin, int width, int height) {
+        List<BlockPos> list = new ArrayList<>();
+        for (int dx = 0; dx < width; dx++) {
+            for (int dy = 0; dy < height; dy++) {
+                list.add(origin.offset(dx, dy, 0));
+            }
+        }
+        return list;
+    }
+
+    private List<BlockPos> pillarPositions(BlockPos origin, int height) {
+        List<BlockPos> list = new ArrayList<>();
+        for (int dy = 0; dy < height; dy++) {
+            list.add(origin.offset(0, dy, 0));
+        }
+        return list;
+    }
+
+    private List<BlockPos> outlinePositions(BlockPos origin, int width, int length) {
+        List<BlockPos> list = new ArrayList<>();
+        for (int dx = 0; dx < width; dx++) {
+            list.add(origin.offset(dx, 0, 0));
+            list.add(origin.offset(dx, 0, length - 1));
+        }
+        for (int dz = 1; dz < length - 1; dz++) {
+            list.add(origin.offset(0, 0, dz));
+            list.add(origin.offset(width - 1, 0, dz));
+        }
+        return list;
+    }
+
+    private Block resolvePlaceableBlock(String blockId) {
+        return switch (blockId.toLowerCase(Locale.ROOT).replace("minecraft:", "")) {
+            case "oak_planks"    -> Blocks.OAK_PLANKS;
+            case "cobblestone"   -> Blocks.COBBLESTONE;
+            case "stone"         -> Blocks.STONE;
+            case "dirt"          -> Blocks.DIRT;
+            case "glass"         -> Blocks.GLASS;
+            case "oak_log"       -> Blocks.OAK_LOG;
+            case "sand"          -> Blocks.SAND;
+            case "gravel"        -> Blocks.GRAVEL;
+            case "oak_leaves"    -> Blocks.OAK_LEAVES;
+            case "bricks"        -> Blocks.BRICKS;
+            case "stone_bricks"  -> Blocks.STONE_BRICKS;
+            case "oak_slab"      -> Blocks.OAK_SLAB;
+            case "oak_stairs"    -> Blocks.OAK_STAIRS;
+            case "crafting_table" -> Blocks.CRAFTING_TABLE;
+            case "furnace"       -> Blocks.FURNACE;
+            case "chest"         -> Blocks.CHEST;
+            case "grass_block"   -> Blocks.GRASS_BLOCK;
+            default              -> resolveKnownBlock(blockId);
+        };
+    }
+
+    private enum ScenarioPhase {
+        EXECUTING,
+        DONE
+    }
+
+    private static final class ScenarioTask {
+        private final UUID requesterId;
+        private final String requesterName;
+        private final String scenarioName;
+        private final List<ScenarioStep> steps;
+        private int currentStepIndex = 0;
+        private boolean stepStarted = false;
+        private long stepDeadlineMillis = 0L;
+        private double moveTargetX;
+        private double moveTargetY;
+        private double moveTargetZ;
+        private boolean isMoveStep = false;
+        private boolean waitingForDelivery = false;
+        private boolean waitingForMineToPlayer = false;
+        private boolean waitingForMineToChest = false;
+        private boolean cancelled = false;
+
+        private ScenarioTask(UUID requesterId, String requesterName, String scenarioName, List<ScenarioStep> steps) {
+            this.requesterId = requesterId;
+            this.requesterName = requesterName;
+            this.scenarioName = scenarioName;
+            this.steps = steps;
         }
     }
 }
