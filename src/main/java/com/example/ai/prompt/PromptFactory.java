@@ -516,7 +516,15 @@ public final class PromptFactory {
             }
         }
 
-        sb.append("IMPORTANT: If the player asks about anything in the surroundings — entities, time, weather, threat level, or what is nearby — answer ONLY from the data provided above. Do not invent, assume, or use outside knowledge.\n");
+        if (memory != null && !memory.shortTerm().isEmpty()) {
+            sb.append("Recent conversation and events (what actually happened):\n");
+            int start = Math.max(0, memory.shortTerm().size() - 6);
+            for (int i = start; i < memory.shortTerm().size(); i++) {
+                sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
+            }
+        }
+
+        sb.append("IMPORTANT: If the player asks about the surroundings, answer ONLY from the data above. If they ask about recent events or tasks, answer ONLY from the recent conversation above. Do not invent or assume.\n");
         sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
         sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
         sb.append("Return ONLY this JSON with no extra text:\n");
@@ -527,8 +535,12 @@ public final class PromptFactory {
     public String searchRequestPrompt(String playerText, MemoryContext memory) {
         StringBuilder sb = new StringBuilder();
         sb.append("You are helping a Minecraft NPC understand a player's request.\n\n");
-        if (memory != null && !memory.shortTerm().isEmpty()) {
-            sb.append("Recent conversation (for resolving pronouns like 'it', 'there', 'that one'):\n");
+        // Only include recent context when the instruction contains a pronoun that needs resolving
+        String lower = playerText == null ? "" : playerText.toLowerCase(java.util.Locale.ROOT);
+        boolean hasPronoun = lower.contains(" it") || lower.contains(" that") || lower.contains(" there")
+                || lower.contains(" one") || lower.contains(" them");
+        if (hasPronoun && memory != null && !memory.shortTerm().isEmpty()) {
+            sb.append("Recent conversation (use ONLY to resolve pronouns like 'it', 'that', 'there'):\n");
             int start = Math.max(0, memory.shortTerm().size() - 4);
             for (int i = start; i < memory.shortTerm().size(); i++) {
                 sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
@@ -536,13 +548,25 @@ public final class PromptFactory {
             sb.append("\n");
         }
         sb.append("Player said: \"").append(playerText).append("\"\n\n");
-        sb.append("Is this a NEW request to find, locate, or lead to a specific creature or entity?\n");
-        sb.append("Qualifies as a search: find, locate, search for, look for, lead me to, take me to,\n");
-        sb.append("show me, where is, guide me to, bring me to, walk me to.\n\n");
-        sb.append("Do NOT classify as search if the player is asking about the result of a previous search.\n");
-        sb.append("Examples that are NOT searches: 'did you find it?', 'did you find anything?',\n");
-        sb.append("'have you found it?', 'what did you find?', 'any luck?', 'found it yet?'.\n");
-        sb.append("Those should return {\"is_search\": false}.\n\n");
+        sb.append("TASK: Decide if the player is explicitly asking the NPC to GO and find a specific creature.\n\n");
+        sb.append("RULE: Return is_search=true ONLY when the instruction contains a clear action verb\n");
+        sb.append("(find, locate, search for, look for, lead me to, take me to, show me, where is,\n");
+        sb.append("guide me to, bring me to) AND names or refers to a specific creature.\n");
+        sb.append("If either is missing, return is_search=false.\n\n");
+        sb.append("EXAMPLES — NOT a search (return {\"is_search\": false}):\n");
+        sb.append("  'how r u doing' → {\"is_search\": false}\n");
+        sb.append("  'what's up?' → {\"is_search\": false}\n");
+        sb.append("  'hello' → {\"is_search\": false}\n");
+        sb.append("  'it is a nice day' → {\"is_search\": false}\n");
+        sb.append("  'are there any enemies nearby?' → {\"is_search\": false}\n");
+        sb.append("  'do you see any mobs?' → {\"is_search\": false}\n");
+        sb.append("  'did you find it?' → {\"is_search\": false}\n");
+        sb.append("  'any luck?' → {\"is_search\": false}\n\n");
+        sb.append("EXAMPLES — IS a search:\n");
+        sb.append("  'find me a chicken' → {\"is_search\": true, \"entity_label\": \"a chicken\", \"entity_id\": \"minecraft:chicken\"}\n");
+        sb.append("  'locate a sheep' → {\"is_search\": true, \"entity_label\": \"a sheep\", \"entity_id\": \"minecraft:sheep\"}\n");
+        sb.append("  'lead me to the nearest cow' → {\"is_search\": true, \"entity_label\": \"a cow\", \"entity_id\": \"minecraft:cow\"}\n");
+        sb.append("  'search for a zombie' → {\"is_search\": true, \"entity_label\": \"a zombie\", \"entity_id\": \"minecraft:zombie\"}\n\n");
         sb.append("If yes, identify the target creature and its Minecraft entity ID.\n");
         sb.append("Use the full Minecraft entity ID format: minecraft:<name>\n");
         sb.append("Examples: minecraft:chicken, minecraft:cow, minecraft:pig, minecraft:sheep,\n");

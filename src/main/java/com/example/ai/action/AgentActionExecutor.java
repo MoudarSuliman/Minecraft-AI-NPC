@@ -2245,6 +2245,7 @@ public final class AgentActionExecutor {
                 Entity target = findNearestSearchTarget(level, villager, task);
                 if (target != null) {
                     task.targetEntityId = target.getUUID();
+                    task.lastKnownTargetPos = target.blockPosition();
                     task.phase = SearchPhase.MOVE_TO_TARGET;
                     task.patrolTarget = null;
                     task.patrolNoProgressTicks = 0;
@@ -2295,48 +2296,58 @@ public final class AgentActionExecutor {
             case MOVE_TO_TARGET -> {
                 Entity target = level.getEntity(task.targetEntityId);
                 if (target == null || !target.isAlive() || !matchesSearchTarget(target, task)) {
-                    task.targetEntityId = null;
-                    task.phase = SearchPhase.FIND_TARGET;
-                    task.failedScans = 0;
-                    task.patrolTarget = null;
-                    task.patrolNoProgressTicks = 0;
-                    task.lastPatrolDistance = Double.MAX_VALUE;
+                    if (task.lastKnownTargetPos != null) {
+                        task.phase = SearchPhase.RETURN_TO_PLAYER;
+                    } else {
+                        task.targetEntityId = null;
+                        task.phase = SearchPhase.FIND_TARGET;
+                        task.failedScans = 0;
+                        task.patrolTarget = null;
+                        task.patrolNoProgressTicks = 0;
+                        task.lastPatrolDistance = Double.MAX_VALUE;
+                    }
                     yield true;
                 }
+                task.lastKnownTargetPos = target.blockPosition();
                 villager.getNavigation().moveTo(target.getX(), target.getY(), target.getZ(), 0.9);
                 if (villager.distanceToSqr(target) <= 9.0) {
-                    task.phase = SearchPhase.BEACON;
-                    task.beaconTicksRemaining = SEARCH_BEACON_TICKS;
-                    BlockPos pos = target.blockPosition();
+                    task.phase = SearchPhase.RETURN_TO_PLAYER;
+                }
+                yield true;
+            }
+            case RETURN_TO_PLAYER -> {
+                villager.getNavigation().moveTo(requester.getX(), requester.getY(), requester.getZ(), 0.9);
+                if (villager.distanceToSqr(requester) <= 16.0) {
+                    BlockPos pos = task.lastKnownTargetPos;
+                    String locStr = pos != null
+                            ? pos.getX() + ", " + pos.getY() + ", " + pos.getZ()
+                            : "nearby";
                     speakSearchStatusWithLlm(
-                            server,
-                            villager,
-                            fallbackName,
-                            requester.getName().getString(),
-                            "beacon_start",
-                            "target=" + task.targetLabel + "; x=" + pos.getX() + "; y=" + pos.getY() + "; z="
-                                    + pos.getZ(),
-                            "I found " + task.targetLabel + " and I am staying at " + pos.getX() + ", " + pos.getY()
-                                    + ", " + pos.getZ() + ".");
+                            server, villager, fallbackName, requester.getName().getString(),
+                            "search_complete",
+                            "target=" + task.targetLabel + "; x=" + (pos != null ? pos.getX() : "?")
+                                    + "; y=" + (pos != null ? pos.getY() : "?")
+                                    + "; z=" + (pos != null ? pos.getZ() : "?"),
+                            "I found " + task.targetLabel + "! It was at " + locStr + ".");
+                    suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
+                    yield false;
                 }
                 yield true;
             }
             case BEACON -> {
                 Entity target = level.getEntity(task.targetEntityId);
                 if (target == null || !target.isAlive() || !matchesSearchTarget(target, task)) {
+                    // Already found and stood next to target — count as success even if it wandered off
                     speakSearchStatusWithLlm(
                             server,
                             villager,
                             fallbackName,
                             requester.getName().getString(),
-                            "target_lost",
+                            "search_complete",
                             "target=" + task.targetLabel,
-                            "Lost the target. Resuming search.");
-                    task.targetEntityId = null;
-                    task.phase = SearchPhase.FIND_TARGET;
-                    task.failedScans = 0;
-                    task.searchRadius = Math.max(task.searchRadius, SEARCH_BASE_RADIUS);
-                    yield true;
+                            "Search complete. " + task.targetLabel + " moved away.");
+                    suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
+                    yield false;
                 }
                 villager.getNavigation().moveTo(target.getX(), target.getY(), target.getZ(), 0.75);
                 task.beaconTicksRemaining -= 1;
@@ -3414,6 +3425,7 @@ public final class AgentActionExecutor {
     private enum SearchPhase {
         FIND_TARGET,
         MOVE_TO_TARGET,
+        RETURN_TO_PLAYER,
         BEACON,
         DONE
     }
@@ -3474,6 +3486,7 @@ public final class AgentActionExecutor {
         private int patrolNoProgressTicks = 0;
         private double lastPatrolDistance = Double.MAX_VALUE;
         private UUID targetEntityId;
+        private BlockPos lastKnownTargetPos;
         private BlockPos patrolTarget;
         private SearchPhase phase = SearchPhase.FIND_TARGET;
         private int beaconTicksRemaining = 0;
