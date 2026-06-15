@@ -1,43 +1,28 @@
 package com.example.ai.trade;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class TradeOfferEngine {
     private static final int MAX_STOCK_REFERENCE = 64;
-    private static final int MAX_DISCOUNT_PCT = 15;
     private static final long OFFER_EXPIRY_MILLIS = 120_000L;
 
-    private final Map<String, Integer> basePricesByItem;
-    private final Map<String, Integer> maxUnitPriceByItem;
+    private final Map<String, PriceConfig> configs = new ConcurrentHashMap<>();
 
-    public TradeOfferEngine(Map<String, Integer> basePricesByItem, Map<String, Integer> maxUnitPriceByItem) {
-        this.basePricesByItem = basePricesByItem;
-        this.maxUnitPriceByItem = maxUnitPriceByItem;
+    public TradeOfferEngine(Map<String, PriceConfig> initialConfigs) {
+        configs.putAll(initialConfigs);
     }
 
-    public static TradeOfferEngine defaultEngine() {
-        return new TradeOfferEngine(Map.of(
-                "minecraft:grass_block", 1,
-                "minecraft:glass", 2,
-                "minecraft:cobblestone", 1,
-                "minecraft:oak_log", 2,
-                "minecraft:oak_planks", 1,
-                "minecraft:stone", 1,
-                "minecraft:dirt", 1,
-                "minecraft:sand", 1,
-                "minecraft:stick", 1
-        ), Map.of(
-                "minecraft:grass_block", 2,
-                "minecraft:cobblestone", 2,
-                "minecraft:dirt", 2,
-                "minecraft:sand", 2,
-                "minecraft:stone", 2,
-                "minecraft:oak_planks", 2,
-                "minecraft:glass", 3,
-                "minecraft:oak_log", 3,
-                "minecraft:stick", 2
-        ));
+    public void updatePrices(Map<String, PriceConfig> newConfigs) {
+        configs.clear();
+        configs.putAll(newConfigs);
+    }
+
+    public Map<String, PriceConfig> currentConfigs() {
+        return Collections.unmodifiableMap(new LinkedHashMap<>(configs));
     }
 
     public TradeOffer quote(
@@ -62,14 +47,16 @@ public final class TradeOfferEngine {
             Integer suggestedTotalPrice
     ) {
         int normalizedQuantity = Math.max(1, quantity);
-        int base = basePricesByItem.getOrDefault(itemId, 2);
+        PriceConfig cfg = configs.getOrDefault(itemId, PriceConfig.defaults(2));
+        int base = cfg.base();
+        int itemCap = cfg.max();
+        int discountPct = cfg.discountPct();
 
         double scarcityMultiplier = 1.0 + (1.0 - Math.min(stock, MAX_STOCK_REFERENCE) / (double) MAX_STOCK_REFERENCE) * 0.35;
         double reputationMultiplier = 1.1 - ((Math.max(-100, Math.min(100, playerReputation)) + 100) / 200.0) * 0.2;
         double demandMultiplier = urgentDemand ? 1.1 : 1.0;
 
         int computedUnitPrice = (int) Math.round(base * scarcityMultiplier * reputationMultiplier * demandMultiplier);
-        int itemCap = maxUnitPriceByItem.getOrDefault(itemId, base * 3);
         int boundedUnitPrice = clampPrice(itemCap, suggestedUnitPrice, computedUnitPrice);
         if (suggestedTotalPrice != null && suggestedTotalPrice > 0) {
             int totalCap = itemCap * normalizedQuantity;
@@ -79,7 +66,7 @@ public final class TradeOfferEngine {
         int totalPrice = boundedUnitPrice * normalizedQuantity;
         long expiresAt = nowMillis + OFFER_EXPIRY_MILLIS;
 
-        return new TradeOffer(itemId, normalizedQuantity, boundedUnitPrice, totalPrice, MAX_DISCOUNT_PCT, expiresAt);
+        return new TradeOffer(itemId, normalizedQuantity, boundedUnitPrice, totalPrice, discountPct, expiresAt);
     }
 
     private int clampPrice(int itemCap, Integer suggestedPrice, int computedPrice) {
@@ -96,7 +83,6 @@ public final class TradeOfferEngine {
         if (proposedTotalPrice < minimumAcceptableTotal) {
             return new TradeCounterResult(false, minimumAcceptableTotal, currentOffer);
         }
-
         int safeTotal = Math.max(1, proposedTotalPrice);
         int unitPrice = Math.max(1, safeTotal / Math.max(1, currentOffer.quantity()));
         TradeOffer acceptedOffer = new TradeOffer(
@@ -115,6 +101,6 @@ public final class TradeOfferEngine {
     }
 
     public Set<String> supportedItems() {
-        return basePricesByItem.keySet();
+        return configs.keySet();
     }
 }

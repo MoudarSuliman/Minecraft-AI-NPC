@@ -1,10 +1,16 @@
 package com.example;
 
 import com.example.ai.runtime.AutonomousNpcRuntime;
+import com.example.ai.trade.PriceConfig;
+import com.example.ai.trade.TradePriceStore;
+import com.example.network.OpenTradePricesPayload;
+import com.example.network.SaveTradePricesPayload;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -18,13 +24,10 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 public class ExampleMod implements ModInitializer {
 	public static final String MOD_ID = "llm_npc";
-
-	// This logger is used to write text to the console and the log file.
-	// It is considered best practice to use your mod id as the logger's name.
-	// That way, it's clear which mod wrote info, warnings, and errors.
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 	private AutonomousNpcRuntime runtime;
 
@@ -32,6 +35,24 @@ public class ExampleMod implements ModInitializer {
 	public void onInitialize() {
 		runtime = AutonomousNpcRuntime.createDefault(LOGGER);
 		ServerTickEvents.END_SERVER_TICK.register(runtime::onServerTick);
+
+		PayloadTypeRegistry.clientboundPlay().register(OpenTradePricesPayload.TYPE, OpenTradePricesPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(SaveTradePricesPayload.TYPE, SaveTradePricesPayload.CODEC);
+
+		ServerPlayNetworking.registerGlobalReceiver(SaveTradePricesPayload.TYPE, (payload, context) -> {
+			context.server().execute(() -> {
+				try {
+					Map<String, PriceConfig> prices = TradePriceStore.fromJson(payload.pricesJson());
+					runtime.updateTradePrices(prices);
+					TradePriceStore.save(prices);
+					context.player().sendSystemMessage(
+							Component.literal("[LLM NPC] Trade prices saved (" + prices.size() + " items)."));
+				} catch (Exception e) {
+					LOGGER.error("[LLM NPC] Failed to save trade prices", e);
+				}
+			});
+		});
+
 		registerCommands();
 		LOGGER.info("LLM NPC runtime initialized.");
 	}
@@ -67,7 +88,17 @@ public class ExampleMod implements ModInitializer {
 					Commands.literal("llm_debug")
 							.executes(context -> debugNearestVillager(context.getSource().getPlayerOrException()))
 			);
+			dispatcher.register(
+					Commands.literal("llm_trade_prices")
+							.executes(context -> openTradePrices(context.getSource().getPlayerOrException()))
+			);
 		});
+	}
+
+	private int openTradePrices(ServerPlayer player) {
+		String json = TradePriceStore.toJson(runtime.currentTradePriceConfigs());
+		ServerPlayNetworking.send(player, new OpenTradePricesPayload(json));
+		return 1;
 	}
 
 	private int spawnAndBindVillager(ServerPlayer player, String name) {
@@ -94,7 +125,6 @@ public class ExampleMod implements ModInitializer {
 			player.sendSystemMessage(Component.literal("[LLM NPC] No villager found within 20 blocks."));
 			return 0;
 		}
-
 		String displayName = nearest.getName().getString();
 		runtime.registerAgent(nearest.getUUID(), displayName, player.getUUID());
 		player.sendSystemMessage(Component.literal("[LLM NPC] Bound nearest villager: " + displayName));
@@ -111,7 +141,6 @@ public class ExampleMod implements ModInitializer {
 			player.sendSystemMessage(Component.literal("[LLM NPC] Nearest villager is not bound. Use /llm_bind_nearest first."));
 			return 0;
 		}
-
 		runtime.enqueuePlayerUtterance(nearest.getUUID(), player.getName().getString(), message);
 		player.sendSystemMessage(Component.literal("[LLM NPC] Instruction queued for " + nearest.getName().getString() + ": " + message));
 		return 1;
@@ -154,10 +183,7 @@ public class ExampleMod implements ModInitializer {
 		}
 		AABB searchBox = new AABB(player.blockPosition()).inflate(radius);
 		List<Villager> villagers = world.getEntitiesOfClass(Villager.class, searchBox, Entity::isAlive);
-		if (villagers.isEmpty()) {
-			return null;
-		}
-
+		if (villagers.isEmpty()) return null;
 		return villagers.stream()
 				.min(Comparator.comparingDouble(v -> v.distanceToSqr(player)))
 				.orElseThrow();
