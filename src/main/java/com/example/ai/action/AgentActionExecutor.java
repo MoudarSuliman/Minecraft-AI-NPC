@@ -94,6 +94,7 @@ public final class AgentActionExecutor {
     private final Map<UUID, SearchTask> activeSearchTasks = new ConcurrentHashMap<>();
     private final Map<UUID, ScoutTask> activeScoutTasks = new ConcurrentHashMap<>();
     private final Map<UUID, ScenarioTask> activeScenarioTasks = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastActionSummaryByNpc = new ConcurrentHashMap<>();
     private final ScenarioPlanParser scenarioPlanParser = new ScenarioPlanParser();
     private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
@@ -205,8 +206,8 @@ public final class AgentActionExecutor {
                 .unwrapKey()
                 .map(Object::toString)
                 .orElse(level.dimension().toString());
-        long timeOfDay = level.getGameTime() % 24000L;
-        boolean isNight = timeOfDay >= 13000L && timeOfDay <= 23000L;
+        long timeOfDay = level.getOverworldClockTime() % 24000L;
+        boolean isNight = !level.isBrightOutside();
         String weather;
         if (level.isThundering()) {
             weather = "thunder";
@@ -249,6 +250,7 @@ public final class AgentActionExecutor {
                 || lower.contains("vindicator")
                 || lower.contains("phantom");
     }
+
 
     public boolean applyNextAction(MinecraftServer server, UUID npcId, String fallbackName) {
         Villager villager = findVillager(server, npcId);
@@ -639,6 +641,10 @@ public final class AgentActionExecutor {
         speakAsNpc(server, villager, fallbackName,
                 groundedRecipeText(responseText, fallbackReply.toString(), ingredientOffer,
                         recipeSummary.summaryText(), nearbyFacts));
+        lastActionSummaryByNpc.put(npcId, "Explained recipe for "
+                + readableItemName(BuiltInRegistries.ITEM.getKey(targetOutput).toString())
+                + ": " + recipeSummary.summaryText()
+                + (missingIngredients.isEmpty() ? ". All ingredients available." : ". Missing: " + missingSummary + "."));
         return true;
     }
 
@@ -688,6 +694,8 @@ public final class AgentActionExecutor {
                 player.getUUID());
         task.nextStatusAtMillis = System.currentTimeMillis() + SEARCH_STATUS_COOLDOWN_MILLIS;
         activeSearchTasks.put(npcId, task);
+        lastActionSummaryByNpc.put(npcId, "Searching for " + request.label()
+                + " (entity: " + request.entityTypeId() + "). Will report location when found.");
         suppressTradeGreeting(npcId, player.getUUID(), SEARCH_TRADE_SUPPRESS_MILLIS);
         speakSearchStatusWithLlm(
                 server,
@@ -751,6 +759,8 @@ public final class AgentActionExecutor {
         String distance = scoutDecision.parameters().has("distance")
                 ? String.valueOf(Math.max(24, scoutDecision.parameters().get("distance").getAsInt()))
                 : String.valueOf(SCOUT_BASE_DISTANCE);
+        lastActionSummaryByNpc.put(npcId, "Scouting " + direction + " for approximately "
+                + distance + " blocks to observe the area.");
         speakScoutStatus(
                 server,
                 villager,
@@ -3774,6 +3784,7 @@ public final class AgentActionExecutor {
         ScenarioTask task = new ScenarioTask(
                 player.getUUID(), player.getName().getString(), plan.scenario(), plan.steps());
         activeScenarioTasks.put(npcId, task);
+        lastActionSummaryByNpc.put(npcId, buildScenarioPlanSummary(plan));
         String announce = plan.announce() == null || plan.announce().isBlank()
                 ? "Starting " + plan.scenario() + "."
                 : plan.announce();
@@ -3781,6 +3792,23 @@ public final class AgentActionExecutor {
         logger.info("[SCENARIO] npc={} player={} scenario='{}' steps={}",
                 fallbackName, playerName, plan.scenario(), plan.steps().size());
         return true;
+    }
+
+    public String lastActionSummary(UUID npcId) {
+        return lastActionSummaryByNpc.getOrDefault(npcId, "");
+    }
+
+    private String buildScenarioPlanSummary(com.example.ai.scenario.ScenarioPlan plan) {
+        StringBuilder sb = new StringBuilder("Planned to build ").append(plan.scenario()).append(".");
+        for (com.example.ai.scenario.ScenarioStep step : plan.steps()) {
+            if ("fetch_from_chest".equals(step.intent())) {
+                JsonObject p = step.parameters();
+                String itemId = p.has("item_id") ? p.get("item_id").getAsString() : "unknown";
+                int count = p.has("count") ? p.get("count").getAsInt() : 0;
+                sb.append(" Requires ").append(count).append("x ").append(itemId).append(" from a chest.");
+            }
+        }
+        return sb.toString();
     }
 
     private boolean isScenarioIntent(String raw) {
@@ -3999,10 +4027,11 @@ public final class AgentActionExecutor {
             case "wall"    -> wallPositions(origin, width, height);
             case "pillar"  -> pillarPositions(origin, height);
             case "outline" -> outlinePositions(origin, width, length);
+            case "hut"     -> hutPositions(origin, width, height, length);
             default        -> floorPositions(origin, width, length);
         };
-        // Floors and outlines pave over existing ground; walls/pillars only fill air
-        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline");
+        // Floors, outlines and huts overwrite existing ground; walls/pillars only fill air
+        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
         int placed = 0;
         for (BlockPos pos : positions) {
             if (overwrite || level.getBlockState(pos).isAir()) {
@@ -4031,6 +4060,30 @@ public final class AgentActionExecutor {
             }
         }
         return list;
+    }
+
+    private List<BlockPos> hutPositions(BlockPos origin, int width, int height, int length) {
+        java.util.LinkedHashSet<BlockPos> set = new java.util.LinkedHashSet<>();
+
+        for (int dx = 0; dx < width; dx++)
+            for (int dz = 0; dz < length; dz++)
+                set.add(origin.offset(dx, 0, dz));
+
+        for (int dy = 1; dy < height; dy++) {
+            for (int dx = 0; dx < width; dx++) {
+                set.add(origin.offset(dx, dy, 0));
+                set.add(origin.offset(dx, dy, length - 1));
+            }
+            for (int dz = 1; dz < length - 1; dz++) {
+                set.add(origin.offset(0, dy, dz));
+                set.add(origin.offset(width - 1, dy, dz));
+            }
+        }
+
+        for (int dx = 0; dx < width; dx++)
+            for (int dz = 0; dz < length; dz++)
+                set.add(origin.offset(dx, height, dz));
+        return new ArrayList<>(set);
     }
 
     private List<BlockPos> pillarPositions(BlockPos origin, int height) {

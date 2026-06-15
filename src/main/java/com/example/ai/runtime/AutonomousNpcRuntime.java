@@ -180,8 +180,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("recipe",
-                        "Handled recipe instruction from " + speaker + ": " + latestInstruction));
+                storeActionMemory(npcId, speaker, latestInstruction, "recipe");
                 return;
             }
 
@@ -190,8 +189,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("search",
-                        "Handled search instruction from " + speaker + ": " + latestInstruction));
+                storeActionMemory(npcId, speaker, latestInstruction, "search");
                 return;
             }
 
@@ -200,8 +198,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scout",
-                        "Handled scout instruction from " + speaker + ": " + latestInstruction));
+                storeActionMemory(npcId, speaker, latestInstruction, "scout");
                 return;
         }
 
@@ -270,8 +267,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory, snapshot, true)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scenario",
-                        "Handled scenario instruction from " + speaker + ": " + latestInstruction));
+                storeActionMemory(npcId, speaker, latestInstruction, "scenario");
                 return;
             }
         }
@@ -447,6 +443,15 @@ public final class AutonomousNpcRuntime {
             pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
         }
+    }
+
+    private void storeActionMemory(UUID npcId, String speaker, String instruction, String type) {
+        String summary = actionExecutor.lastActionSummary(npcId);
+        String entry = summary.isBlank()
+                ? speaker + " asked me to " + type + ": " + instruction
+                : summary + " (requested by " + speaker + ")";
+        memoryStore.appendWorking(npcId, MemoryEntry.episodic(type, entry));
+        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic(type, entry));
     }
 
     private record AgentHandle(UUID npcId, String npcName, UUID ownerPlayerId) {
