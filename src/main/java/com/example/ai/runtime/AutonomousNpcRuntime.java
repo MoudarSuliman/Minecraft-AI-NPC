@@ -330,6 +330,14 @@ public final class AutonomousNpcRuntime {
         return agents.containsKey(npcId);
     }
 
+    public void updateTradePrices(java.util.Map<String, com.example.ai.trade.PriceConfig> configs) {
+        actionExecutor.updateTradePrices(configs);
+    }
+
+    public java.util.Map<String, com.example.ai.trade.PriceConfig> currentTradePriceConfigs() {
+        return actionExecutor.currentTradePriceConfigs();
+    }
+
     public String statusForAgent(UUID npcId) {
         AgentHandle handle = agents.get(npcId);
         if (handle == null) {

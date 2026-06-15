@@ -16,8 +16,10 @@ import com.example.ai.trade.TradeCounterResult;
 import com.example.ai.trade.TradeIntentClassifierDraft;
 import com.example.ai.trade.TradeIntentClassifierParser;
 import com.example.ai.trade.TradeIntentType;
+import com.example.ai.trade.PriceConfig;
 import com.example.ai.trade.TradeOffer;
 import com.example.ai.trade.TradeOfferEngine;
+import com.example.ai.trade.TradePriceStore;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.core.BlockPos;
@@ -81,7 +83,7 @@ public final class AgentActionExecutor {
     private final PromptFactory promptFactory;
     private final LlmRouter llmRouter;
     private final SemanticPerceptionService perceptionService = new SemanticPerceptionService();
-    private final TradeOfferEngine tradeOfferEngine = TradeOfferEngine.defaultEngine();
+    private final TradeOfferEngine tradeOfferEngine = new TradeOfferEngine(TradePriceStore.load());
     private final TradeIntentClassifierParser tradeIntentClassifierParser = new TradeIntentClassifierParser();
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
@@ -110,6 +112,14 @@ public final class AgentActionExecutor {
         this.logger = logger;
         this.promptFactory = promptFactory;
         this.llmRouter = llmRouter;
+    }
+
+    public void updateTradePrices(Map<String, PriceConfig> configs) {
+        tradeOfferEngine.updatePrices(configs);
+    }
+
+    public Map<String, PriceConfig> currentTradePriceConfigs() {
+        return tradeOfferEngine.currentConfigs();
     }
 
     public boolean execute(UUID npcId, AgentDecision decision) {
@@ -3843,8 +3853,6 @@ public final class AgentActionExecutor {
         if (task.stepStarted) return true;
 
         ScenarioStep step = task.steps.get(task.currentStepIndex);
-        logger.info("[SCENARIO] npc={} executing step {} intent={} desc={}",
-                fallbackName, task.currentStepIndex, step.intent(), step.description());
         executeScenarioStep(server, npcId, villager, fallbackName, task, step);
 
         // Delegated steps (move_to, fetch, mine) set a flag above; mark started so we don't re-execute
