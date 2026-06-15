@@ -10,6 +10,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.npc.villager.Villager;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
@@ -38,6 +39,15 @@ public class ExampleMod implements ModInitializer {
 	private void registerCommands() {
 		CommandRegistrationCallback.EVENT.register((dispatcher, buildContext, selection) -> {
 			dispatcher.register(
+					Commands.literal("llm_spawn")
+							.executes(context -> spawnAndBindVillager(
+									context.getSource().getPlayerOrException(), null))
+							.then(Commands.argument("name", StringArgumentType.greedyString())
+									.executes(context -> spawnAndBindVillager(
+											context.getSource().getPlayerOrException(),
+											StringArgumentType.getString(context, "name"))))
+			);
+			dispatcher.register(
 					Commands.literal("llm_bind_nearest")
 							.executes(context -> bindNearestVillager(context.getSource().getPlayerOrException()))
 			);
@@ -58,6 +68,24 @@ public class ExampleMod implements ModInitializer {
 							.executes(context -> debugNearestVillager(context.getSource().getPlayerOrException()))
 			);
 		});
+	}
+
+	private int spawnAndBindVillager(ServerPlayer player, String name) {
+		if (!(player.level() instanceof ServerLevel level)) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] Could not access server world."));
+			return 0;
+		}
+		Villager villager = new Villager(EntityType.VILLAGER, level);
+		villager.teleportTo(player.getX(), player.getY(), player.getZ());
+		if (name != null && !name.isBlank()) {
+			villager.setCustomName(Component.literal(name));
+			villager.setCustomNameVisible(true);
+		}
+		level.addFreshEntity(villager);
+		String displayName = villager.getName().getString();
+		runtime.registerAgent(villager.getUUID(), displayName, player.getUUID());
+		player.sendSystemMessage(Component.literal("[LLM NPC] Spawned and bound villager: " + displayName));
+		return 1;
 	}
 
 	private int bindNearestVillager(ServerPlayer player) {
