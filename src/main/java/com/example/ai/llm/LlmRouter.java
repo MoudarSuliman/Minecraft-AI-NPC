@@ -1,5 +1,7 @@
 package com.example.ai.llm;
 
+import org.slf4j.LoggerFactory;
+
 public final class LlmRouter {
     private final LlmClient primary;
     private final LlmClient escalated;
@@ -13,6 +15,11 @@ public final class LlmRouter {
         LlmConfig cfg = LlmConfig.load();
         LlmClient ollama = new OllamaLlmClient("http://127.0.0.1:11434/api/generate", "llama3");
         LlmClient cloud  = buildCloudClient(cfg, ollama);
+
+        String cloudDesc = (cfg.cloudApiKey != null && !cfg.cloudApiKey.isBlank())
+                ? cfg.cloudProvider + "/" + cfg.cloudModel
+                : "none (no API key)";
+        LoggerFactory.getLogger("llm_npc").info("[LLM] mode={} cloud={}", cfg.mode, cloudDesc);
 
         return switch (cfg.mode) {
             case local -> new LlmRouter(ollama, ollama);
