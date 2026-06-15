@@ -30,11 +30,18 @@ public final class PromptFactory {
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
                 + "IMPORTANT — intent selection rules in priority order:\n"
-                + "1. Any message that is a QUESTION or asks about your abilities, knowledge, or nature MUST use dialogue_reply — "
-                + "   this overrides ALL other rules including expected_intent. "
-                + "   Examples: 'do you have the ability to mine?' -> dialogue_reply. 'can you build?' -> dialogue_reply. "
-                + "   'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. 'hey' -> dialogue_reply. "
-                + "   'how are you' -> dialogue_reply. 'what are you doing' -> dialogue_reply.\n"
+                + "1. TRADE intents take top priority. Use a trade_* intent whenever the player's message relates to "
+                + "buying, selling, trading, stock, pricing, or items the NPC sells — even if phrased as a question. "
+                + "   trade_offer: player wants to buy/trade/get items, or asks what you sell, what you have in stock, "
+                + "     what something costs, or expresses general trading intent. "
+                + "     Examples: 'what do you sell?' -> trade_offer. 'what items do you have?' -> trade_offer. "
+                + "     'I want to buy wood' -> trade_offer. 'give me the items' -> trade_offer. "
+                + "     'do you have oak logs?' -> trade_offer. 'how much does wood cost?' -> trade_offer. "
+                + "     'I want to trade' -> trade_offer. 'what can I buy?' -> trade_offer.\n"
+                + "   trade_accept: player agrees to a deal. Examples: 'deal', 'ok', 'yes', 'fine', 'sure'.\n"
+                + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
+                + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
+                + "   NEVER use dialogue_reply for anything trade or stock related.\n"
                 + "2. If latest_instruction asks to build, construct, place, or create a structure or floor or wall of blocks, "
                 + "use intent build_structure with parameters {\"description\":\"...\"}. "
                 + "Examples: 'build a 3x3 cobblestone floor' -> build_structure. 'construct a wall' -> build_structure.\n"
@@ -46,22 +53,16 @@ public final class PromptFactory {
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
                 + "6. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "7. If the player wants to buy, sell, trade, exchange, or make a deal for items, use trade_offer. "
-                + "If the player accepts a trade offer, use trade_accept. "
-                + "If the player rejects or declines, use trade_decline. "
-                + "If the player proposes different terms or a counter-offer, use trade_counter. "
-                + "Examples: 'I want to buy wood' -> trade_offer. 'deal' -> trade_accept. 'no thanks' -> trade_decline. 'how about 2 emeralds instead?' -> trade_counter. "
-                + "NEVER use dialogue_reply for trade requests — always use a trade_* intent.\n"
-                + "8. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
+                + "7. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
                 + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
                 + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
                 + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb.\n"
-                + "9. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
-                + "10. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
-                + "11. For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
+                + "8. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
+                + "9. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
+                + "10. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
+                + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
                 + "NEVER repeat or echo the player's message. "
-                + "Example: player says 'you there?' -> parameters.text = 'Yes, I am here. What do you need?' "
-                + "Example: player says 'hello' -> parameters.text = 'Hello there! How can I help you?'"
+                + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply."
                 : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
         return payload.toString();
     }
@@ -414,7 +415,8 @@ public final class PromptFactory {
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
                         + "Use intent none only when the utterance is truly unrelated to trade. "
-                        + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer.");
+                        + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer. "
+                + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.");
         return payload.toString();
     }
 
@@ -443,7 +445,7 @@ public final class PromptFactory {
                 + "- active offer + 'deal/yes/sure' => accept_offer.\n"
                 + "- active offer + 'no/nope/not now' => decline_offer.\n"
                 + "- explicit emerald counter => counter_offer with counter_total_price.\n"
-                + "- If follow-up omits item and last requested item exists, reuse it.\n"
+                                + "- If follow-up omits item and last requested item exists, reuse it.\n"
                 + "- Use none only if unrelated to trade.\n"
                 + "- Scout/explore/check area instructions are not trade.\n"
                 + "Return ONLY this JSON object with no extra text:\n"
@@ -799,6 +801,23 @@ public final class PromptFactory {
                 "Return strict JSON only. Write one short in-character sentence (max 14 words) where the NPC "
                 + "announces they have delivered the mined blocks to the player's inventory. "
                 + "Use first-person speech. No system tags, no narration, no follow-up questions.");
+        return payload.toString();
+    }
+
+    public String challengeClassifierPrompt(String lastInstruction, String currentInstruction) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "challenge_classifier");
+        payload.addProperty("previous_player_request", lastInstruction);
+        payload.addProperty("current_player_utterance", currentInstruction);
+        payload.addProperty("instructions",
+                "Decide if the current utterance is a direct challenge or retry of the EXACT previous action — "
+                + "meaning the player doubts the result and wants the NPC to redo it "
+                + "(e.g. 'are you sure?', 'check again', 'really?', 'you sure you don't have any?', 'try again', 'look harder'). "
+                + "is_challenge must be FALSE if the current utterance is: a price negotiation, a discount request, "
+                + "a new purchase request, a question about a different topic, small talk, or anything that introduces "
+                + "new intent rather than asking to redo the previous action. "
+                + "Return strict JSON only: {\"is_challenge\": true} or {\"is_challenge\": false}. "
+                + "No other fields, no markdown.");
         return payload.toString();
     }
 

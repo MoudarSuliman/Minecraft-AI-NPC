@@ -58,7 +58,7 @@ import java.util.concurrent.CompletableFuture;
 public final class AgentActionExecutor {
     private static final int CHEST_SCAN_RADIUS = 16;
     private static final int MINE_SCAN_RADIUS = 8;
-    private static final int TRADE_SCAN_RADIUS = 18;
+    private static final int TRADE_SCAN_RADIUS = 48;
     private static final int SEARCH_BASE_RADIUS = 24;
     private static final int SEARCH_MAX_RADIUS = 96;
     private static final int SEARCH_BEACON_TICKS = 20 * 30;
@@ -567,6 +567,7 @@ public final class AgentActionExecutor {
         session.lastInteractionAtMillis = now;
         ServerLevel level = (ServerLevel) villager.level();
         List<RecipeIngredientStatus> ingredientStatuses = evaluateIngredientStatus(
+                server,
                 level,
                 villager.blockPosition(),
                 player,
@@ -804,8 +805,8 @@ public final class AgentActionExecutor {
             return true;
         }
 
-        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(villager, player, instruction, session, snapshot,
-                memory, npcId);
+        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(server, villager, player, instruction, session,
+                snapshot, memory, npcId);
         ParsedTradeIntent tradeIntent = resolveTradeIntent(llmClassified, session);
         logger.info(
                 "[TRADE-DEBUG] npc={} utterance='{}' llm_intent={} resolved_intent={} resolved_item={} resolved_qty={} resolved_counter={}",
@@ -838,7 +839,7 @@ public final class AgentActionExecutor {
                 instruction,
                 mode,
                 session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
-                tradeStockSummary(villager),
+                tradeStockSummary(server, villager),
                 tradeFactsForIntent(tradeIntent, session, instruction),
                 snapshot,
                 memory);
@@ -1164,11 +1165,14 @@ public final class AgentActionExecutor {
             long now,
             TradeNegotiationDraft draft) {
         ServerLevel level = (ServerLevel) villager.level();
+        ServerPlayer player = findPlayerByName(server, playerName);
+        BlockPos scanCenter = (player != null && player.level() == level)
+                ? player.blockPosition() : villager.blockPosition();
         String requestedItemId = tradeIntent == null ? "" : tradeIntent.itemId();
         if (requestedItemId != null && !requestedItemId.isBlank() && tradeOfferEngine.supportsItem(requestedItemId)) {
             Item requestedItem = resolveKnownItem(requestedItemId);
             if (requestedItem != null) {
-                int stock = countItemInNearbyChests(level, villager.blockPosition(), requestedItem, TRADE_SCAN_RADIUS);
+                int stock = countItemInNearbyChests(server, level, scanCenter, requestedItem, TRADE_SCAN_RADIUS);
                 session.lastRequestedItemId = requestedItemId;
                 session.lastRequestedQuantity = 1;
                 if (stock <= 0) {
@@ -1194,7 +1198,7 @@ public final class AgentActionExecutor {
             if (item == null) {
                 continue;
             }
-            int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+            int stock = countItemInNearbyChests(server, level, scanCenter, item, TRADE_SCAN_RADIUS);
             if (stock <= 0) {
                 continue;
             }
@@ -1239,7 +1243,7 @@ public final class AgentActionExecutor {
             return true;
         }
 
-        int stock = countItemInNearbyChests((ServerLevel) villager.level(), villager.blockPosition(),
+        int stock = countItemInNearbyChests(server, (ServerLevel) villager.level(), villager.blockPosition(),
                 resolveKnownItem(itemId), TRADE_SCAN_RADIUS);
         if (stock < quantity) {
             String msg = parseRecipeResponseText(llmRouter.generate(
@@ -1340,7 +1344,7 @@ public final class AgentActionExecutor {
             return true;
         }
         ServerLevel level = (ServerLevel) villager.level();
-        int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+        int stock = countItemInNearbyChests(server, level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
         if (stock < offer.quantity()) {
             session.activeOffer = null;
             speakAsNpc(server, villager, fallbackName, "I ran out of stock before completing the deal.");
@@ -1352,7 +1356,7 @@ public final class AgentActionExecutor {
             speakAsNpc(server, villager, fallbackName, "I couldn't take payment. Try again.");
             return true;
         }
-        ItemStack collected = withdrawFromNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS,
+        ItemStack collected = withdrawFromNearbyChests(server, level, villager.blockPosition(), item, TRADE_SCAN_RADIUS,
                 offer.quantity());
         if (collected.getCount() < offer.quantity()) {
             player.getInventory().add(new ItemStack(Items.EMERALD, offer.totalPrice()));
@@ -1373,10 +1377,10 @@ public final class AgentActionExecutor {
                     remaining);
         }
 
-        BlockPos chestPos = findNearestChest(level, villager.blockPosition(), CHEST_SCAN_RADIUS);
+        BlockPos chestPos = findNearestChest(server, level, villager.blockPosition(), CHEST_SCAN_RADIUS);
         ItemStack emeraldStack = new ItemStack(Items.EMERALD, offer.totalPrice());
         if (chestPos != null) {
-            ItemStack emeraldRemaining = insertIntoChest(level, chestPos, emeraldStack);
+            ItemStack emeraldRemaining = insertIntoChest(server, level, chestPos, emeraldStack);
             if (!emeraldRemaining.isEmpty()) {
                 Containers.dropItemStack(level, villager.getX(), villager.getY() + 1.0, villager.getZ(),
                         emeraldRemaining);
@@ -1404,7 +1408,7 @@ public final class AgentActionExecutor {
         return null;
     }
 
-    private String tradeStockSummary(Villager villager) {
+    private String tradeStockSummary(MinecraftServer server, Villager villager) {
         if (!(villager.level() instanceof ServerLevel level)) {
             return "unavailable";
         }
@@ -1414,7 +1418,7 @@ public final class AgentActionExecutor {
             if (item == null) {
                 continue;
             }
-            int stock = countItemInNearbyChests(level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
+            int stock = countItemInNearbyChests(server, level, villager.blockPosition(), item, TRADE_SCAN_RADIUS);
             if (stock > 0) {
                 entries.add(readableItemName(itemId) + "=" + stock);
             }
@@ -1784,6 +1788,10 @@ public final class AgentActionExecutor {
         return holder[0];
     }
 
+    public boolean isVillagerAlive(MinecraftServer server, UUID npcId) {
+        return findVillager(server, npcId) != null;
+    }
+
     private Villager findVillager(MinecraftServer server, UUID npcId) {
         for (ServerLevel level : server.getAllLevels()) {
             Entity entity = level.getEntity(npcId);
@@ -1949,7 +1957,7 @@ public final class AgentActionExecutor {
             return false;
         }
 
-        BlockPos chestPos = findNearestChest(level, villager.blockPosition(), CHEST_SCAN_RADIUS);
+        BlockPos chestPos = findNearestChest(server, level, villager.blockPosition(), CHEST_SCAN_RADIUS);
         if (chestPos == null) {
             notifyNearbyPlayers(server, villager, "[LLM NPC] I could not find a nearby chest for storage.");
             return false;
@@ -2073,7 +2081,7 @@ public final class AgentActionExecutor {
                 if (task.heldStack.isEmpty()) {
                     yield false;
                 }
-                ItemStack remaining = insertIntoChest(level, task.chestPos, task.heldStack);
+                ItemStack remaining = insertIntoChest(server, level, task.chestPos, task.heldStack);
                 if (!remaining.isEmpty()) {
                     task.heldStack = remaining;
                     notifyNearbyPlayers(server, villager, "[LLM NPC] Chest is full. Could not store all mined blocks.");
@@ -2709,7 +2717,7 @@ public final class AgentActionExecutor {
         double bestDistance = Double.MAX_VALUE;
 
         for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -4; dy <= 4; dy++) {
+            for (int dy = -16; dy <= 16; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos pos = center.offset(dx, dy, dz);
                     BlockEntity blockEntity = level.getBlockEntity(pos);
@@ -2737,11 +2745,19 @@ public final class AgentActionExecutor {
         return bestPos;
     }
 
-    private BlockPos findNearestChest(ServerLevel level, BlockPos center, int radius) {
+    private BlockPos findNearestChest(MinecraftServer server, ServerLevel level, BlockPos center, int radius) {
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> findNearestChest(server, level, center, radius)).get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch findNearestChest to main thread", e);
+                return null;
+            }
+        }
         BlockPos bestPos = null;
         double bestDistance = Double.MAX_VALUE;
         for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -4; dy <= 4; dy++) {
+            for (int dy = -16; dy <= 16; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos pos = center.offset(dx, dy, dz);
                     BlockEntity blockEntity = level.getBlockEntity(pos);
@@ -2759,7 +2775,15 @@ public final class AgentActionExecutor {
         return bestPos;
     }
 
-    private ItemStack insertIntoChest(ServerLevel level, BlockPos chestPos, ItemStack stack) {
+    private ItemStack insertIntoChest(MinecraftServer server, ServerLevel level, BlockPos chestPos, ItemStack stack) {
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> insertIntoChest(server, level, chestPos, stack)).get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch insertIntoChest to main thread", e);
+                return stack;
+            }
+        }
         BlockEntity blockEntity = level.getBlockEntity(chestPos);
         if (!(blockEntity instanceof ChestBlockEntity chest)) {
             return stack;
@@ -2814,7 +2838,7 @@ public final class AgentActionExecutor {
         BlockPos bestPos = null;
         double bestDistance = Double.MAX_VALUE;
         for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -4; dy <= 4; dy++) {
+            for (int dy = -16; dy <= 16; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos pos = center.offset(dx, dy, dz);
                     if (!level.getBlockState(pos).is(block)) {
@@ -3072,13 +3096,14 @@ public final class AgentActionExecutor {
     }
 
     private List<RecipeIngredientStatus> evaluateIngredientStatus(
+            MinecraftServer server,
             ServerLevel level,
             BlockPos center,
             ServerPlayer player,
             List<RecipeIngredientNeed> needs) {
         List<RecipeIngredientStatus> statuses = new ArrayList<>();
         for (RecipeIngredientNeed need : needs) {
-            int nearby = countItemInNearbyChests(level, center, need.item(), TRADE_SCAN_RADIUS);
+            int nearby = countItemInNearbyChests(server, level, center, need.item(), TRADE_SCAN_RADIUS);
             boolean playerHas = hasAtLeast(player, need.item(), need.count());
             statuses.add(new RecipeIngredientStatus(
                     need.item(),
@@ -3162,13 +3187,21 @@ public final class AgentActionExecutor {
         }
     }
 
-    private int countItemInNearbyChests(ServerLevel level, BlockPos center, Item item, int radius) {
+    private int countItemInNearbyChests(MinecraftServer server, ServerLevel level, BlockPos center, Item item, int radius) {
         if (item == null) {
             return 0;
         }
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> countItemInNearbyChests(server, level, center, item, radius)).get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch chest scan to main thread", e);
+                return 0;
+            }
+        }
         int total = 0;
         for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -4; dy <= 4; dy++) {
+            for (int dy = -16; dy <= 16; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
                     BlockPos pos = center.offset(dx, dy, dz);
                     BlockEntity blockEntity = level.getBlockEntity(pos);
@@ -3177,7 +3210,7 @@ public final class AgentActionExecutor {
                     }
                     for (int slot = 0; slot < chest.getContainerSize(); slot++) {
                         ItemStack stack = chest.getItem(slot);
-                        if (stack.is(item)) {
+                        if (!stack.isEmpty() && stack.is(item)) {
                             total += stack.getCount();
                         }
                     }
@@ -3187,12 +3220,21 @@ public final class AgentActionExecutor {
         return total;
     }
 
-    private ItemStack withdrawFromNearbyChests(ServerLevel level, BlockPos center, Item item, int radius,
-            int neededCount) {
+    private ItemStack withdrawFromNearbyChests(MinecraftServer server, ServerLevel level, BlockPos center, Item item,
+            int radius, int neededCount) {
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> withdrawFromNearbyChests(server, level, center, item, radius, neededCount))
+                        .get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch chest withdraw to main thread", e);
+                return ItemStack.EMPTY;
+            }
+        }
         int remaining = neededCount;
         ItemStack collected = ItemStack.EMPTY;
         for (int dx = -radius; dx <= radius && remaining > 0; dx++) {
-            for (int dy = -4; dy <= 4 && remaining > 0; dy++) {
+            for (int dy = -16; dy <= 16 && remaining > 0; dy++) {
                 for (int dz = -radius; dz <= radius && remaining > 0; dz++) {
                     BlockPos pos = center.offset(dx, dy, dz);
                     BlockEntity blockEntity = level.getBlockEntity(pos);
@@ -3255,6 +3297,7 @@ public final class AgentActionExecutor {
     }
 
     private ParsedTradeIntent classifyTradeIntentWithLlm(
+            MinecraftServer server,
             Villager villager,
             ServerPlayer player,
             String instruction,
@@ -3267,7 +3310,7 @@ public final class AgentActionExecutor {
                 player.getName().getString(),
                 instruction,
                 session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
-                tradeStockSummary(villager),
+                tradeStockSummary(server, villager),
                 snapshot,
                 memory);
         tradeLlmInFlightByNpc.put(npcId, true);
@@ -3280,7 +3323,7 @@ public final class AgentActionExecutor {
                 String recoveryPrompt = promptFactory.tradeIntentRecoveryPrompt(
                         instruction,
                         session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
-                        tradeStockSummary(villager),
+                        tradeStockSummary(server, villager),
                         session.lastRequestedItemId);
                 String recoveryRaw = llmRouter.generate(recoveryPrompt);
                 TradeIntentClassifierDraft recovered = tradeIntentClassifierParser.parse(recoveryRaw);
@@ -3338,6 +3381,15 @@ public final class AgentActionExecutor {
             return ParsedTradeIntent.none();
         }
         if (classified.intent() == TradeIntentType.COUNTER_OFFER && session.activeOffer == null) {
+            String itemId = classified.itemId();
+            boolean hasItem = itemId != null && !itemId.isBlank()
+                    && !itemId.equalsIgnoreCase("none") && !itemId.equalsIgnoreCase("minecraft:none");
+            int qty = classified.quantity() > 0 ? classified.quantity() : 1;
+            if (hasItem) {
+                logger.info("[TRADE-DEBUG] npc={} counter_offer without active offer -> request_offer item={} qty={}",
+                        villager.getName().getString(), itemId, qty);
+                return new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, itemId, qty, null);
+            }
             logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: counter_offer without active offer",
                     villager.getName().getString());
             return ParsedTradeIntent.none();

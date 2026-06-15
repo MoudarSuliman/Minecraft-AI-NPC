@@ -43,10 +43,13 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, Boolean> pendingInstruction = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> llmInFlight = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastProcessedInstructionByNpc = new ConcurrentHashMap<>();
 
     private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Set<UUID> thinkingNpcs = ConcurrentHashMap.newKeySet();
     private final Set<UUID> pendingWelcomeBack = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Long> villagerFirstMissingAt = new ConcurrentHashMap<>();
+    private static final long VILLAGER_MISSING_EVICT_MS = 30_000L;
 
     private AutonomousNpcRuntime(
             Logger logger,
@@ -91,8 +94,21 @@ public final class AutonomousNpcRuntime {
     public void onServerTick(MinecraftServer server) {
         long now = System.currentTimeMillis();
         restorePersistedBindings(server);
+        List<UUID> toEvict = null;
         for (AgentHandle handle : agents.values()) {
             UUID npcId = handle.npcId();
+
+            if (!actionExecutor.isVillagerAlive(server, npcId)) {
+                long firstMissing = villagerFirstMissingAt.computeIfAbsent(npcId, k -> now);
+                if (now - firstMissing >= VILLAGER_MISSING_EVICT_MS) {
+                    logger.warn("[AGENT] Villager {} ({}) missing for {}s — evicting binding",
+                            handle.npcName(), npcId, VILLAGER_MISSING_EVICT_MS / 1000);
+                    if (toEvict == null) toEvict = new ArrayList<>();
+                    toEvict.add(npcId);
+                }
+                continue;
+            }
+            villagerFirstMissingAt.remove(npcId);
 
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
@@ -165,12 +181,31 @@ public final class AutonomousNpcRuntime {
                 }
             });
         }
+        if (toEvict != null) {
+            for (UUID npcId : toEvict) {
+                agents.remove(npcId);
+                nextThinkAt.remove(npcId);
+                pendingInstruction.remove(npcId);
+                pendingWelcomeBack.remove(npcId);
+                thinkingNpcs.remove(npcId);
+                villagerFirstMissingAt.remove(npcId);
+                bindingStore.forgetBinding(npcId);
+            }
+        }
     }
 
     private void processInstruction(MinecraftServer server, AgentHandle handle, UUID npcId,
                                     MemoryContext memory, WorldSnapshot snapshot,
                                     String speaker, String latestInstruction,
                                     long now, boolean hasPendingInstruction) {
+        String lastInstruction = lastProcessedInstructionByNpc.get(npcId);
+        if (lastInstruction != null && !lastInstruction.isBlank()
+                && isChallenge(lastInstruction, latestInstruction)) {
+            logger.info("[THINK] npc={} challenge detected — replaying last instruction='{}'",
+                    handle.npcName(), lastInstruction);
+            latestInstruction = lastInstruction;
+        }
+
         logger.info("[THINK] npc={} instruction='{}' speaker='{}'",
                 handle.npcName(), latestInstruction, speaker);
 
@@ -280,6 +315,7 @@ public final class AutonomousNpcRuntime {
                 nextThinkAt.put(npcId, now + 800L);
                 memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("dialogue",
                         "Handled dialogue from " + speaker + ": " + latestInstruction));
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
                 return;
             }
         }
@@ -292,6 +328,7 @@ public final class AutonomousNpcRuntime {
                 nextThinkAt.put(npcId, now + 800L);
                 memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("trade",
                         "Handled trade instruction from " + speaker + ": " + latestInstruction));
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
                 return;
             }
         }
@@ -304,6 +341,7 @@ public final class AutonomousNpcRuntime {
                 "Executed " + decision.intent().name().toLowerCase() + ": " + decision.reasoning()));
         pendingInstruction.put(npcId, false);
         nextThinkAt.put(npcId, now + 1500L);
+        lastProcessedInstructionByNpc.put(npcId, latestInstruction);
     }
 
     public void registerAgent(UUID npcId, String npcName) {
@@ -445,6 +483,22 @@ public final class AutonomousNpcRuntime {
         }
     }
 
+    private boolean isChallenge(String lastInstruction, String currentInstruction) {
+        try {
+            String prompt = promptFactory.challengeClassifierPrompt(lastInstruction, currentInstruction);
+            String raw = llmRouter.generate(prompt);
+            if (raw == null || raw.isBlank()) return false;
+            int start = raw.indexOf('{');
+            int end = raw.lastIndexOf('}');
+            if (start < 0 || end <= start) return false;
+            com.google.gson.JsonObject root = com.google.gson.JsonParser.parseString(
+                    raw.substring(start, end + 1)).getAsJsonObject();
+            return root.has("is_challenge") && root.get("is_challenge").getAsBoolean();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void storeActionMemory(UUID npcId, String speaker, String instruction, String type) {
         String summary = actionExecutor.lastActionSummary(npcId);
         String entry = summary.isBlank()
@@ -452,6 +506,7 @@ public final class AutonomousNpcRuntime {
                 : summary + " (requested by " + speaker + ")";
         memoryStore.appendWorking(npcId, MemoryEntry.episodic(type, entry));
         memoryStore.appendLongTerm(npcId, MemoryEntry.episodic(type, entry));
+        lastProcessedInstructionByNpc.put(npcId, instruction);
     }
 
     private record AgentHandle(UUID npcId, String npcName, UUID ownerPlayerId) {

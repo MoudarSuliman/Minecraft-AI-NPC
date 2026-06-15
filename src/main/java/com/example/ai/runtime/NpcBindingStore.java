@@ -37,6 +37,12 @@ public final class NpcBindingStore {
         persist();
     }
 
+    public void forgetBinding(UUID npcId) {
+        if (bindings.remove(npcId) != null) {
+            persist();
+        }
+    }
+
     public Map<UUID, BoundNpc> snapshot() {
         return Collections.unmodifiableMap(new LinkedHashMap<>(bindings));
     }
