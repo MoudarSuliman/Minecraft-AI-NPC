@@ -304,7 +304,8 @@ public final class AutonomousNpcRuntime {
         logger.info("LLM decision queued: agent={} intent={} priority={} reasoning={}",
                 handle.npcName(), decision.intent(), decision.priority(), decision.reasoning());
         memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
-        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision", snapshot.toJson().toString()));
+        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision",
+                "Executed " + decision.intent().name().toLowerCase() + ": " + decision.reasoning()));
         pendingInstruction.put(npcId, false);
         nextThinkAt.put(npcId, now + 1500L);
     }
