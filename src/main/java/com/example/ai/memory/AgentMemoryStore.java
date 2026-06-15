@@ -1,16 +1,14 @@
 package com.example.ai.memory;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import org.slf4j.Logger;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -24,114 +22,135 @@ public final class AgentMemoryStore {
     private static final int LONG_TERM_MAX = 128;
 
     private final Logger logger;
-    private final Path basePath;
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+    private final Path dbPath;
+    private Connection connection;
+
     private final Map<UUID, List<MemoryEntry>> shortTerm = new ConcurrentHashMap<>();
     private final Map<UUID, List<MemoryEntry>> working = new ConcurrentHashMap<>();
-    private final Map<UUID, List<MemoryEntry>> longTerm = new ConcurrentHashMap<>();
+    private final Map<UUID, List<MemoryEntry>> longTermCache = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> loaded = new ConcurrentHashMap<>();
 
-    private AgentMemoryStore(Logger logger, Path basePath) {
+    private AgentMemoryStore(Logger logger, Path dbPath) {
         this.logger = logger;
-        this.basePath = basePath;
+        this.dbPath = dbPath;
     }
 
     public static AgentMemoryStore createDefault(Logger logger) {
-        Path memoryPath = Path.of("config", "llm_npc", "memory");
-        return new AgentMemoryStore(logger, memoryPath);
+        Path dbPath = Path.of("config", "llm_npc", "memory.db");
+        AgentMemoryStore store = new AgentMemoryStore(logger, dbPath);
+        store.initDatabase();
+        return store;
+    }
+
+    private void initDatabase() {
+        try {
+            Files.createDirectories(dbPath.getParent());
+            connection = DriverManager.getConnection("jdbc:sqlite:" + dbPath.toAbsolutePath());
+            try (var stmt = connection.createStatement()) {
+                stmt.execute("PRAGMA journal_mode=WAL");
+                stmt.execute("""
+                        CREATE TABLE IF NOT EXISTS long_term_memory (
+                            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                            npc_uuid  TEXT    NOT NULL,
+                            type      TEXT    NOT NULL,
+                            timestamp INTEGER NOT NULL,
+                            content   TEXT    NOT NULL,
+                            salience  REAL    NOT NULL
+                        )""");
+                stmt.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_npc ON long_term_memory(npc_uuid)");
+            }
+        } catch (Exception e) {
+            logger.error("Failed to initialise SQLite memory database at {}", dbPath, e);
+        }
     }
 
     public void appendShortTerm(UUID npcId, MemoryEntry entry) {
-        append(shortTerm, npcId, entry, SHORT_TERM_MAX);
+        appendRam(shortTerm, npcId, entry, SHORT_TERM_MAX);
     }
 
     public void appendWorking(UUID npcId, MemoryEntry entry) {
-        append(working, npcId, entry, WORKING_MAX);
+        appendRam(working, npcId, entry, WORKING_MAX);
     }
 
     public void appendLongTerm(UUID npcId, MemoryEntry entry) {
-        append(longTerm, npcId, entry, LONG_TERM_MAX);
-        persist(npcId);
+        ensureLoaded(npcId);
+        appendRam(longTermCache, npcId, entry, LONG_TERM_MAX);
+        persistLongTerm(npcId, entry);
     }
 
     public MemoryContext getContext(UUID npcId) {
         ensureLoaded(npcId);
-        List<MemoryEntry> shortList = new ArrayList<>(shortTerm.getOrDefault(npcId, List.of()));
+        List<MemoryEntry> shortList   = new ArrayList<>(shortTerm.getOrDefault(npcId, List.of()));
         List<MemoryEntry> workingList = new ArrayList<>(working.getOrDefault(npcId, List.of()));
-        List<MemoryEntry> longList = longTerm.getOrDefault(npcId, List.of()).stream()
+        List<MemoryEntry> longList    = longTermCache.getOrDefault(npcId, List.of()).stream()
                 .sorted(Comparator.comparingDouble(MemoryEntry::salience).reversed())
                 .limit(8)
                 .toList();
         return new MemoryContext(shortList, workingList, longList);
     }
 
-    private void append(Map<UUID, List<MemoryEntry>> target, UUID npcId, MemoryEntry entry, int maxSize) {
-        ensureLoaded(npcId);
+    private void appendRam(Map<UUID, List<MemoryEntry>> target, UUID npcId,
+                           MemoryEntry entry, int maxSize) {
         target.compute(npcId, (id, list) -> {
             List<MemoryEntry> safe = list == null ? new ArrayList<>() : new ArrayList<>(list);
             safe.add(entry);
-            if (safe.size() > maxSize) {
-                safe.remove(0);
-            }
+            if (safe.size() > maxSize) safe.remove(0);
             return safe;
         });
     }
 
-    private void persist(UUID npcId) {
+    private void persistLongTerm(UUID npcId, MemoryEntry entry) {
+        if (connection == null) return;
         try {
-            Files.createDirectories(basePath);
-            JsonObject root = new JsonObject();
-            root.add("short_term", serializeList(shortTerm.getOrDefault(npcId, List.of())));
-            root.add("working", serializeList(working.getOrDefault(npcId, List.of())));
-            root.add("long_term", serializeList(longTerm.getOrDefault(npcId, List.of())));
-            Files.writeString(basePath.resolve(npcId + ".json"), gson.toJson(root));
-        } catch (IOException e) {
-            logger.warn("Failed to persist memory for {}", npcId, e);
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "INSERT INTO long_term_memory (npc_uuid, type, timestamp, content, salience) VALUES (?, ?, ?, ?, ?)")) {
+                ps.setString(1, npcId.toString());
+                ps.setString(2, entry.type());
+                ps.setLong(3,   entry.timestamp());
+                ps.setString(4, entry.content());
+                ps.setDouble(5, entry.salience());
+                ps.executeUpdate();
+            }
+            // Enforce cap: keep only the most recent LONG_TERM_MAX rows per NPC
+            try (PreparedStatement ps = connection.prepareStatement("""
+                    DELETE FROM long_term_memory
+                    WHERE npc_uuid = ?
+                      AND id NOT IN (
+                          SELECT id FROM long_term_memory
+                          WHERE npc_uuid = ?
+                          ORDER BY timestamp DESC
+                          LIMIT ?
+                      )""")) {
+                ps.setString(1, npcId.toString());
+                ps.setString(2, npcId.toString());
+                ps.setInt(3,    LONG_TERM_MAX);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            logger.warn("Failed to persist long-term memory for {}", npcId, e);
         }
     }
 
     private void ensureLoaded(UUID npcId) {
-        if (loaded.putIfAbsent(npcId, true) != null) {
-            return;
-        }
-        Path file = basePath.resolve(npcId + ".json");
-        if (!Files.exists(file)) {
-            return;
-        }
-        try {
-            JsonObject root = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
-            shortTerm.put(npcId, deserializeList(root.getAsJsonArray("short_term")));
-            working.put(npcId, deserializeList(root.getAsJsonArray("working")));
-            longTerm.put(npcId, deserializeList(root.getAsJsonArray("long_term")));
-        } catch (Exception e) {
-            logger.warn("Failed to load memory for {}", npcId, e);
-        }
-    }
-
-    private List<MemoryEntry> deserializeList(JsonArray array) {
-        List<MemoryEntry> list = new ArrayList<>();
-        if (array == null) {
-            return list;
-        }
-        for (JsonElement element : array) {
-            if (!element.isJsonObject()) {
-                continue;
+        if (loaded.putIfAbsent(npcId, true) != null) return;
+        if (connection == null) return;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT type, timestamp, content, salience FROM long_term_memory WHERE npc_uuid = ? ORDER BY timestamp ASC")) {
+            ps.setString(1, npcId.toString());
+            List<MemoryEntry> entries = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(new MemoryEntry(
+                            rs.getString("type"),
+                            rs.getLong("timestamp"),
+                            rs.getString("content"),
+                            rs.getDouble("salience")));
+                }
             }
-            JsonObject json = element.getAsJsonObject();
-            String type = json.has("type") ? json.get("type").getAsString() : "unknown";
-            long timestamp = json.has("timestamp") ? json.get("timestamp").getAsLong() : System.currentTimeMillis();
-            String content = json.has("content") ? json.get("content").getAsString() : "";
-            double salience = json.has("salience") ? json.get("salience").getAsDouble() : 0.5;
-            list.add(new MemoryEntry(type, timestamp, content, salience));
+            longTermCache.put(npcId, entries);
+        } catch (SQLException e) {
+            logger.warn("Failed to load long-term memory for {}", npcId, e);
         }
-        return list;
-    }
-
-    private JsonArray serializeList(List<MemoryEntry> list) {
-        JsonArray array = new JsonArray();
-        for (MemoryEntry entry : list) {
-            array.add(entry.toJson());
-        }
-        return array;
     }
 }
