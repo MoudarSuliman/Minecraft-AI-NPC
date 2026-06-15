@@ -3,6 +3,7 @@ package com.example.ai.llm;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -43,6 +44,9 @@ public final class GeminiLlmClient implements LlmClient {
                 .build();
 
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("Gemini API error " + response.statusCode() + ": " + response.body());
+        }
         JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
         return root.getAsJsonArray("candidates")
                 .get(0).getAsJsonObject()

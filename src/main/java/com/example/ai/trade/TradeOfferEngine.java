@@ -111,7 +111,7 @@ public final class TradeOfferEngine {
     }
 
     public boolean supportsItem(String itemId) {
-        return basePricesByItem.containsKey(itemId);
+        return itemId != null && !itemId.isBlank();
     }
 
     public Set<String> supportedItems() {

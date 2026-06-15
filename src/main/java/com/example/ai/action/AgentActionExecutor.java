@@ -22,6 +22,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -35,7 +36,6 @@ import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -844,10 +844,10 @@ public final class AgentActionExecutor {
         session.lastInteractionAtMillis = now;
 
         return switch (tradeIntent.type()) {
-            case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, session, tradeIntent, now, draft);
+            case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, playerName, session, tradeIntent, now, draft);
             case INQUIRE_PAYMENT -> handlePaymentInquiry(server, villager, fallbackName, draft);
             case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, villager, fallbackName, session, draft);
-            case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, session, tradeIntent, now, draft);
+            case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, playerName, session, tradeIntent, now, draft);
             case COUNTER_OFFER -> handleTradeCounter(server, villager, fallbackName, session, tradeIntent, now, draft);
             case ACCEPT_OFFER, DECLINE_OFFER -> false; // Already handled above
             case NONE -> false;
@@ -1138,6 +1138,7 @@ public final class AgentActionExecutor {
             MinecraftServer server,
             Villager villager,
             String fallbackName,
+            String playerName,
             TradeSession session,
             ParsedTradeIntent tradeIntent,
             long now,
@@ -1151,7 +1152,11 @@ public final class AgentActionExecutor {
                 session.lastRequestedItemId = requestedItemId;
                 session.lastRequestedQuantity = 1;
                 if (stock <= 0) {
-                    speakAsNpc(server, villager, fallbackName, "I don't have that in stock right now.");
+                    String msg = parseRecipeResponseText(llmRouter.generate(
+                            promptFactory.tradeOutOfStockPrompt(villager.getName().getString(),
+                                    playerName, requestedItemId, 0)));
+                    speakAsNpc(server, villager, fallbackName,
+                            msg.isBlank() ? "I'm afraid I don't have any of that in stock." : msg);
                     return true;
                 }
                 TradeOffer preview = tradeOfferEngine.quote(requestedItemId, 1, stock, 0, false, now);
@@ -1202,6 +1207,7 @@ public final class AgentActionExecutor {
             MinecraftServer server,
             Villager villager,
             String fallbackName,
+            String playerName,
             TradeSession session,
             ParsedTradeIntent tradeIntent,
             long now,
@@ -1216,7 +1222,11 @@ public final class AgentActionExecutor {
         int stock = countItemInNearbyChests((ServerLevel) villager.level(), villager.blockPosition(),
                 resolveKnownItem(itemId), TRADE_SCAN_RADIUS);
         if (stock < quantity) {
-            speakAsNpc(server, villager, fallbackName, "I only have " + stock + " in stock right now.");
+            String msg = parseRecipeResponseText(llmRouter.generate(
+                    promptFactory.tradeOutOfStockPrompt(villager.getName().getString(),
+                            playerName, itemId, stock)));
+            speakAsNpc(server, villager, fallbackName,
+                    msg.isBlank() ? "I only have " + stock + " of that available, not enough for your order." : msg);
             return true;
         }
 
@@ -1927,7 +1937,8 @@ public final class AgentActionExecutor {
 
         MineToChestTask task = new MineToChestTask(block, minedItem, blockId, count, chestPos);
         activeMineToChest.put(npcId, task);
-        notifyNearbyPlayers(server, villager, "[LLM NPC] Mining " + count + "x " + blockId + " and storing in chest.");
+        speakAsNpc(server, villager, villager.getName().getString(),
+                "On it! I'll mine " + count + "x " + blockId + " and store them in the chest.");
         return true;
     }
 
@@ -1962,8 +1973,12 @@ public final class AgentActionExecutor {
 
         MineToPlayerTask task = new MineToPlayerTask(block, minedItem, blockId, count, targetPlayer.getUUID());
         activeMineToPlayer.put(npcId, task);
-        notifyNearbyPlayers(server, villager,
-                "[LLM NPC] Mining " + count + "x " + blockId + " and delivering to your inventory.");
+        String startMsg = parseDialogueText(llmRouter.generate(
+                promptFactory.mineTaskStartPrompt(villager.getName().getString(),
+                        targetPlayer.getName().getString(), count, blockId)));
+        speakAsNpc(server, villager, villager.getName().getString(),
+                startMsg != null && !startMsg.isBlank() ? startMsg
+                        : "I'll mine those blocks and bring them to you.");
         return true;
     }
 
@@ -2188,8 +2203,12 @@ public final class AgentActionExecutor {
                 ItemStack remaining = insertIntoPlayerInventory(player, task.heldStack.copy());
                 int deliveredCount = task.heldStack.getCount() - remaining.getCount();
                 if (deliveredCount > 0) {
-                    notifyNearbyPlayers(server, villager,
-                            "[LLM NPC] Added " + deliveredCount + "x " + task.blockId + " to your inventory.");
+                    String doneMsg = parseDialogueText(llmRouter.generate(
+                            promptFactory.mineTaskCompletePrompt(villager.getName().getString(),
+                                    player.getName().getString(), deliveredCount, task.blockId)));
+                    speakAsNpc(server, villager, villager.getName().getString(),
+                            doneMsg != null && !doneMsg.isBlank() ? doneMsg
+                                    : "I've put the blocks in your inventory.");
                 }
                 if (!remaining.isEmpty()) {
                     Containers.dropItemStack(
@@ -2795,37 +2814,32 @@ public final class AgentActionExecutor {
         return bestPos;
     }
 
+    private String normalizeMinecraftId(String id) {
+        if (id == null || id.isBlank()) return null;
+        String trimmed = id.trim().replace(' ', '_').toLowerCase(Locale.ROOT);
+        return trimmed.contains(":") ? trimmed : "minecraft:" + trimmed;
+    }
+
     private Item resolveKnownItem(String itemId) {
-        return switch (itemId) {
-            case "minecraft:glass", "glass", "minecraft:glass_block", "glass_block" -> Items.GLASS;
-            case "minecraft:grass_block", "grass_block" -> Blocks.GRASS_BLOCK.asItem();
-            case "minecraft:oak_planks", "oak_planks" -> Items.OAK_PLANKS;
-            case "minecraft:cobblestone", "cobblestone" -> Items.COBBLESTONE;
-            case "minecraft:oak_log", "oak_log" -> Items.OAK_LOG;
-            case "minecraft:stone", "stone" -> Blocks.STONE.asItem();
-            case "minecraft:dirt", "dirt" -> Blocks.DIRT.asItem();
-            case "minecraft:sand", "sand" -> Blocks.SAND.asItem();
-            case "minecraft:stick", "stick", "sticks" -> Items.STICK;
-            case "minecraft:diamond", "diamond", "diamonds" -> Items.DIAMOND;
-            case "minecraft:iron_ingot", "iron_ingot", "iron ingot", "iron", "iron ingots" -> Items.IRON_INGOT;
-            default -> null;
-        };
+        String normalized = normalizeMinecraftId(itemId);
+        if (normalized == null) return null;
+        try {
+            Identifier key = Identifier.parse(normalized);
+            return BuiltInRegistries.ITEM.get(key).map(ref -> ref.value()).orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private Block resolveKnownBlock(String blockId) {
-        return switch (blockId) {
-            case "minecraft:grass_block", "grass_block" -> Blocks.GRASS_BLOCK;
-            case "minecraft:glass", "glass", "minecraft:glass_block", "glass_block" -> Blocks.GLASS;
-            case "minecraft:oak_log", "oak_log" -> Blocks.OAK_LOG;
-            case "minecraft:stone", "stone" -> Blocks.STONE;
-            case "minecraft:dirt", "dirt" -> Blocks.DIRT;
-            case "minecraft:sand", "sand" -> Blocks.SAND;
-            case "minecraft:cobblestone", "cobblestone" -> Blocks.COBBLESTONE;
-            case "minecraft:diamond_ore", "diamond_ore", "diamond ore" -> Blocks.DIAMOND_ORE;
-            case "minecraft:deepslate_diamond_ore", "deepslate_diamond_ore", "deepslate diamond ore" ->
-                Blocks.DEEPSLATE_DIAMOND_ORE;
-            default -> null;
-        };
+        String normalized = normalizeMinecraftId(blockId);
+        if (normalized == null) return null;
+        try {
+            Identifier key = Identifier.parse(normalized);
+            return BuiltInRegistries.BLOCK.get(key).map(ref -> ref.value()).orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private SearchRequest parseSearchRequestWithLlm(String instruction, MemoryContext memory) {
@@ -2859,17 +2873,7 @@ public final class AgentActionExecutor {
         if (resolved != null) {
             return resolved;
         }
-        resolved = resolveItemFromRecipePhrase(instruction == null ? "" : instruction.toLowerCase(Locale.ROOT));
-        if (resolved != null) {
-            return resolved;
-        }
-        if (lower.contains("diamond pickaxe") || lower.contains("diamond pick")) {
-            return Items.DIAMOND_PICKAXE;
-        }
-        if (lower.contains("iron pickaxe") || lower.contains("iron pick")) {
-            return Items.IRON_PICKAXE;
-        }
-        return null;
+        return resolveItemFromRecipePhrase(instruction == null ? "" : instruction.toLowerCase(Locale.ROOT));
     }
 
     private String extractRecipeTargetPhrase(String lower) {
@@ -3658,7 +3662,7 @@ public final class AgentActionExecutor {
             int end = raw.lastIndexOf('}');
             if (start < 0 || end <= start) return null;
             JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
-            for (String key : new String[]{"text", "reply", "response", "message"}) {
+            for (String key : new String[]{"text", "reply", "response", "message", "response_text"}) {
                 if (root.has(key) && root.get(key).isJsonPrimitive()) {
                     String val = root.get(key).getAsString().trim();
                     if (!val.isBlank() && val.length() <= 300) return val;
@@ -4043,26 +4047,7 @@ public final class AgentActionExecutor {
     }
 
     private Block resolvePlaceableBlock(String blockId) {
-        return switch (blockId.toLowerCase(Locale.ROOT).replace("minecraft:", "")) {
-            case "oak_planks"    -> Blocks.OAK_PLANKS;
-            case "cobblestone"   -> Blocks.COBBLESTONE;
-            case "stone"         -> Blocks.STONE;
-            case "dirt"          -> Blocks.DIRT;
-            case "glass"         -> Blocks.GLASS;
-            case "oak_log"       -> Blocks.OAK_LOG;
-            case "sand"          -> Blocks.SAND;
-            case "gravel"        -> Blocks.GRAVEL;
-            case "oak_leaves"    -> Blocks.OAK_LEAVES;
-            case "bricks"        -> Blocks.BRICKS;
-            case "stone_bricks"  -> Blocks.STONE_BRICKS;
-            case "oak_slab"      -> Blocks.OAK_SLAB;
-            case "oak_stairs"    -> Blocks.OAK_STAIRS;
-            case "crafting_table" -> Blocks.CRAFTING_TABLE;
-            case "furnace"       -> Blocks.FURNACE;
-            case "chest"         -> Blocks.CHEST;
-            case "grass_block"   -> Blocks.GRASS_BLOCK;
-            default              -> resolveKnownBlock(blockId);
-        };
+        return resolveKnownBlock(blockId);
     }
 
     private enum ScenarioPhase {

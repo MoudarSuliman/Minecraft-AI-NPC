@@ -20,7 +20,6 @@ import org.slf4j.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -43,8 +42,6 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, Long> nextThinkAt = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> pendingInstruction = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> llmInFlight = new ConcurrentHashMap<>();
-    private final Map<UUID, String> lastDemandByNpc = new ConcurrentHashMap<>();
-    private final Map<UUID, String> lastExpectedIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
 
     private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
@@ -150,16 +147,15 @@ public final class AutonomousNpcRuntime {
             }
 
           
-            String latestEntry      = latestInstruction(memory);
-            String speaker          = speakerFromEntry(latestEntry);
-            String instruction      = instructionTextFromEntry(latestEntry);
-            InstructionDemand demand = classifyDemand(instruction);
+            String latestEntry  = latestInstruction(memory);
+            String speaker      = speakerFromEntry(latestEntry);
+            String instruction  = instructionTextFromEntry(latestEntry);
 
             thinkingNpcs.add(npcId);
             llmExecutor.submit(() -> {
                 try {
                     processInstruction(server, handle, npcId, memory, snapshot,
-                            speaker, instruction, demand, now, hasPending);
+                            speaker, instruction, now, hasPending);
                 } catch (Exception e) {
                     logger.warn("[ASYNC] Think error for {}", handle.npcName(), e);
                     pendingInstruction.put(npcId, false);
@@ -174,12 +170,12 @@ public final class AutonomousNpcRuntime {
     private void processInstruction(MinecraftServer server, AgentHandle handle, UUID npcId,
                                     MemoryContext memory, WorldSnapshot snapshot,
                                     String speaker, String latestInstruction,
-                                    InstructionDemand demand, long now, boolean hasPendingInstruction) {
-        logger.info("[THINK] npc={} instruction='{}' speaker='{}' demand={}",
-                handle.npcName(), latestInstruction, speaker, demand);
+                                    long now, boolean hasPendingInstruction) {
+        logger.info("[THINK] npc={} instruction='{}' speaker='{}'",
+                handle.npcName(), latestInstruction, speaker);
 
-        if (demand == InstructionDemand.NONE) {
-            if (actionExecutor.tryHandleRecipeInstruction(
+        // Self-classifying handlers — each uses its own LLM to decide if it applies
+        if (actionExecutor.tryHandleRecipeInstruction(
                     server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
                     latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
@@ -207,46 +203,11 @@ public final class AutonomousNpcRuntime {
                 memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scout",
                         "Handled scout instruction from " + speaker + ": " + latestInstruction));
                 return;
-            }
         }
 
-        if (demand == InstructionDemand.REQUIRE_BUILD && actionExecutor.tryHandleScenarioInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory, snapshot, true)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, now + 800L);
-            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scenario",
-                    "Handled scenario instruction from " + speaker + ": " + latestInstruction));
-            return;
-        }
-
-        if (demand == InstructionDemand.REQUIRE_TRADE && actionExecutor.tryHandleTradeInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory, snapshot)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, now + 800L);
-            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("trade",
-                    "Handled trade instruction from " + speaker + ": " + latestInstruction));
-            return;
-        }
-
-        if (demand == InstructionDemand.NONE && actionExecutor.tryHandleDialogueInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory, snapshot)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, now + 800L);
-            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("dialogue",
-                    "Handled dialogue from " + speaker + ": " + latestInstruction));
-            return;
-        }
-
-
-        String expectedIntent = expectedIntentForDemand(demand);
-        lastDemandByNpc.put(npcId, demand.name().toLowerCase(Locale.ROOT));
-        lastExpectedIntentByNpc.put(npcId, expectedIntent.isBlank() ? "none" : expectedIntent);
-        String targetHint = targetHintFromInstruction(latestInstruction, demand);
+        // Action selection LLM decides intent — no keyword pre-classification
         String prompt = promptFactory.actionSelectionPrompt(
-                snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint);
+                snapshot, memory, hasPendingInstruction, latestInstruction, "", "");
 
         llmInFlight.put(npcId, true);
         String raw;
@@ -257,7 +218,7 @@ public final class AutonomousNpcRuntime {
         }
 
         AgentDecision decision = decisionParser.parse(raw);
-        lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase(Locale.ROOT));
+        lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase());
 
         if (!decision.isValid()) {
             logger.info("LLM produced invalid decision for agent {}: {}", handle.npcName(), raw);
@@ -301,30 +262,42 @@ public final class AutonomousNpcRuntime {
             nextThinkAt.put(npcId, now + 1200L);
             return;
         }
-        if (demand == InstructionDemand.REQUIRE_MINE && decision.intent() != AgentIntentType.MINE_BLOCK) {
-            logger.info("Mine instruction requires MINE_BLOCK for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
-            nextThinkAt.put(npcId, now + 1200L);
-            return;
+
+        // Post-classification dispatch for handlers that need specialized execution
+        if (decision.intent() == AgentIntentType.BUILD_STRUCTURE) {
+            if (actionExecutor.tryHandleScenarioInstruction(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot, true)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scenario",
+                        "Handled scenario instruction from " + speaker + ": " + latestInstruction));
+                return;
+            }
         }
-        if (demand == InstructionDemand.REQUIRE_MINE_TO_CHEST && decision.intent() != AgentIntentType.MINE_TO_CHEST) {
-            logger.info("Mine-to-chest instruction requires MINE_TO_CHEST for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
-            nextThinkAt.put(npcId, now + 1200L);
-            return;
+
+        if (decision.intent() == AgentIntentType.DIALOGUE_REPLY) {
+            if (actionExecutor.tryHandleDialogueInstruction(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("dialogue",
+                        "Handled dialogue from " + speaker + ": " + latestInstruction));
+                return;
+            }
         }
-        if (demand == InstructionDemand.REQUIRE_MINE_TO_PLAYER && decision.intent() != AgentIntentType.MINE_TO_PLAYER) {
-            logger.info("Mine-to-player instruction requires MINE_TO_PLAYER for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
-            nextThinkAt.put(npcId, now + 1200L);
-            return;
-        }
-        if (demand == InstructionDemand.REQUIRE_FETCH && decision.intent() != AgentIntentType.FETCH_FROM_CHEST) {
-            logger.info("Fetch instruction requires FETCH_FROM_CHEST for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
-            nextThinkAt.put(npcId, now + 1200L);
-            return;
-        }
-        if (demand == InstructionDemand.REQUIRE_BUILD && decision.intent() != AgentIntentType.BUILD_STRUCTURE) {
-            logger.info("Build instruction requires BUILD_STRUCTURE for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
-            nextThinkAt.put(npcId, now + 1200L);
-            return;
+
+        if (decision.intent().name().startsWith("TRADE_")) {
+            if (actionExecutor.tryHandleTradeInstruction(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, now + 800L);
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("trade",
+                        "Handled trade instruction from " + speaker + ": " + latestInstruction));
+                return;
+            }
         }
 
         actionExecutor.execute(npcId, decision);
@@ -392,8 +365,6 @@ public final class AutonomousNpcRuntime {
         lines.add(statusForAgent(npcId));
         lines.add("owner_player_id=" + (handle.ownerPlayerId() == null ? "none" : handle.ownerPlayerId()));
         lines.add("next_think_in_ms=" + waitMs);
-        lines.add("last_demand=" + lastDemandByNpc.getOrDefault(npcId, "none"));
-        lines.add("expected_intent=" + lastExpectedIntentByNpc.getOrDefault(npcId, "none"));
         lines.add("last_decision_intent=" + lastParsedDecisionIntentByNpc.getOrDefault(npcId, "none"));
         lines.add("memory_sizes short=" + context.shortTerm().size()
                 + " working=" + context.working().size()
@@ -428,86 +399,6 @@ public final class AutonomousNpcRuntime {
             return entry.trim();
         }
         return entry.substring(sep + 1).trim();
-    }
-
-    private InstructionDemand classifyDemand(String instruction) {
-        String lower = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
-        if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
-                && (lower.contains("give me")
-                || lower.contains("give to me")
-                || lower.contains("give it to me")
-                || lower.contains("give them to me")
-                || lower.contains("deliver to me")
-                || lower.contains("to my inventory")
-                || lower.contains("my inventory")
-                || mentionsInventory(lower))) {
-            return InstructionDemand.REQUIRE_MINE_TO_PLAYER;
-        }
-        if ((lower.contains("mine") || lower.contains("dig") || lower.contains("break"))
-                && (lower.contains("chest") || lower.contains("store") || lower.contains("put in"))) {
-            return InstructionDemand.REQUIRE_MINE_TO_CHEST;
-        }
-        if (lower.contains("mine") || lower.contains("dig") || lower.contains("break")) {
-            return InstructionDemand.REQUIRE_MINE;
-        }
-        if (lower.contains("buy")
-                || lower.contains("trade")
-                || lower.contains("deal")
-                || lower.contains("emerald")
-                || lower.contains("counter")
-                || lower.contains("no thanks")
-                || lower.contains("decline")) {
-            return InstructionDemand.REQUIRE_TRADE;
-        }
-        if (lower.contains("bring") || lower.contains("fetch") || lower.contains("get me")) {
-            return InstructionDemand.REQUIRE_FETCH;
-        }
-        if (lower.contains("build") || lower.contains("construct")
-                || lower.contains("place a") || lower.contains("place the")
-                || lower.contains("make a") || lower.contains("create a")
-                || lower.contains("lay a") || lower.contains("lay the")
-                || lower.contains("set up a") || lower.contains("put down a")) {
-            return InstructionDemand.REQUIRE_BUILD;
-        }
-        return InstructionDemand.NONE;
-    }
-
-    private boolean mentionsInventory(String lower) {
-        if (lower == null || lower.isBlank()) {
-            return false;
-        }
-        return lower.contains("inventory")
-                || lower.contains("inverntory")
-                || lower.matches(".*\\binv\\w*tory\\b.*");
-    }
-
-    private String expectedIntentForDemand(InstructionDemand demand) {
-        return switch (demand) {
-            case REQUIRE_MINE -> "mine_block";
-            case REQUIRE_FETCH -> "fetch_from_chest";
-            case REQUIRE_MINE_TO_CHEST -> "mine_to_chest";
-            case REQUIRE_MINE_TO_PLAYER -> "mine_to_player";
-            case REQUIRE_TRADE -> "dialogue_reply";
-            case REQUIRE_BUILD -> "build_structure";
-            case NONE -> "";
-        };
-    }
-
-    private String targetHintFromInstruction(String instruction, InstructionDemand demand) {
-        String lower = instruction == null ? "" : instruction.toLowerCase(Locale.ROOT);
-        if (lower.contains("grass")) {
-            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:grass_block" : "minecraft:grass_block";
-        }
-        if (lower.contains("glass")) {
-            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:glass" : "minecraft:glass";
-        }
-        if (lower.contains("cobblestone")) {
-            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:cobblestone" : "minecraft:cobblestone";
-        }
-        if (lower.contains("oak log")) {
-            return demand == InstructionDemand.REQUIRE_FETCH ? "minecraft:oak_log" : "minecraft:oak_log";
-        }
-        return "";
     }
 
     private void restorePersistedBindings(MinecraftServer server) {
@@ -552,13 +443,4 @@ public final class AutonomousNpcRuntime {
     private record AgentHandle(UUID npcId, String npcName, UUID ownerPlayerId) {
     }
 
-    private enum InstructionDemand {
-        NONE,
-        REQUIRE_MINE,
-        REQUIRE_MINE_TO_CHEST,
-        REQUIRE_MINE_TO_PLAYER,
-        REQUIRE_TRADE,
-        REQUIRE_FETCH,
-        REQUIRE_BUILD
-    }
 }

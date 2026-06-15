@@ -30,8 +30,10 @@ public final class PromptFactory {
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
                 + "IMPORTANT — intent selection rules in priority order:\n"
-                + "1. Greetings, questions, or any conversational message that is NOT a physical task MUST use dialogue_reply. "
-                + "   Examples: 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. 'hey' -> dialogue_reply. "
+                + "1. Any message that is a QUESTION or asks about your abilities, knowledge, or nature MUST use dialogue_reply — "
+                + "   this overrides ALL other rules including expected_intent. "
+                + "   Examples: 'do you have the ability to mine?' -> dialogue_reply. 'can you build?' -> dialogue_reply. "
+                + "   'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. 'hey' -> dialogue_reply. "
                 + "   'how are you' -> dialogue_reply. 'what are you doing' -> dialogue_reply.\n"
                 + "2. If latest_instruction asks to build, construct, place, or create a structure or floor or wall of blocks, "
                 + "use intent build_structure with parameters {\"description\":\"...\"}. "
@@ -44,13 +46,19 @@ public final class PromptFactory {
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
                 + "6. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "7. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
+                + "7. If the player wants to buy, sell, trade, exchange, or make a deal for items, use trade_offer. "
+                + "If the player accepts a trade offer, use trade_accept. "
+                + "If the player rejects or declines, use trade_decline. "
+                + "If the player proposes different terms or a counter-offer, use trade_counter. "
+                + "Examples: 'I want to buy wood' -> trade_offer. 'deal' -> trade_accept. 'no thanks' -> trade_decline. 'how about 2 emeralds instead?' -> trade_counter. "
+                + "NEVER use dialogue_reply for trade requests — always use a trade_* intent.\n"
+                + "8. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
                 + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
                 + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
                 + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb.\n"
-                + "8. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
-                + "9. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
-                + "10. For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
+                + "9. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
+                + "10. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
+                + "11. For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
                 + "NEVER repeat or echo the player's message. "
                 + "Example: player says 'you there?' -> parameters.text = 'Yes, I am here. What do you need?' "
                 + "Example: player says 'hello' -> parameters.text = 'Hello there! How can I help you?'"
@@ -530,7 +538,15 @@ public final class PromptFactory {
             }
         }
 
+        sb.append("My abilities (what I can actually do when commanded):\n");
+        sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");
+        sb.append("  - Fetch items from nearby chests and bring them to the player\n");
+        sb.append("  - Build structures (floors, walls, simple constructions)\n");
+        sb.append("  - Scout and explore in a direction and report back\n");
+        sb.append("  - Trade items with the player\n");
+        sb.append("  - Answer questions and hold a conversation\n");
         sb.append("IMPORTANT RULES:\n");
+        sb.append("- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n");
         sb.append("- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data above. Do not invent.\n");
         sb.append("- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' above. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n");
         sb.append("- If asked about what was just said: use the recent conversation section.\n");
@@ -696,6 +712,52 @@ public final class PromptFactory {
         json.add("working", toArray(memory.working()));
         json.add("long_term", toArray(memory.longTerm()));
         return json;
+    }
+
+    public String tradeOutOfStockPrompt(String npcName, String playerName, String itemId, int stock) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "trade_out_of_stock");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("item_id", itemId);
+        payload.addProperty("stock", stock);
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. Write one short in-character sentence (max 16 words) where the NPC "
+                + "explains they don't have enough of the requested item in stock. "
+                + "If stock is 0, say they have none. If stock > 0 but less than requested, mention the actual amount. "
+                + "Use first-person speech. No system tags, no narration.");
+        return payload.toString();
+    }
+
+    public String mineTaskStartPrompt(String npcName, String playerName, int count, String blockId) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "mine_task_start");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("count", count);
+        payload.addProperty("block_id", blockId);
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. Write one short in-character sentence (max 14 words) where the NPC "
+                + "confirms they are heading out to mine the requested blocks. "
+                + "Use first-person speech. No system tags, no narration, no follow-up questions.");
+        return payload.toString();
+    }
+
+    public String mineTaskCompletePrompt(String npcName, String playerName, int count, String blockId) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("task", "mine_task_complete");
+        payload.addProperty("npc_name", npcName);
+        payload.addProperty("player_name", playerName);
+        payload.addProperty("count", count);
+        payload.addProperty("block_id", blockId);
+        payload.addProperty("format", "{\"response_text\":\"...\"}");
+        payload.addProperty("constraints",
+                "Return strict JSON only. Write one short in-character sentence (max 14 words) where the NPC "
+                + "announces they have delivered the mined blocks to the player's inventory. "
+                + "Use first-person speech. No system tags, no narration, no follow-up questions.");
+        return payload.toString();
     }
 
     private JsonArray toArray(Iterable<MemoryEntry> entries) {
