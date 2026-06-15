@@ -869,7 +869,9 @@ public final class AgentActionExecutor {
             case INQUIRE_PAYMENT -> handlePaymentInquiry(server, villager, fallbackName, draft);
             case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, villager, fallbackName, session, draft);
             case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, playerName, session, tradeIntent, now, draft);
-            case COUNTER_OFFER -> handleTradeCounter(server, villager, fallbackName, session, tradeIntent, now, draft);
+            case COUNTER_OFFER -> (session.activeOffer == null && tradeOfferEngine.supportsItem(tradeIntent.itemId()))
+                    ? handleCounterWithoutOffer(server, villager, fallbackName, playerName, session, tradeIntent, now, draft)
+                    : handleTradeCounter(server, villager, fallbackName, session, tradeIntent, now, draft);
             case ACCEPT_OFFER, DECLINE_OFFER -> false; // Already handled above
             case NONE -> false;
         };
@@ -1318,6 +1320,52 @@ public final class AgentActionExecutor {
 
         session.activeOffer = counter.offer();
         speakAsNpc(server, villager, fallbackName, groundedCounterText(draft.responseText(), counter.offer()));
+        return true;
+    }
+
+    private boolean handleCounterWithoutOffer(
+            MinecraftServer server,
+            Villager villager,
+            String fallbackName,
+            String playerName,
+            TradeSession session,
+            ParsedTradeIntent tradeIntent,
+            long now,
+            TradeNegotiationDraft draft) {
+        String itemId = tradeIntent.itemId();
+        int quantity = Math.max(1, tradeIntent.quantity());
+        Item item = resolveKnownItem(itemId);
+        if (item == null) {
+            speakAsNpc(server, villager, fallbackName, "I don't trade that item.");
+            return true;
+        }
+        int stock = countItemInNearbyChests(server, (ServerLevel) villager.level(), villager.blockPosition(),
+                item, TRADE_SCAN_RADIUS);
+        if (stock < quantity) {
+            String msg = parseRecipeResponseText(llmRouter.generate(
+                    promptFactory.tradeOutOfStockPrompt(villager.getName().getString(), playerName, itemId, stock)));
+            speakAsNpc(server, villager, fallbackName,
+                    msg.isBlank() ? "I only have " + stock + " of that available." : msg);
+            return true;
+        }
+        TradeOffer freshOffer = tradeOfferEngine.quote(itemId, quantity, stock, 0, false, now);
+        session.lastRequestedItemId = itemId;
+        session.lastRequestedQuantity = quantity;
+        Integer proposed = tradeIntent.counterTotalPrice();
+        if (proposed != null && proposed > 0) {
+            TradeCounterResult result = tradeOfferEngine.evaluateCounter(freshOffer, proposed, now);
+            if (result.accepted()) {
+                session.activeOffer = result.offer();
+                speakAsNpc(server, villager, fallbackName, groundedCounterText(draft.responseText(), result.offer()));
+                return true;
+            }
+            session.activeOffer = freshOffer;
+            speakAsNpc(server, villager, fallbackName, groundedCounterRejectionText(
+                    draft.responseText(), result.minimumAcceptableTotal(), quantity, itemId));
+            return true;
+        }
+        session.activeOffer = freshOffer;
+        speakAsNpc(server, villager, fallbackName, groundedOfferText(draft.responseText(), freshOffer));
         return true;
     }
 
@@ -3381,18 +3429,15 @@ public final class AgentActionExecutor {
             return ParsedTradeIntent.none();
         }
         if (classified.intent() == TradeIntentType.COUNTER_OFFER && session.activeOffer == null) {
-            String itemId = classified.itemId();
-            boolean hasItem = itemId != null && !itemId.isBlank()
-                    && !itemId.equalsIgnoreCase("none") && !itemId.equalsIgnoreCase("minecraft:none");
-            int qty = classified.quantity() > 0 ? classified.quantity() : 1;
-            if (hasItem) {
-                logger.info("[TRADE-DEBUG] npc={} counter_offer without active offer -> request_offer item={} qty={}",
-                        villager.getName().getString(), itemId, qty);
-                return new ParsedTradeIntent(TradeIntentType.REQUEST_OFFER, itemId, qty, null);
+            String cItemId = classified.itemId();
+            boolean cHasItem = cItemId != null && !cItemId.isBlank()
+                    && !cItemId.equalsIgnoreCase("none") && !cItemId.equalsIgnoreCase("minecraft:none");
+            if (!cHasItem) {
+                logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: counter_offer without active offer or item",
+                        villager.getName().getString());
+                return ParsedTradeIntent.none();
             }
-            logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: counter_offer without active offer",
-                    villager.getName().getString());
-            return ParsedTradeIntent.none();
+            // Has item — let COUNTER_OFFER through; handled downstream after draft is ready
         }
         String itemId = classified.itemId();
         if ((classified.intent() == TradeIntentType.REQUEST_OFFER

@@ -97,7 +97,7 @@ public final class TradeOfferEngine {
     }
 
     public boolean supportsItem(String itemId) {
-        return itemId != null && !itemId.isBlank();
+        return itemId != null && configs.containsKey(itemId);
     }
 
     public Set<String> supportedItems() {
