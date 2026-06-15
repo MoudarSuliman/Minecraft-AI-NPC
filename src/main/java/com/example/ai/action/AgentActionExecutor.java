@@ -85,6 +85,7 @@ public final class AgentActionExecutor {
     private final TradeIntentClassifierParser tradeIntentClassifierParser = new TradeIntentClassifierParser();
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
+    private final Map<UUID, List<String>> completedTaskSummaries = new ConcurrentHashMap<>();
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
     private final Map<UUID, MineToPlayerTask> activeMineToPlayer = new ConcurrentHashMap<>();
@@ -1648,6 +1649,18 @@ public final class AgentActionExecutor {
         return lastTradeIntentByNpc.getOrDefault(npcId, "none");
     }
 
+    public List<String> pollCompletedTaskSummaries(UUID npcId) {
+        return completedTaskSummaries.remove(npcId);
+    }
+
+    private void recordTaskSummary(UUID npcId, String summary) {
+        completedTaskSummaries.compute(npcId, (id, list) -> {
+            List<String> safe = list == null ? new ArrayList<>() : list;
+            safe.add(summary);
+            return safe;
+        });
+    }
+
     public String currentTaskPhase(UUID npcId) {
         MineToPlayerTask mineToPlayer = activeMineToPlayer.get(npcId);
         if (mineToPlayer != null) {
@@ -2329,6 +2342,9 @@ public final class AgentActionExecutor {
                                     + "; y=" + (pos != null ? pos.getY() : "?")
                                     + "; z=" + (pos != null ? pos.getZ() : "?"),
                             "I found " + task.targetLabel + "! It was at " + locStr + ".");
+                    recordTaskSummary(villager.getUUID(),
+                            "Searched for " + task.targetLabel + " and found it at " + locStr
+                            + " for " + requester.getName().getString() + ".");
                     suppressTradeGreeting(villager.getUUID(), task.requesterId, SEARCH_TRADE_SUPPRESS_MILLIS);
                     yield false;
                 }
@@ -3796,6 +3812,9 @@ public final class AgentActionExecutor {
                 speakAsNpc(server, villager, fallbackName,
                         "I have finished the " + task.scenarioName + " task.");
             }
+            recordTaskSummary(villager.getUUID(),
+                    "Completed task '" + task.scenarioName + "' for "
+                    + (requester != null ? requester.getName().getString() : "player") + ".");
             return false;
         }
 

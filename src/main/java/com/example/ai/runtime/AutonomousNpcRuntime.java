@@ -95,6 +95,13 @@ public final class AutonomousNpcRuntime {
             actionExecutor.maybeSendEnvironmentalAdvisory(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
+            List<String> summaries = actionExecutor.pollCompletedTaskSummaries(npcId);
+            if (summaries != null) {
+                for (String summary : summaries) {
+                    memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("task_result", summary));
+                }
+            }
+
             boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
             if (!hasPendingInstruction) {
                 continue;

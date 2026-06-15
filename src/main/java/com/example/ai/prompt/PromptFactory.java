@@ -516,15 +516,25 @@ public final class PromptFactory {
             }
         }
 
+        if (memory != null && !memory.longTerm().isEmpty()) {
+            sb.append("Things I remember from past interactions:\n");
+            for (MemoryEntry e : memory.longTerm()) {
+                sb.append("  [memory] ").append(e.content()).append("\n");
+            }
+        }
         if (memory != null && !memory.shortTerm().isEmpty()) {
-            sb.append("Recent conversation and events (what actually happened):\n");
+            sb.append("Recent conversation and events (most recent first):\n");
             int start = Math.max(0, memory.shortTerm().size() - 6);
-            for (int i = start; i < memory.shortTerm().size(); i++) {
+            for (int i = memory.shortTerm().size() - 1; i >= start; i--) {
                 sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
             }
         }
 
-        sb.append("IMPORTANT: If the player asks about the surroundings, answer ONLY from the data above. If they ask about recent events or tasks, answer ONLY from the recent conversation above. Do not invent or assume.\n");
+        sb.append("IMPORTANT RULES:\n");
+        sb.append("- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data above. Do not invent.\n");
+        sb.append("- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' above. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n");
+        sb.append("- If asked about what was just said: use the recent conversation section.\n");
+        sb.append("- Never invent facts, events, or task names not present in the data above.\n");
         sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
         sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
         sb.append("Return ONLY this JSON with no extra text:\n");
