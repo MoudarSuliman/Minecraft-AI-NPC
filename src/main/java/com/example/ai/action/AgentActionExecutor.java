@@ -428,6 +428,28 @@ public final class AgentActionExecutor {
         speakAsNpc(server, villager, fallbackName, "You looking to trade?");
     }
 
+    public boolean tryFireWelcomeBack(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            UUID ownerPlayerId,
+            MemoryContext memory) {
+        if (ownerPlayerId == null) return true;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return false;
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerPlayerId);
+        if (owner == null || owner.level() != villager.level()) return false;
+
+        if (!hasLongTermMemory(memory)) {
+            speakAsNpc(server, villager, fallbackName, "Hey! Good to see you again.");
+            return true;
+        }
+        String greeting = generateRelationshipGreeting(npcId, villager, owner, memory);
+        speakAsNpc(server, villager, fallbackName, greeting.isBlank()
+                ? "Hey! Good to see you again." : greeting);
+        return true;
+    }
+
     public void maybeSendEnvironmentalAdvisory(
             MinecraftServer server,
             UUID npcId,
@@ -3616,11 +3638,6 @@ public final class AgentActionExecutor {
         ServerPlayer player = findPlayerByName(server, playerName);
         if (player == null) { logger.info("[DIALOGUE] skip: player '{}' not found", playerName); return false; }
         if (player.level() != villager.level()) { logger.info("[DIALOGUE] skip: player/villager in different levels"); return false; }
-        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
-            logger.info("[DIALOGUE] skip: speaker '{}' is not the owner {}", playerName, ownerPlayerId);
-            return false;
-        }
-
         String replyPrompt = promptFactory.dialogueReplyPrompt(
                 villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory);
         String replyRaw = llmRouter.generate(replyPrompt);

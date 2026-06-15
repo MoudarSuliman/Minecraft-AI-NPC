@@ -22,8 +22,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class AutonomousNpcRuntime {
     private final Logger logger;
@@ -43,6 +46,10 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, String> lastDemandByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastExpectedIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
+
+    private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final Set<UUID> thinkingNpcs = ConcurrentHashMap.newKeySet();
+    private final Set<UUID> pendingWelcomeBack = ConcurrentHashMap.newKeySet();
 
     private AutonomousNpcRuntime(
             Logger logger,
@@ -89,10 +96,8 @@ public final class AutonomousNpcRuntime {
         restorePersistedBindings(server);
         for (AgentHandle handle : agents.values()) {
             UUID npcId = handle.npcId();
-            MemoryContext memory = memoryStore.getContext(npcId);
+
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
-            // actionExecutor.maybeSendTradeGreeting(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
-            actionExecutor.maybeSendEnvironmentalAdvisory(server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
             List<String> summaries = actionExecutor.pollCompletedTaskSummaries(npcId);
@@ -102,248 +107,233 @@ public final class AutonomousNpcRuntime {
                 }
             }
 
-            boolean hasPendingInstruction = pendingInstruction.getOrDefault(npcId, false);
-            if (!hasPendingInstruction) {
+            if (thinkingNpcs.contains(npcId)) continue;
+
+            // Fire welcome-back greeting once after server restart, before normal processing
+            if (pendingWelcomeBack.contains(npcId)) {
+                MemoryContext greetMem = memoryStore.getContext(npcId);
+                thinkingNpcs.add(npcId);
+                llmExecutor.submit(() -> {
+                    try {
+                        boolean fired = actionExecutor.tryFireWelcomeBack(
+                                server, npcId, handle.npcName(), handle.ownerPlayerId(), greetMem);
+                        if (fired) pendingWelcomeBack.remove(npcId);
+                    } catch (Exception e) {
+                        logger.warn("[ASYNC] Welcome-back error for {}", handle.npcName(), e);
+                    } finally {
+                        thinkingNpcs.remove(npcId);
+                    }
+                });
                 continue;
             }
-            if (now < nextThinkAt.getOrDefault(npcId, 0L)) {
+
+            if (now < nextThinkAt.getOrDefault(npcId, 0L)) continue;
+
+            MemoryContext memory       = memoryStore.getContext(npcId);
+            boolean hasPending         = pendingInstruction.getOrDefault(npcId, false);
+            WorldSnapshot snapshot     = actionExecutor.captureWorldSnapshot(server, npcId, handle.npcName());
+
+            if (!hasPending) {
+
+                thinkingNpcs.add(npcId);
+                llmExecutor.submit(() -> {
+                    try {
+                        actionExecutor.maybeSendEnvironmentalAdvisory(
+                                server, npcId, handle.npcName(), handle.ownerPlayerId(), memory);
+                    } catch (Exception e) {
+                        logger.warn("[ASYNC] Environmental advisory error for {}", handle.npcName(), e);
+                    } finally {
+                        thinkingNpcs.remove(npcId);
+                    }
+                });
                 continue;
             }
 
-            String latestEntry = latestInstruction(memory);
-            String speaker = speakerFromEntry(latestEntry);
-            String latestInstruction = instructionTextFromEntry(latestEntry);
-            WorldSnapshot snapshot = actionExecutor.captureWorldSnapshot(server, npcId, handle.npcName());
+          
+            String latestEntry      = latestInstruction(memory);
+            String speaker          = speakerFromEntry(latestEntry);
+            String instruction      = instructionTextFromEntry(latestEntry);
+            InstructionDemand demand = classifyDemand(instruction);
 
-            InstructionDemand demand = classifyDemand(latestInstruction);
-            logger.info("[THINK] npc={} instruction='{}' speaker='{}' demand={}", handle.npcName(), latestInstruction, speaker, demand);
+            thinkingNpcs.add(npcId);
+            llmExecutor.submit(() -> {
+                try {
+                    processInstruction(server, handle, npcId, memory, snapshot,
+                            speaker, instruction, demand, now, hasPending);
+                } catch (Exception e) {
+                    logger.warn("[ASYNC] Think error for {}", handle.npcName(), e);
+                    pendingInstruction.put(npcId, false);
+                    nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                } finally {
+                    thinkingNpcs.remove(npcId);
+                }
+            });
+        }
+    }
 
+    private void processInstruction(MinecraftServer server, AgentHandle handle, UUID npcId,
+                                    MemoryContext memory, WorldSnapshot snapshot,
+                                    String speaker, String latestInstruction,
+                                    InstructionDemand demand, long now, boolean hasPendingInstruction) {
+        logger.info("[THINK] npc={} instruction='{}' speaker='{}' demand={}",
+                handle.npcName(), latestInstruction, speaker, demand);
+
+        if (demand == InstructionDemand.NONE) {
             if (actionExecutor.tryHandleRecipeInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory,
-                    snapshot
-            )) {
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("recipe", "Handled recipe instruction from " + speaker + ": " + latestInstruction)
-                );
-                continue;
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("recipe",
+                        "Handled recipe instruction from " + speaker + ": " + latestInstruction));
+                return;
             }
 
             if (actionExecutor.tryHandleSearchInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory
-            )) {
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("search", "Handled search instruction from " + speaker + ": " + latestInstruction)
-                );
-                continue;
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("search",
+                        "Handled search instruction from " + speaker + ": " + latestInstruction));
+                return;
             }
 
             if (actionExecutor.tryHandleScoutInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory,
-                    snapshot
-            )) {
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("scout", "Handled scout instruction from " + speaker + ": " + latestInstruction)
-                );
-                continue;
+                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scout",
+                        "Handled scout instruction from " + speaker + ": " + latestInstruction));
+                return;
             }
-
-            if (demand == InstructionDemand.REQUIRE_BUILD && actionExecutor.tryHandleScenarioInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory,
-                    snapshot,
-                    true
-            )) {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("scenario", "Handled scenario instruction from " + speaker + ": " + latestInstruction)
-                );
-                continue;
-            }
-
-            if (demand == InstructionDemand.REQUIRE_TRADE && actionExecutor.tryHandleTradeInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory,
-                    snapshot
-            )) {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("trade", "Handled trade instruction from " + speaker + ": " + latestInstruction)
-                );
-                continue;
-            }
-
-            if (demand == InstructionDemand.NONE && actionExecutor.tryHandleDialogueInstruction(
-                    server,
-                    npcId,
-                    handle.npcName(),
-                    speaker,
-                    handle.ownerPlayerId(),
-                    latestInstruction,
-                    memory,
-                    snapshot
-            )) {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, now + 800L);
-                memoryStore.appendLongTerm(
-                        npcId,
-                        MemoryEntry.episodic("dialogue", "Handled dialogue from " + speaker + ": " + latestInstruction)
-                );
-                continue;
-            }
-
-            String expectedIntent = expectedIntentForDemand(demand);
-            lastDemandByNpc.put(npcId, demand.name().toLowerCase(Locale.ROOT));
-            lastExpectedIntentByNpc.put(npcId, expectedIntent.isBlank() ? "none" : expectedIntent);
-            String targetHint = targetHintFromInstruction(latestInstruction, demand);
-            String prompt = promptFactory.actionSelectionPrompt(
-                    snapshot,
-                    memory,
-                    hasPendingInstruction,
-                    latestInstruction,
-                    expectedIntent,
-                    targetHint
-            );
-            llmInFlight.put(npcId, true);
-            String raw;
-            try {
-                raw = llmRouter.generate(prompt);
-            } finally {
-                llmInFlight.put(npcId, false);
-            }
-            AgentDecision decision = decisionParser.parse(raw);
-            lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase(Locale.ROOT));
-            if (!decision.isValid()) {
-                logger.info("LLM produced invalid decision for agent {}: {}", handle.npcName(), raw);
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (!safetyPolicy.allow(npcId, decision)) {
-                logger.info("Safety policy blocked decision for agent {}: {}", handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-
-            if (decision.intent() == AgentIntentType.IDLE) {
-                logger.info("Idle decision rejected for pending instruction on agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (decision.intent() == AgentIntentType.DIALOGUE_REPLY
-                    && !decision.parameters().has("text")) {
-                logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST
-                    && !decision.parameters().has("item_id")) {
-                logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (decision.intent() == AgentIntentType.MINE_BLOCK
-                    && !decision.parameters().has("block")
-                    && !(decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"))) {
-                logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (decision.intent() == AgentIntentType.MINE_TO_CHEST
-                    && !decision.parameters().has("block")) {
-                logger.info("Mine-to-chest decision missing parameters.block for agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (decision.intent() == AgentIntentType.MINE_TO_PLAYER
-                    && !decision.parameters().has("block")) {
-                logger.info("Mine-to-player decision missing parameters.block for agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (demand == InstructionDemand.REQUIRE_MINE && decision.intent() != AgentIntentType.MINE_BLOCK) {
-                logger.info("Mine instruction requires MINE_BLOCK intent for agent {}. Got {}. Retrying.",
-                        handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (demand == InstructionDemand.REQUIRE_MINE_TO_CHEST && decision.intent() != AgentIntentType.MINE_TO_CHEST) {
-                logger.info("Mine-to-chest instruction requires MINE_TO_CHEST intent for agent {}. Got {}. Retrying.",
-                        handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (demand == InstructionDemand.REQUIRE_MINE_TO_PLAYER && decision.intent() != AgentIntentType.MINE_TO_PLAYER) {
-                logger.info("Mine-to-player instruction requires MINE_TO_PLAYER intent for agent {}. Got {}. Retrying.",
-                        handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (demand == InstructionDemand.REQUIRE_FETCH && decision.intent() != AgentIntentType.FETCH_FROM_CHEST) {
-                logger.info("Fetch instruction requires FETCH_FROM_CHEST intent for agent {}. Got {}. Retrying.",
-                        handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-            if (demand == InstructionDemand.REQUIRE_BUILD && decision.intent() != AgentIntentType.BUILD_STRUCTURE) {
-                logger.info("Build instruction requires BUILD_STRUCTURE intent for agent {}. Got {}. Retrying.",
-                        handle.npcName(), decision.intent());
-                nextThinkAt.put(npcId, now + 1200L);
-                continue;
-            }
-
-            actionExecutor.execute(npcId, decision);
-            logger.info(
-                    "LLM decision queued: agent={} intent={} priority={} reasoning={}",
-                    handle.npcName(),
-                    decision.intent(),
-                    decision.priority(),
-                    decision.reasoning()
-            );
-            memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
-            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision", snapshot.toJson().toString()));
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, now + 1500L);
         }
+
+        if (demand == InstructionDemand.REQUIRE_BUILD && actionExecutor.tryHandleScenarioInstruction(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                latestInstruction, memory, snapshot, true)) {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, now + 800L);
+            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("scenario",
+                    "Handled scenario instruction from " + speaker + ": " + latestInstruction));
+            return;
+        }
+
+        if (demand == InstructionDemand.REQUIRE_TRADE && actionExecutor.tryHandleTradeInstruction(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                latestInstruction, memory, snapshot)) {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, now + 800L);
+            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("trade",
+                    "Handled trade instruction from " + speaker + ": " + latestInstruction));
+            return;
+        }
+
+        if (demand == InstructionDemand.NONE && actionExecutor.tryHandleDialogueInstruction(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                latestInstruction, memory, snapshot)) {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, now + 800L);
+            memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("dialogue",
+                    "Handled dialogue from " + speaker + ": " + latestInstruction));
+            return;
+        }
+
+
+        String expectedIntent = expectedIntentForDemand(demand);
+        lastDemandByNpc.put(npcId, demand.name().toLowerCase(Locale.ROOT));
+        lastExpectedIntentByNpc.put(npcId, expectedIntent.isBlank() ? "none" : expectedIntent);
+        String targetHint = targetHintFromInstruction(latestInstruction, demand);
+        String prompt = promptFactory.actionSelectionPrompt(
+                snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint);
+
+        llmInFlight.put(npcId, true);
+        String raw;
+        try {
+            raw = llmRouter.generate(prompt);
+        } finally {
+            llmInFlight.put(npcId, false);
+        }
+
+        AgentDecision decision = decisionParser.parse(raw);
+        lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase(Locale.ROOT));
+
+        if (!decision.isValid()) {
+            logger.info("LLM produced invalid decision for agent {}: {}", handle.npcName(), raw);
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (!safetyPolicy.allow(npcId, decision)) {
+            logger.info("Safety policy blocked decision for agent {}: {}", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.IDLE) {
+            logger.info("Idle decision rejected for pending instruction on agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.DIALOGUE_REPLY && !decision.parameters().has("text")) {
+            logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST && !decision.parameters().has("item_id")) {
+            logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.MINE_BLOCK
+                && !decision.parameters().has("block")
+                && !(decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"))) {
+            logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.MINE_TO_CHEST && !decision.parameters().has("block")) {
+            logger.info("Mine-to-chest decision missing parameters.block for agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (decision.intent() == AgentIntentType.MINE_TO_PLAYER && !decision.parameters().has("block")) {
+            logger.info("Mine-to-player decision missing parameters.block for agent {}. Retrying.", handle.npcName());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (demand == InstructionDemand.REQUIRE_MINE && decision.intent() != AgentIntentType.MINE_BLOCK) {
+            logger.info("Mine instruction requires MINE_BLOCK for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (demand == InstructionDemand.REQUIRE_MINE_TO_CHEST && decision.intent() != AgentIntentType.MINE_TO_CHEST) {
+            logger.info("Mine-to-chest instruction requires MINE_TO_CHEST for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (demand == InstructionDemand.REQUIRE_MINE_TO_PLAYER && decision.intent() != AgentIntentType.MINE_TO_PLAYER) {
+            logger.info("Mine-to-player instruction requires MINE_TO_PLAYER for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (demand == InstructionDemand.REQUIRE_FETCH && decision.intent() != AgentIntentType.FETCH_FROM_CHEST) {
+            logger.info("Fetch instruction requires FETCH_FROM_CHEST for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+        if (demand == InstructionDemand.REQUIRE_BUILD && decision.intent() != AgentIntentType.BUILD_STRUCTURE) {
+            logger.info("Build instruction requires BUILD_STRUCTURE for agent {}. Got {}. Retrying.", handle.npcName(), decision.intent());
+            nextThinkAt.put(npcId, now + 1200L);
+            return;
+        }
+
+        actionExecutor.execute(npcId, decision);
+        logger.info("LLM decision queued: agent={} intent={} priority={} reasoning={}",
+                handle.npcName(), decision.intent(), decision.priority(), decision.reasoning());
+        memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
+        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision", snapshot.toJson().toString()));
+        pendingInstruction.put(npcId, false);
+        nextThinkAt.put(npcId, now + 1500L);
     }
 
     public void registerAgent(UUID npcId, String npcName) {
@@ -554,6 +544,7 @@ public final class AutonomousNpcRuntime {
 
             agents.put(npcId, new AgentHandle(npcId, npcName, ownerPlayerId));
             pendingInstruction.put(npcId, false);
+            pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
         }
     }
