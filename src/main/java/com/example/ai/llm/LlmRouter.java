@@ -10,12 +10,24 @@ public final class LlmRouter {
     }
 
     public static LlmRouter defaultRouter() {
-        String apiKey = System.getenv("OPENAI_API_KEY");
+        LlmConfig cfg = LlmConfig.load();
         LlmClient ollama = new OllamaLlmClient("http://127.0.0.1:11434/api/generate", "llama3");
-        LlmClient gpt = (apiKey == null || apiKey.isBlank())
-                ? ollama
-                : new Gpt4oLlmClient(apiKey);
-        return new LlmRouter(ollama, gpt);
+        LlmClient cloud  = buildCloudClient(cfg, ollama);
+
+        return switch (cfg.mode) {
+            case local -> new LlmRouter(ollama, ollama);
+            case cloud -> new LlmRouter(cloud,  cloud);
+            case auto  -> new LlmRouter(ollama, cloud);
+        };
+    }
+
+    private static LlmClient buildCloudClient(LlmConfig cfg, LlmClient fallback) {
+        if (cfg.cloudApiKey == null || cfg.cloudApiKey.isBlank()) return fallback;
+        return switch (cfg.cloudProvider) {
+            case openai    -> new Gpt4oLlmClient(cfg.cloudApiKey, cfg.cloudModel);
+            case anthropic -> new AnthropicLlmClient(cfg.cloudApiKey, cfg.cloudModel);
+            case gemini    -> new GeminiLlmClient(cfg.cloudApiKey, cfg.cloudModel);
+        };
     }
 
     public String generate(String prompt) {

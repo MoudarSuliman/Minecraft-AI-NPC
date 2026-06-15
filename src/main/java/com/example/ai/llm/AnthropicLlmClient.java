@@ -10,16 +10,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
-public final class Gpt4oLlmClient implements LlmClient {
+public final class AnthropicLlmClient implements LlmClient {
     private final HttpClient http = HttpClient.newHttpClient();
     private final String apiKey;
     private final String model;
 
-    public Gpt4oLlmClient(String apiKey) {
-        this(apiKey, "gpt-4o");
-    }
-
-    public Gpt4oLlmClient(String apiKey, String model) {
+    public AnthropicLlmClient(String apiKey, String model) {
         this.apiKey = apiKey;
         this.model  = model;
     }
@@ -28,27 +24,27 @@ public final class Gpt4oLlmClient implements LlmClient {
     public String generate(String prompt) throws Exception {
         JsonObject body = new JsonObject();
         body.addProperty("model", model);
+        body.addProperty("max_tokens", 1024);
         JsonArray messages = new JsonArray();
         JsonObject user = new JsonObject();
         user.addProperty("role", "user");
         user.addProperty("content", prompt);
         messages.add(user);
         body.add("messages", messages);
-        body.addProperty("temperature", 0.2);
 
-        HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.openai.com/v1/chat/completions"))
+        HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.anthropic.com/v1/messages"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
+                .header("x-api-key", apiKey)
+                .header("anthropic-version", "2023-06-01")
                 .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
                 .build();
 
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
         JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
-        return root.getAsJsonArray("choices")
+        return root.getAsJsonArray("content")
                 .get(0).getAsJsonObject()
-                .getAsJsonObject("message")
-                .get("content")
+                .get("text")
                 .getAsString();
     }
 }

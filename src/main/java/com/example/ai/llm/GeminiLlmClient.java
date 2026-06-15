@@ -10,45 +10,46 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
-public final class Gpt4oLlmClient implements LlmClient {
+public final class GeminiLlmClient implements LlmClient {
     private final HttpClient http = HttpClient.newHttpClient();
     private final String apiKey;
     private final String model;
 
-    public Gpt4oLlmClient(String apiKey) {
-        this(apiKey, "gpt-4o");
-    }
-
-    public Gpt4oLlmClient(String apiKey, String model) {
+    public GeminiLlmClient(String apiKey, String model) {
         this.apiKey = apiKey;
         this.model  = model;
     }
 
     @Override
     public String generate(String prompt) throws Exception {
+        JsonObject part = new JsonObject();
+        part.addProperty("text", prompt);
+        JsonArray parts = new JsonArray();
+        parts.add(part);
+        JsonObject content = new JsonObject();
+        content.add("parts", parts);
+        JsonArray contents = new JsonArray();
+        contents.add(content);
         JsonObject body = new JsonObject();
-        body.addProperty("model", model);
-        JsonArray messages = new JsonArray();
-        JsonObject user = new JsonObject();
-        user.addProperty("role", "user");
-        user.addProperty("content", prompt);
-        messages.add(user);
-        body.add("messages", messages);
-        body.addProperty("temperature", 0.2);
+        body.add("contents", contents);
 
-        HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.openai.com/v1/chat/completions"))
+        String url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                + model + ":generateContent?key=" + apiKey;
+
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
                 .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
                 .build();
 
         HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
         JsonObject root = JsonParser.parseString(response.body()).getAsJsonObject();
-        return root.getAsJsonArray("choices")
+        return root.getAsJsonArray("candidates")
                 .get(0).getAsJsonObject()
-                .getAsJsonObject("message")
-                .get("content")
+                .getAsJsonObject("content")
+                .getAsJsonArray("parts")
+                .get(0).getAsJsonObject()
+                .get("text")
                 .getAsString();
     }
 }
