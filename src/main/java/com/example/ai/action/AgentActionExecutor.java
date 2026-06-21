@@ -1186,8 +1186,8 @@ public final class AgentActionExecutor {
                     return true;
                 }
                 TradeOffer preview = tradeOfferEngine.quote(requestedItemId, 1, stock, 0, false, now);
-                session.activeOffer = tradeOfferEngine.quote(requestedItemId, stock, stock, 0, false, now);
-                session.lastRequestedQuantity = stock;
+                session.activeOffer = preview;
+                session.lastRequestedQuantity = 1;
                 String response = "I currently have " + stock + " " + readableItemName(requestedItemId)
                         + " in stock at " + preview.unitPrice() + " emerald each.";
                 speakAsNpc(server, villager, fallbackName, groundedStockText(draft.responseText(), response));
@@ -1221,8 +1221,8 @@ public final class AgentActionExecutor {
             return true;
         }
         session.lastRequestedItemId = firstItemIdWithStock;
-        session.lastRequestedQuantity = firstStock;
-        session.activeOffer = tradeOfferEngine.quote(firstItemIdWithStock, firstStock, firstStock, 0, false, now);
+        session.lastRequestedQuantity = 1;
+        session.activeOffer = tradeOfferEngine.quote(firstItemIdWithStock, 1, firstStock, 0, false, now);
         offers.sort(String::compareTo);
         int limit = Math.min(4, offers.size());
         String message = String.join(", ", offers.subList(0, limit));
@@ -1519,10 +1519,13 @@ public final class AgentActionExecutor {
         if (tradeIntent.type() == TradeIntentType.REQUEST_OFFER && session.activeOffer == null) {
             String itemId = tradeIntent.itemId();
             int quantity = Math.max(1, tradeIntent.quantity());
-            int stock = 0;
+            PriceConfig cfg = tradeOfferEngine.currentConfigs().getOrDefault(itemId, PriceConfig.defaults(2));
             return "request_item=" + itemId
                     + "; quantity=" + quantity
-                    + "; stock=" + stock;
+                    + "; base_price=" + cfg.base()
+                    + "; max_price=" + cfg.max()
+                    + "; discount_pct=" + cfg.discountPct()
+                    + "; start_offer_at=base_price";
         }
         if (tradeIntent.type() == TradeIntentType.COUNTER_OFFER && session.activeOffer != null) {
             return "current_offer=" + summarizeOffer(session.activeOffer)

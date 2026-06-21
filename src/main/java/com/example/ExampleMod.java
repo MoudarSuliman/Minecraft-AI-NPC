@@ -107,7 +107,7 @@ public class ExampleMod implements ModInitializer {
 			return 0;
 		}
 		Villager villager = new Villager(EntityType.VILLAGER, level);
-		villager.setNoAi(true);
+		villager.getBrain().removeAllBehaviors();
 		villager.teleportTo(player.getX(), player.getY(), player.getZ());
 		if (name != null && !name.isBlank()) {
 			villager.setCustomName(Component.literal(name));
