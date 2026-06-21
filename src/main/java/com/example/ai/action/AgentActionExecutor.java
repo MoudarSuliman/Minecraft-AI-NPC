@@ -3991,6 +3991,152 @@ public final class AgentActionExecutor {
         return sb.toString();
     }
 
+    // ── Direct execution methods (called after action selection already classified the intent) ─
+
+    public boolean tryHandleRecipeInstructionDirect(
+            MinecraftServer server, UUID npcId, String fallbackName,
+            String playerName, UUID ownerPlayerId,
+            String instruction, MemoryContext memory, WorldSnapshot snapshot) {
+        if (instruction == null || instruction.isBlank()) return false;
+        String lower = instruction.toLowerCase(Locale.ROOT);
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return false;
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) return false;
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+
+        Item targetOutput = recipeTargetItem(lower, instruction);
+        if (targetOutput == null) return false;
+
+        RecipeSummary recipeSummary = summarizeRecipeFromGame(server, targetOutput);
+        long now = System.currentTimeMillis();
+        TradeSessionKey key = new TradeSessionKey(npcId, player.getUUID());
+        TradeSession session = tradeSessions.computeIfAbsent(key, ignored -> new TradeSession());
+        session.lastInteractionAtMillis = now;
+        ServerLevel level = (ServerLevel) villager.level();
+        List<RecipeIngredientStatus> ingredientStatuses = evaluateIngredientStatus(
+                server, level, villager.blockPosition(), player, recipeSummary.ingredients());
+
+        List<String> missingIngredients = new ArrayList<>();
+        List<String> availableIngredients = new ArrayList<>();
+        for (RecipeIngredientStatus status : ingredientStatuses) {
+            String entry = status.readableName() + " " + status.nearbyCount() + "/" + status.neededCount();
+            if (status.nearbyCount() >= status.neededCount()) availableIngredients.add(entry);
+            else missingIngredients.add(entry);
+        }
+        String missingSummary = missingIngredients.isEmpty() ? "none" : String.join(", ", missingIngredients);
+        String availableSummary = availableIngredients.isEmpty() ? "none" : String.join(", ", availableIngredients);
+
+        StringBuilder fallbackReply = new StringBuilder();
+        fallbackReply.append("You need ").append(recipeSummary.summaryText()).append(".");
+        if (!ingredientStatuses.isEmpty()) {
+            fallbackReply.append(" Nearby stock: ");
+            List<String> stockBits = new ArrayList<>();
+            for (RecipeIngredientStatus status : ingredientStatuses) {
+                stockBits.add(status.readableName() + " " + status.nearbyCount() + "/" + status.neededCount());
+            }
+            fallbackReply.append(String.join(", ", stockBits)).append(".");
+        }
+
+        TradeOffer ingredientOffer = null;
+        RecipeIngredientStatus offeredStatus = null;
+        for (RecipeIngredientStatus status : ingredientStatuses) {
+            if (!tradeOfferEngine.supportsItem(status.itemId()) || status.nearbyCount() <= 0) continue;
+            int offerCount = Math.min(status.neededCount(), Math.max(1, status.nearbyCount()));
+            ingredientOffer = tradeOfferEngine.quote(status.itemId(), offerCount, status.nearbyCount(), 0, false, now);
+            offeredStatus = status;
+            break;
+        }
+        if (ingredientOffer != null && offeredStatus != null) {
+            session.activeOffer = ingredientOffer;
+            session.lastInteractionAtMillis = now;
+            session.lastRequestedItemId = ingredientOffer.itemId();
+            session.lastRequestedQuantity = ingredientOffer.quantity();
+            fallbackReply.append(" I can trade ").append(ingredientOffer.quantity()).append(" ")
+                    .append(offeredStatus.readableName()).append(" for ").append(ingredientOffer.totalPrice())
+                    .append(" emeralds if you want.");
+        }
+        fallbackReply.append(" I can help gather what is missing.");
+
+        String nearbyFacts = summarizeIngredientFacts(ingredientStatuses);
+        String requiredFacts = "recipe=" + recipeSummary.summaryText()
+                + "; output_item=" + readableItemName(BuiltInRegistries.ITEM.getKey(targetOutput).toString())
+                + "; nearby_ingredients=" + nearbyFacts
+                + "; missing_ingredients=" + missingSummary
+                + "; available_ingredients=" + availableSummary
+                + "; active_offer=" + (ingredientOffer == null ? "none" : summarizeOffer(ingredientOffer));
+        String prompt = promptFactory.recipeAssistantPrompt(
+                villager.getName().getString(), player.getName().getString(),
+                instruction, requiredFacts, snapshot, memory);
+        String responseText = parseRecipeResponseText(llmRouter.generate(prompt));
+        speakAsNpc(server, villager, fallbackName,
+                groundedRecipeText(responseText, fallbackReply.toString(), ingredientOffer,
+                        recipeSummary.summaryText(), nearbyFacts));
+        lastActionSummaryByNpc.put(npcId, "Explained recipe for "
+                + readableItemName(BuiltInRegistries.ITEM.getKey(targetOutput).toString())
+                + ": " + recipeSummary.summaryText()
+                + (missingIngredients.isEmpty() ? ". All ingredients available." : ". Missing: " + missingSummary + "."));
+        return true;
+    }
+
+    public boolean executeSearchDirect(
+            MinecraftServer server, UUID npcId, String fallbackName,
+            String playerName, UUID ownerPlayerId,
+            String entityId, String entityLabel) {
+        if (entityId == null || entityId.isBlank()) return false;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel)) return false;
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) return false;
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+        if (activeSearchTasks.containsKey(npcId)) {
+            String label = entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId;
+            speakSearchStatusWithLlm(server, villager, fallbackName, player.getName().getString(),
+                    "search_already_active", "target=" + label, "I am already running a search task.");
+            return true;
+        }
+        String label = entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId;
+        SearchTask task = new SearchTask(label, entityId, false, player.getUUID());
+        task.nextStatusAtMillis = System.currentTimeMillis() + SEARCH_STATUS_COOLDOWN_MILLIS;
+        activeSearchTasks.put(npcId, task);
+        lastActionSummaryByNpc.put(npcId, "Searching for " + label + " (entity: " + entityId + "). Will report location when found.");
+        suppressTradeGreeting(npcId, player.getUUID(), SEARCH_TRADE_SUPPRESS_MILLIS);
+        speakSearchStatusWithLlm(server, villager, fallbackName, player.getName().getString(),
+                "search_start", "target=" + label,
+                "Got it. I will search for " + label + " and call out its location when I find it.");
+        return true;
+    }
+
+    public boolean executeScoutDirect(
+            MinecraftServer server, UUID npcId, String fallbackName,
+            String playerName, UUID ownerPlayerId,
+            String instruction, JsonObject parameters) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || !(villager.level() instanceof ServerLevel)) return false;
+        ServerPlayer player = findPlayerByName(server, playerName);
+        if (player == null || player.level() != villager.level()) return false;
+        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+        if (activeScoutTasks.containsKey(npcId)) {
+            speakAsNpc(server, villager, fallbackName, "I am already scouting.");
+            return true;
+        }
+        if (!startScoutTask(server, npcId, villager, player.getUUID(), player.getName().getString(),
+                instruction, parameters)) {
+            return false;
+        }
+        String direction = parameters != null && parameters.has("direction")
+                ? parameters.get("direction").getAsString() : "around";
+        String distance = parameters != null && parameters.has("distance")
+                ? String.valueOf(Math.max(24, parameters.get("distance").getAsInt()))
+                : String.valueOf(SCOUT_BASE_DISTANCE);
+        lastActionSummaryByNpc.put(npcId, "Scouting " + direction + " for approximately "
+                + distance + " blocks to observe the area.");
+        speakScoutStatus(server, villager, fallbackName, player.getName().getString(), "scout_start",
+                "direction=" + direction + "; distance=" + distance + "; objective=" + instruction,
+                "I will scout the area and report back.");
+        return true;
+    }
+
     private boolean isScenarioIntent(String raw) {
         if (raw == null || raw.isBlank()) return false;
         try {

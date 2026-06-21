@@ -16,20 +16,38 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "");
+    }
+
+    public String actionSelectionPrompt(
+            WorldSnapshot snapshot,
+            MemoryContext memory,
+            boolean hasPendingInstruction,
+            String latestInstruction,
+            String expectedIntent,
+            String targetHint,
+            String previousInstruction
+    ) {
         JsonObject payload = new JsonObject();
         payload.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
         payload.add("perception", snapshot.toJson());
         payload.add("memory", memoryToJson(memory));
         payload.addProperty("has_pending_instruction", hasPendingInstruction);
         payload.addProperty("latest_instruction", latestInstruction);
+        if (previousInstruction != null && !previousInstruction.isBlank()) {
+            payload.addProperty("previous_instruction", previousInstruction);
+        }
         payload.addProperty("expected_intent", expectedIntent);
         payload.addProperty("target_hint", targetHint);
         payload.addProperty("required_schema",
-                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
+                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
         payload.addProperty("constraints", hasPendingInstruction
                 ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
                 + "IMPORTANT — intent selection rules in priority order:\n"
+                + "0. CHALLENGE DETECTION: If previous_instruction is set and latest_instruction is clearly challenging "
+                + "or asking to retry the previous action ('are you sure?', 'check again', 'really?', 'try again', 'look harder'), "
+                + "classify as if latest_instruction were previous_instruction.\n"
                 + "1. TRADE intents take top priority. Use a trade_* intent whenever the player's message relates to "
                 + "buying, selling, trading, stock, pricing, or items the NPC sells — even if phrased as a question. "
                 + "   trade_offer: player wants to buy/trade/get items, or asks what you sell, what you have in stock, "
@@ -49,27 +67,35 @@ public final class PromptFactory {
                 + "'build a 3x3 cobblestone floor' -> build_structure. "
                 + "'build me a hut' -> build_structure. "
                 + "'build me a hut with cobble stone' -> build_structure. "
-                + "'build me a hut with cobblestone' -> build_structure. "
                 + "'build me a house out of wood' -> build_structure. "
                 + "'make me a small shelter' -> build_structure. "
                 + "'construct a wall to the north' -> build_structure. "
                 + "'set up a floor here' -> build_structure. "
                 + "Parameters: {\"description\":\"<the full instruction text>\"}\n"
-                + "3. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
+                + "3. If latest_instruction asks about crafting, how to make an item, or what the recipe for something is, "
+                + "use intent recipe_reply. "
+                + "Examples: 'how do I make a sword?' -> recipe_reply. 'what is the recipe for a pickaxe?' -> recipe_reply. "
+                + "'what do I need to craft a furnace?' -> recipe_reply. "
+                + "NEVER use recipe_reply for build requests ('build me a hut' is build_structure, not recipe_reply).\n"
+                + "4. If latest_instruction asks the NPC to find, locate, lead, or search for a specific creature, "
+                + "use intent search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}. "
+                + "Examples: 'find me a chicken' -> search_entity. 'locate the nearest cow' -> search_entity. "
+                + "'lead me to a sheep' -> search_entity. 'search for a zombie' -> search_entity.\n"
+                + "5. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
                 + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
-                + "4. If latest_instruction asks to mine a block, use intent mine_block with "
+                + "6. If latest_instruction asks to mine a block, use intent mine_block with "
                 + "parameters {\"block\":\"minecraft:...\"}.\n"
-                + "5. If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
+                + "7. If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "6. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
+                + "8. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
                 + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "7. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
+                + "9. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
                 + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
                 + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
                 + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb.\n"
-                + "8. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
-                + "9. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
-                + "10. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
+                + "10. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
+                + "11. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
+                + "12. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
                 + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
                 + "NEVER repeat or echo the player's message. "
                 + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. "

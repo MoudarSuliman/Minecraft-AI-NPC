@@ -200,53 +200,20 @@ public final class AutonomousNpcRuntime {
                                     MemoryContext memory, WorldSnapshot snapshot,
                                     String speaker, String latestInstruction,
                                     long now, boolean hasPendingInstruction) {
-        // Resolve challenge — if the player is questioning the last answer, replay it
-        String lastInstruction = lastProcessedInstructionByNpc.get(npcId);
-        if (lastInstruction != null && !lastInstruction.isBlank()
-                && isChallenge(lastInstruction, latestInstruction)) {
-            logger.info("[THINK] npc={} challenge detected — replaying last instruction='{}'",
-                    handle.npcName(), lastInstruction);
-            latestInstruction = lastInstruction;
-        }
-
         logger.info("[THINK] npc={} instruction='{}' speaker='{}'",
                 handle.npcName(), latestInstruction, speaker);
-
-        // Pre-classifiers: self-identifying handlers that always run first regardless of NPC state
-        if (actionExecutor.tryHandleRecipeInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory, snapshot)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "recipe");
-            return;
-        }
-        if (actionExecutor.tryHandleSearchInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "search");
-            return;
-        }
-        if (actionExecutor.tryHandleScoutInstruction(
-                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                latestInstruction, memory, snapshot)) {
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "scout");
-            return;
-        }
-        // Run action selection for all states
-        runActionSelection(server, handle, npcId, memory, snapshot, speaker, latestInstruction, now, hasPendingInstruction);
+        String previousInstruction = lastProcessedInstructionByNpc.getOrDefault(npcId, "");
+        runActionSelection(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                previousInstruction, now, hasPendingInstruction);
     }
 
     private void runActionSelection(MinecraftServer server, AgentHandle handle, UUID npcId,
                                     MemoryContext memory, WorldSnapshot snapshot,
                                     String speaker, String latestInstruction,
+                                    String previousInstruction,
                                     long now, boolean hasPendingInstruction) {
         String prompt = promptFactory.actionSelectionPrompt(
-                snapshot, memory, hasPendingInstruction, latestInstruction, "", "");
+                snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction);
 
         llmInFlight.put(npcId, true);
         String raw;
@@ -269,6 +236,51 @@ public final class AutonomousNpcRuntime {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
+            } else {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+            }
+            return;
+        }
+
+        // Route intents that have dedicated handlers directly — no extra classifier call needed
+        if (decision.intent() == AgentIntentType.RECIPE_REPLY) {
+            if (actionExecutor.tryHandleRecipeInstructionDirect(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "recipe");
+            } else {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+            }
+            return;
+        }
+        if (decision.intent() == AgentIntentType.SEARCH_ENTITY) {
+            String entityId = decision.parameters().has("entity_id")
+                    ? decision.parameters().get("entity_id").getAsString() : "";
+            String entityLabel = decision.parameters().has("entity_label")
+                    ? decision.parameters().get("entity_label").getAsString() : entityId;
+            if (actionExecutor.executeSearchDirect(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    entityId, entityLabel)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "search");
+            } else {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+            }
+            return;
+        }
+        if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
+            if (actionExecutor.executeScoutDirect(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, decision.parameters())) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "scout");
             } else {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
@@ -509,22 +521,6 @@ public final class AutonomousNpcRuntime {
             pendingInstruction.put(npcId, false);
             pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
-        }
-    }
-
-    private boolean isChallenge(String lastInstruction, String currentInstruction) {
-        try {
-            String prompt = promptFactory.challengeClassifierPrompt(lastInstruction, currentInstruction);
-            String raw = llmRouter.generate(prompt);
-            if (raw == null || raw.isBlank()) return false;
-            int start = raw.indexOf('{');
-            int end = raw.lastIndexOf('}');
-            if (start < 0 || end <= start) return false;
-            com.google.gson.JsonObject root = com.google.gson.JsonParser.parseString(
-                    raw.substring(start, end + 1)).getAsJsonObject();
-            return root.has("is_challenge") && root.get("is_challenge").getAsBoolean();
-        } catch (Exception e) {
-            return false;
         }
     }
 

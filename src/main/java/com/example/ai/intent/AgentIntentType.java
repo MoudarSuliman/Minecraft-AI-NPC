@@ -4,6 +4,7 @@ public enum AgentIntentType {
     IDLE,
     DIALOGUE_REPLY,
     RECIPE_REPLY,
+    SEARCH_ENTITY,
     SCOUT_EXPLORER,
     MOVE_TO,
     FETCH_FROM_CHEST,

@@ -62,7 +62,8 @@ public final class AgentDecisionParser {
             case "PLACE_BLOCK" -> AgentIntentType.PLACE_BLOCK;
             case "BREAK_BLOCK" -> AgentIntentType.BREAK_BLOCK;
                         case "RECIPE_REPLY" -> AgentIntentType.RECIPE_REPLY;
-                        case "BUILD_STRUCTURE" -> AgentIntentType.BUILD_STRUCTURE;
+            case "SEARCH_ENTITY" -> AgentIntentType.SEARCH_ENTITY;
+            case "BUILD_STRUCTURE" -> AgentIntentType.BUILD_STRUCTURE;
                         default -> AgentIntentType.IDLE;
         };
     }
