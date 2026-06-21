@@ -8,7 +8,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public final class TradeOfferEngine {
     private static final int MAX_STOCK_REFERENCE = 64;
-    private static final long OFFER_EXPIRY_MILLIS = 120_000L;
+    private static final long OFFER_EXPIRY_MILLIS = 600_000L;
 
     private final Map<String, PriceConfig> configs = new ConcurrentHashMap<>();
 

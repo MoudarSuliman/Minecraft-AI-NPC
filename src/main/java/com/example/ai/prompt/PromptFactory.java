@@ -283,6 +283,7 @@ public final class PromptFactory {
                         + "Do not invent quantities, items, stock, or prices not in required_facts. "
                         + "You MUST include the recipe requirements from required_facts. "
                         + "You MUST include the nearby ingredient status from required_facts, but only describe what is actually present. "
+                        + "If required_facts available_ingredients contains items the player needs, offer to fetch or hand them over — say something like 'I can get those for you' or 'want me to grab them?'. "
                         + "If required_facts active_offer is \"none\", do NOT claim you can trade or provide items from stock. "
                         + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.");
         return payload.toString();
