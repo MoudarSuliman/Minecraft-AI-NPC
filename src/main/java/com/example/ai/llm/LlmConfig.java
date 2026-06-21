@@ -15,6 +15,7 @@ public final class LlmConfig {
     public enum CloudProvider { openai, anthropic, gemini }
 
     public final ModelMode     mode;
+    public final String        localModel;
     public final CloudProvider cloudProvider;
     public final String        cloudModel;
     public final String        cloudApiKey;
@@ -22,9 +23,10 @@ public final class LlmConfig {
     private static final Path CONFIG_PATH = Path.of("config", "llm_npc", "config.json");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    private LlmConfig(ModelMode mode, CloudProvider cloudProvider,
+    private LlmConfig(ModelMode mode, String localModel, CloudProvider cloudProvider,
                       String cloudModel, String cloudApiKey) {
         this.mode          = mode;
+        this.localModel    = localModel;
         this.cloudProvider = cloudProvider;
         this.cloudModel    = cloudModel;
         this.cloudApiKey   = cloudApiKey;
@@ -39,6 +41,8 @@ public final class LlmConfig {
 
             ModelMode mode = parseEnum(ModelMode.class,
                     getString(json, "model", "auto"), ModelMode.auto);
+
+            String localModel = getString(json, "local_model", "llama3");
 
             CloudProvider provider = parseEnum(CloudProvider.class,
                     getString(json, "cloud_provider", "openai"), CloudProvider.openai);
@@ -56,10 +60,10 @@ public final class LlmConfig {
                 if (env != null) key = env;
             }
 
-            return new LlmConfig(mode, provider, cloudModel, key);
+            return new LlmConfig(mode, localModel, provider, cloudModel, key);
         } catch (Exception e) {
             LoggerFactory.getLogger("llm_npc").warn("Failed to load LLM config, using defaults", e);
-            return new LlmConfig(ModelMode.auto, CloudProvider.openai, "gpt-4o", "");
+            return new LlmConfig(ModelMode.auto, "llama3", CloudProvider.openai, "gpt-4o", "");
         }
     }
 
@@ -68,6 +72,7 @@ public final class LlmConfig {
             Files.createDirectories(CONFIG_PATH.getParent());
             JsonObject json = new JsonObject();
             json.addProperty("model",          "auto");
+            json.addProperty("local_model",    "llama3");
             json.addProperty("cloud_provider", "openai");
             json.addProperty("cloud_model",    "gpt-4o");
             json.addProperty("cloud_api_key",  "");

@@ -13,7 +13,7 @@ public final class LlmRouter {
 
     public static LlmRouter defaultRouter() {
         LlmConfig cfg = LlmConfig.load();
-        LlmClient ollama = new OllamaLlmClient("http://127.0.0.1:11434/api/generate", "llama3");
+        LlmClient ollama = new OllamaLlmClient("http://127.0.0.1:11434/api/generate", cfg.localModel);
         LlmClient cloud  = buildCloudClient(cfg, ollama);
 
         String cloudDesc = (cfg.cloudApiKey != null && !cfg.cloudApiKey.isBlank())

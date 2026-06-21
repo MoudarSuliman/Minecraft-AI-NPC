@@ -42,9 +42,19 @@ public final class PromptFactory {
                 + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
                 + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
                 + "   NEVER use dialogue_reply for anything trade or stock related.\n"
-                + "2. If latest_instruction asks to build, construct, place, or create a structure or floor or wall of blocks, "
-                + "use intent build_structure with parameters {\"description\":\"...\"}. "
-                + "Examples: 'build a 3x3 cobblestone floor' -> build_structure. 'construct a wall' -> build_structure.\n"
+                + "2. CRITICAL: If latest_instruction asks to build, construct, place, create, make, or set up a structure, "
+                + "floor, wall, hut, house, shelter, or pattern of blocks — you MUST use intent build_structure. "
+                + "NEVER use dialogue_reply for a build request. "
+                + "Examples (all MUST be build_structure): "
+                + "'build a 3x3 cobblestone floor' -> build_structure. "
+                + "'build me a hut' -> build_structure. "
+                + "'build me a hut with cobble stone' -> build_structure. "
+                + "'build me a hut with cobblestone' -> build_structure. "
+                + "'build me a house out of wood' -> build_structure. "
+                + "'make me a small shelter' -> build_structure. "
+                + "'construct a wall to the north' -> build_structure. "
+                + "'set up a floor here' -> build_structure. "
+                + "Parameters: {\"description\":\"<the full instruction text>\"}\n"
                 + "3. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
                 + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
                 + "4. If latest_instruction asks to mine a block, use intent mine_block with "
@@ -62,7 +72,8 @@ public final class PromptFactory {
                 + "10. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
                 + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
                 + "NEVER repeat or echo the player's message. "
-                + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply."
+                + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. "
+                + "STRICT RULE: NEVER use dialogue_reply when the instruction contains 'build', 'construct', 'make a', 'create', or 'set up' referring to a structure — use build_structure instead."
                 : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
         return payload.toString();
     }
@@ -264,8 +275,18 @@ public final class PromptFactory {
         payload.addProperty("format", "{\"is_recipe\":true,\"confidence\":0.0}");
         payload.addProperty("constraints",
                 "Return strict JSON only. "
-                        + "Set is_recipe=true only when the player is asking about crafting, recipes, or how to make an item (e.g. \\\"what is the recipe for a diamond pickaxe\\\", \\\"how do I craft a furnace\\\"). "
-                        + "Set is_recipe=false for trade requests, stock questions, or unrelated chat.");
+                        + "Set is_recipe=true ONLY when the player is explicitly asking HOW TO CRAFT or what the recipe FOR an item is "
+                        + "(e.g. 'what is the recipe for a diamond pickaxe', 'how do I craft a furnace', 'how do I make a sword'). "
+                        + "Set is_recipe=false for ALL of these:\n"
+                        + "- Build/construct requests (player wants the NPC to physically build something): "
+                        + "  'build me a hut with cobble stone' -> false. "
+                        + "  'build me a hut with cobblestone' -> false. "
+                        + "  'build a 3x3 cobblestone floor' -> false. "
+                        + "  'construct a wall' -> false. "
+                        + "  'make me a shelter out of wood' -> false. "
+                        + "  'set up a floor here' -> false. "
+                        + "- Trade requests, stock questions, or unrelated chat -> false. "
+                        + "KEY RULE: If the player says 'build', 'construct', 'make a [structure]', 'set up' — that is a build order, NOT a recipe question. Return is_recipe=false.");
         return payload.toString();
     }
 
@@ -497,6 +518,11 @@ public final class PromptFactory {
 
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory) {
+        return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, null);
+    }
+
+    public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
+            WorldSnapshot snapshot, MemoryContext memory, String scenarioContext) {
         StringBuilder sb = new StringBuilder();
         sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
         sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
@@ -545,6 +571,13 @@ public final class PromptFactory {
             }
         }
 
+        if (scenarioContext != null && !scenarioContext.isBlank()) {
+            sb.append("Background (ongoing task): ").append(scenarioContext).append("\n");
+            sb.append("Refer to this task ONLY if the player's question is about the build, materials, or quantities. ");
+            sb.append("If asked about materials, state EXACTLY what is listed — do not invent items or quantities. ");
+            sb.append("If asked where to place materials, say to put them in a nearby chest. ");
+            sb.append("For unrelated questions (trade, greetings, other topics), answer those normally without mentioning the build task.\n");
+        }
         sb.append("My abilities (what I can actually do when commanded):\n");
         sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");
         sb.append("  - Fetch items from nearby chests and bring them to the player\n");
@@ -625,12 +658,16 @@ public final class PromptFactory {
         return "Classify this Minecraft player instruction.\n"
                 + "Player (" + playerName + ") said to NPC (" + npcName + "): \"" + playerText + "\"\n"
                 + "\n"
-                + "RULE: classify as scenario_builder ONLY when the player asks the NPC to build, construct,\n"
+                + "RULE: classify as scenario_builder when the player asks the NPC to build, construct,\n"
                 + "place, or create a physical structure or pattern of blocks in the world.\n"
                 + "\n"
                 + "scenario_builder examples:\n"
                 + "  'build a 3x3 cobblestone floor' -> scenario_builder\n"
                 + "  'build a small shelter here' -> scenario_builder\n"
+                + "  'build me a hut' -> scenario_builder\n"
+                + "  'build me a hut with cobblestone' -> scenario_builder\n"
+                + "  'build me a hut with cobble stone' -> scenario_builder\n"
+                + "  'build me a house out of wood' -> scenario_builder\n"
                 + "  'construct a wall to the north' -> scenario_builder\n"
                 + "  'make a 3x3 platform out of oak planks' -> scenario_builder\n"
                 + "  'place a cobblestone floor here' -> scenario_builder\n"
@@ -642,18 +679,19 @@ public final class PromptFactory {
                 + "  'mine some cobblestone' -> none\n"
                 + "  'fetch me some glass' -> none\n"
                 + "  'do you have sticks' -> none\n"
+                + "  'how do I build a house?' -> none\n"
                 + "  'you there?' -> none\n"
                 + "\n"
                 + "The player said: \"" + playerText + "\"\n"
                 + (hasBuildVerb
-                        ? "The message contains a build/construct/place verb — this is likely scenario_builder.\n"
-                        : "The message does NOT contain a build or construction verb — default to none.\n")
+                        ? "IMPORTANT: The message contains a build/construct/place verb. Classify as scenario_builder.\n"
+                        : "The message does not contain a build or construction verb — classify as none.\n")
                 + "\n"
                 + "Return ONLY valid JSON, no extra text.\n"
-                + "If this is NOT a build request (the default):\n"
-                + "{\"intent\":\"none\",\"reasoning\":\"not a build request\",\"confidence\":0.9}\n"
                 + "If this IS a build/construct/place request:\n"
-                + "{\"intent\":\"scenario_builder\",\"reasoning\":\"player asked to build\",\"confidence\":0.9}";
+                + "{\"intent\":\"scenario_builder\",\"reasoning\":\"player asked to build\",\"confidence\":0.9}\n"
+                + "If this is NOT a build request:\n"
+                + "{\"intent\":\"none\",\"reasoning\":\"not a build request\",\"confidence\":0.9}";
     }
 
     public String scenarioPlanningPrompt(
@@ -669,6 +707,10 @@ public final class PromptFactory {
         return "You are planning a multi-step task for a Minecraft NPC named " + npcName + ".\n"
                 + "Player (" + playerName + ") requested: \"" + instruction + "\"\n"
                 + "NPC current position: " + posStr + "\n"
+                + "\n"
+                + "FIRST: If the player is NOT asking you to build, construct, place, or create a physical structure,\n"
+                + "return exactly: {\"scenario\":\"\",\"announce\":\"\",\"steps\":[]}\n"
+                + "Examples of non-build requests: greetings, trade questions, fetch/mine-only requests, questions about the world.\n"
                 + "\n"
                 + "Available step intents and their parameter formats:\n"
                 + "  fetch_from_chest: {\"item_id\":\"minecraft:cobblestone\", \"count\":9}\n"
@@ -811,11 +853,20 @@ public final class PromptFactory {
         payload.addProperty("current_player_utterance", currentInstruction);
         payload.addProperty("instructions",
                 "Decide if the current utterance is a direct challenge or retry of the EXACT previous action — "
-                + "meaning the player doubts the result and wants the NPC to redo it "
-                + "(e.g. 'are you sure?', 'check again', 'really?', 'you sure you don't have any?', 'try again', 'look harder'). "
-                + "is_challenge must be FALSE if the current utterance is: a price negotiation, a discount request, "
-                + "a new purchase request, a question about a different topic, small talk, or anything that introduces "
-                + "new intent rather than asking to redo the previous action. "
+                + "meaning the player doubts the NPC's last result and wants the NPC to redo it. "
+                + "is_challenge=TRUE examples: 'are you sure?', 'check again', 'really?', 'try again', 'look harder', "
+                + "'you sure you don't have any?', 'I don't believe you', 'do it again'. "
+                + "is_challenge=FALSE examples (new question or follow-up, NOT a retry): "
+                + "'but didn't you finish?' -> false (asking about completion status). "
+                + "'looks great' -> false (compliment, new statement). "
+                + "'did you do it?' -> false (status check). "
+                + "'can you do it again?' -> false (new request, not doubting the result). "
+                + "'how did it go?' -> false (status question). "
+                + "'what did you build?' -> false (new question). "
+                + "'nice work' -> false (compliment). "
+                + "is_challenge must also be FALSE for: price negotiation, discount request, "
+                + "new purchase request, question about a different topic, small talk, or anything that introduces "
+                + "new intent rather than explicitly asking to redo or recheck the previous action. "
                 + "Return strict JSON only: {\"is_challenge\": true} or {\"is_challenge\": false}. "
                 + "No other fields, no markdown.");
         return payload.toString();

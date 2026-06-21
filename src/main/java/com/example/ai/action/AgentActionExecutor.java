@@ -1186,6 +1186,8 @@ public final class AgentActionExecutor {
                     return true;
                 }
                 TradeOffer preview = tradeOfferEngine.quote(requestedItemId, 1, stock, 0, false, now);
+                session.activeOffer = tradeOfferEngine.quote(requestedItemId, stock, stock, 0, false, now);
+                session.lastRequestedQuantity = stock;
                 String response = "I currently have " + stock + " " + readableItemName(requestedItemId)
                         + " in stock at " + preview.unitPrice() + " emerald each.";
                 speakAsNpc(server, villager, fallbackName, groundedStockText(draft.responseText(), response));
@@ -1195,6 +1197,7 @@ public final class AgentActionExecutor {
 
         List<String> offers = new ArrayList<>();
         String firstItemIdWithStock = null;
+        int firstStock = 0;
         for (String itemId : tradeOfferEngine.supportedItems()) {
             Item item = resolveKnownItem(itemId);
             if (item == null) {
@@ -1206,6 +1209,7 @@ public final class AgentActionExecutor {
             }
             if (firstItemIdWithStock == null) {
                 firstItemIdWithStock = itemId;
+                firstStock = stock;
             }
             TradeOffer preview = tradeOfferEngine.quote(itemId, 1, stock, 0, false, now);
             offers.add(
@@ -1217,7 +1221,8 @@ public final class AgentActionExecutor {
             return true;
         }
         session.lastRequestedItemId = firstItemIdWithStock;
-        session.lastRequestedQuantity = 1;
+        session.lastRequestedQuantity = firstStock;
+        session.activeOffer = tradeOfferEngine.quote(firstItemIdWithStock, firstStock, firstStock, 0, false, now);
         offers.sort(String::compareTo);
         int limit = Math.min(4, offers.size());
         String message = String.join(", ", offers.subList(0, limit));
@@ -1240,6 +1245,11 @@ public final class AgentActionExecutor {
             TradeNegotiationDraft draft) {
         String itemId = tradeIntent.itemId();
         int quantity = Math.max(1, tradeIntent.quantity());
+        if (itemId == null || itemId.isBlank() || itemId.equals("none")
+                || itemId.equals("minecraft:none") || itemId.equals("minecraft:air")) {
+            return handleStockInquiry(server, villager, fallbackName, playerName, session,
+                    new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, "", 0, null), now, draft);
+        }
         if (!tradeOfferEngine.supportsItem(itemId)) {
             speakAsNpc(server, villager, fallbackName, "I don't trade that item right now.");
             return true;
@@ -1289,6 +1299,19 @@ public final class AgentActionExecutor {
             speakAsNpc(server, villager, fallbackName, "I need to make an offer first.");
             return true;
         }
+        int requestedQty = tradeIntent.quantity() > 0 ? tradeIntent.quantity() : session.activeOffer.quantity();
+        if (requestedQty != session.activeOffer.quantity()) {
+            Item reqItem = resolveKnownItem(session.activeOffer.itemId());
+            if (reqItem != null) {
+                int stock = countItemInNearbyChests(server, (ServerLevel) villager.level(),
+                        villager.blockPosition(), reqItem, TRADE_SCAN_RADIUS);
+                if (stock >= requestedQty) {
+                    session.activeOffer = tradeOfferEngine.quote(
+                            session.activeOffer.itemId(), requestedQty, stock, 0, false, now);
+                    session.lastRequestedQuantity = requestedQty;
+                }
+            }
+        }
         Integer proposed = tradeIntent.counterTotalPrice();
         if (proposed == null || proposed <= 0) {
             int minimum = tradeOfferEngine.minimumAcceptableTotal(session.activeOffer);
@@ -1310,10 +1333,19 @@ public final class AgentActionExecutor {
         }
         TradeCounterResult counter = tradeOfferEngine.evaluateCounter(session.activeOffer, proposed, now);
         if (!counter.accepted()) {
+            int bobsTotal = counter.minimumAcceptableTotal();
+            int qty = session.activeOffer.quantity();
+            session.activeOffer = new TradeOffer(
+                    session.activeOffer.itemId(),
+                    qty,
+                    Math.max(1, bobsTotal / Math.max(1, qty)),
+                    bobsTotal,
+                    session.activeOffer.maxDiscountPct(),
+                    session.activeOffer.expiresAtMillis());
             speakAsNpc(server, villager, fallbackName, groundedCounterRejectionText(
                     draft.responseText(),
-                    counter.minimumAcceptableTotal(),
-                    session.activeOffer.quantity(),
+                    bobsTotal,
+                    qty,
                     session.activeOffer.itemId()));
             return true;
         }
@@ -1912,6 +1944,10 @@ public final class AgentActionExecutor {
     }
 
     private boolean startFetchTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
+        return startFetchTask(server, npcId, villager, parameters, true);
+    }
+
+    private boolean startFetchTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters, boolean notifyOnFailure) {
         if (!(villager.level() instanceof ServerLevel level)) {
             return false;
         }
@@ -1927,9 +1963,20 @@ public final class AgentActionExecutor {
             return false;
         }
 
-        BlockPos chestPos = findChestWithItem(level, villager.blockPosition(), item, CHEST_SCAN_RADIUS, count);
+        int available = countItemInNearbyChests(server, level, villager.blockPosition(), item, CHEST_SCAN_RADIUS);
+        BlockPos chestPos = available >= count
+                ? findChestWithItem(level, villager.blockPosition(), item, CHEST_SCAN_RADIUS, count)
+                : null;
         if (chestPos == null) {
-            notifyNearbyPlayers(server, villager, "[LLM NPC] I could not find " + itemId + " in nearby chests.");
+            if (notifyOnFailure) {
+                if (available > 0) {
+                    notifyNearbyPlayers(server, villager, "[LLM NPC] I need " + count + "x " + itemId
+                            + " but only found " + available + " in nearby chests. Add more and I will continue.");
+                } else {
+                    notifyNearbyPlayers(server, villager, "[LLM NPC] I could not find " + itemId
+                            + " in nearby chests. Please place " + count + "x " + itemId + " in a nearby chest.");
+                }
+            }
             return false;
         }
 
@@ -3759,8 +3806,10 @@ public final class AgentActionExecutor {
         ServerPlayer player = findPlayerByName(server, playerName);
         if (player == null) { logger.info("[DIALOGUE] skip: player '{}' not found", playerName); return false; }
         if (player.level() != villager.level()) { logger.info("[DIALOGUE] skip: player/villager in different levels"); return false; }
+        String scenarioContext = buildScenarioContextForDialogue(server, villager, npcId);
         String replyPrompt = promptFactory.dialogueReplyPrompt(
-                villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory);
+                villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory,
+                scenarioContext);
         String replyRaw = llmRouter.generate(replyPrompt);
         String text = parseDialogueText(replyRaw);
         if (text == null || text.isBlank()) {
@@ -3772,31 +3821,65 @@ public final class AgentActionExecutor {
         return true;
     }
 
+    public enum NpcState { BUILDING, SCOUTING, SEARCHING, IDLE }
+
+    public NpcState getNpcState(UUID npcId) {
+        if (activeScenarioTasks.containsKey(npcId)) return NpcState.BUILDING;
+        if (activeScoutTasks.containsKey(npcId))    return NpcState.SCOUTING;
+        if (activeSearchTasks.containsKey(npcId))   return NpcState.SEARCHING;
+        return NpcState.IDLE;
+    }
+
+    private String buildScenarioContextForDialogue(MinecraftServer server, Villager villager, UUID npcId) {
+        ScenarioTask task = activeScenarioTasks.get(npcId);
+        if (task == null) return null;
+        ServerLevel level = villager.level() instanceof ServerLevel sl ? sl : null;
+        StringBuilder sb = new StringBuilder("Active build task: ").append(task.scenarioName).append(". Materials needed:");
+        for (com.example.ai.scenario.ScenarioStep step : task.steps) {
+            if ("fetch_from_chest".equals(step.intent())) {
+                com.google.gson.JsonObject p = step.parameters();
+                String itemId = p.has("item_id") ? p.get("item_id").getAsString() : "unknown";
+                int count = p.has("count") ? p.get("count").getAsInt() : 0;
+                sb.append(" ").append(count).append("x ").append(itemId);
+                if (level != null) {
+                    Item item = resolveKnownItem(itemId);
+                    if (item != null) {
+                        int inChest = countItemInNearbyChests(server, level, villager.blockPosition(), item, CHEST_SCAN_RADIUS);
+                        sb.append(" (").append(inChest).append(" currently in nearby chest)");
+                    }
+                }
+                sb.append(";");
+            }
+        }
+        return sb.toString();
+    }
+
     private String parseDialogueText(String raw) {
         if (raw == null || raw.isBlank()) return null;
         try {
             int start = raw.indexOf('{');
             int end = raw.lastIndexOf('}');
-            if (start < 0 || end <= start) return null;
-            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
-            for (String key : new String[]{"text", "reply", "response", "message", "response_text"}) {
-                if (root.has(key) && root.get(key).isJsonPrimitive()) {
-                    String val = root.get(key).getAsString().trim();
-                    if (!val.isBlank() && val.length() <= 300) return val;
+            if (start >= 0 && end > start) {
+                JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
+                for (String key : new String[]{"text", "reply", "response", "message", "response_text"}) {
+                    if (root.has(key) && root.get(key).isJsonPrimitive()) {
+                        String val = root.get(key).getAsString().trim();
+                        if (!val.isBlank() && val.length() <= 300) return val;
+                    }
                 }
             }
-            // Handle action-selection format: {"intent":"dialogue_reply","parameters":{"text":"..."}}
-            // if (root.has("parameters") && root.get("parameters").isJsonObject()) {
-            //     JsonObject params = root.getAsJsonObject("parameters");
-            //     for (String key : new String[]{"text", "reply", "response", "message"}) {
-            //         if (params.has(key) && params.get(key).isJsonPrimitive()) {
-            //             String val = params.get(key).getAsString().trim();
-            //             if (!val.isBlank() && val.length() <= 300) return val;
-            //         }
-            //     }
-            // }
         } catch (Exception ignored) {}
-        return null;
+        // Fallback: use raw text when model returns plain text instead of JSON.
+        // Reject if it still looks like a JSON fragment (LLM returned an action blob instead of dialogue).
+        String trimmed = raw.trim();
+        if (trimmed.contains("\"intent\"") || trimmed.contains("\"parameters\"") || trimmed.contains("\"reasoning\"")) {
+            return null;
+        }
+        int colonIdx = trimmed.indexOf(':');
+        if (colonIdx > 0 && colonIdx < 20) {
+            trimmed = trimmed.substring(colonIdx + 1).trim();
+        }
+        return (trimmed.isBlank() || trimmed.length() > 300) ? null : trimmed;
     }
 
     // ── Scenario Builder ─────────────────────────────────────────────────────
@@ -3925,6 +4008,11 @@ public final class AgentActionExecutor {
     private boolean advanceScenarioTask(MinecraftServer server, Villager villager, String fallbackName, ScenarioTask task) {
         if (!(villager.level() instanceof ServerLevel level)) return false;
         if (task.cancelled) return false;
+        if (task.waitingForMaterials) {
+            if (System.currentTimeMillis() < task.retryFetchAt) return true;
+            task.waitingForMaterials = false;
+            task.stepStarted = false;
+        }
         UUID npcId = villager.getUUID();
 
         // Sub-task completion: advance the step index when delegated work finishes
@@ -3982,7 +4070,7 @@ public final class AgentActionExecutor {
 
         // Delegated steps (move_to, fetch, mine) set a flag above; mark started so we don't re-execute
         // Immediate steps (place_block, place_pattern, dialogue_reply) already incremented currentStepIndex
-        if (task.isMoveStep || task.waitingForDelivery || task.waitingForMineToPlayer || task.waitingForMineToChest) {
+        if (task.isMoveStep || task.waitingForDelivery || task.waitingForMineToPlayer || task.waitingForMineToChest || task.waitingForMaterials) {
             task.stepStarted = true;
             task.stepDeadlineMillis = System.currentTimeMillis() + 30_000L;
         }
@@ -4053,10 +4141,14 @@ public final class AgentActionExecutor {
             case "fetch_from_chest" -> {
                 JsonObject p = step.parameters();
                 if (p.has("item_id")) {
-                    if (startFetchTask(server, npcId, villager, p)) {
+                    if (startFetchTask(server, npcId, villager, p, !task.materialsMissingNotified)) {
                         task.waitingForDelivery = true;
+                        task.waitingForMaterials = false;
+                        task.materialsMissingNotified = false;
                     } else {
-                        task.cancelled = true;
+                        task.materialsMissingNotified = true;
+                        task.waitingForMaterials = true;
+                        task.retryFetchAt = System.currentTimeMillis() + 15_000L;
                     }
                 } else {
                     task.currentStepIndex++;
@@ -4229,6 +4321,9 @@ public final class AgentActionExecutor {
         private boolean waitingForMineToPlayer = false;
         private boolean waitingForMineToChest = false;
         private boolean cancelled = false;
+        private boolean waitingForMaterials = false;
+        private long retryFetchAt = 0L;
+        private boolean materialsMissingNotified = false;
 
         private ScenarioTask(UUID requesterId, String requesterName, String scenarioName, List<ScenarioStep> steps) {
             this.requesterId = requesterId;
