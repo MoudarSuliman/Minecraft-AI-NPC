@@ -216,14 +216,19 @@ public class TradePricesScreen extends Screen {
     }
 
     private void addNewRow() {
-        rows.add(new PriceRow("", "2", "4", "15"));
+        String currentId   = itemIdBox.getValue().trim();
+        String currentBase = baseBox.getValue().trim();
+        String currentMax  = maxBox.getValue().trim();
+        String currentDisc = discBox.getValue().trim();
+        rows.add(new PriceRow(
+                currentId,
+                currentBase.isBlank() ? "2"  : currentBase,
+                currentMax.isBlank()  ? "4"  : currentMax,
+                currentDisc.isBlank() ? "15" : currentDisc
+        ));
         selectedIndex = rows.size() - 1;
-        itemIdBox.setValue("");
-        baseBox.setValue("2");
-        maxBox.setValue("4");
-        discBox.setValue("15");
+        populateEditPanel();
         itemIdBox.setFocused(true);
-        refreshEditPanel();
     }
 
     private void saveAndClose() {
