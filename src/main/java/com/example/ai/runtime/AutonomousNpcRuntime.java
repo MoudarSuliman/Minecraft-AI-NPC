@@ -517,6 +517,7 @@ public final class AutonomousNpcRuntime {
                 }
             }
 
+            ((Villager) entity).getBrain().removeAllBehaviors();
             agents.put(npcId, new AgentHandle(npcId, npcName, ownerPlayerId));
             pendingInstruction.put(npcId, false);
             pendingWelcomeBack.add(npcId);
