@@ -347,6 +347,17 @@ public final class AgentActionExecutor {
         return success;
     }
 
+    public void lookAtOwnerIfIdle(MinecraftServer server, UUID npcId, UUID ownerPlayerId) {
+        if (ownerPlayerId == null) return;
+        if (getNpcState(npcId) != NpcState.IDLE) return;
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return;
+        ServerPlayer owner = server.getPlayerList().getPlayer(ownerPlayerId);
+        if (owner == null || owner.level() != villager.level()) return;
+        if (villager.distanceToSqr(owner) > 400.0) return; // 20 blocks
+        villager.getLookControl().setLookAt(owner, 30.0f, 30.0f);
+    }
+
     public void enforceOwnerLeash(MinecraftServer server, UUID npcId, UUID ownerPlayerId, String fallbackName) {
         if (ownerPlayerId == null) {
             return;
@@ -437,7 +448,9 @@ public final class AgentActionExecutor {
             speakAsNpc(server, villager, fallbackName, relationshipGreeting);
             return;
         }
-        speakAsNpc(server, villager, fallbackName, "You looking to trade?");
+        speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                "A player approached you and you want to greet them and ask if they want to trade.",
+                "You looking to trade?"));
     }
 
     public boolean tryFireWelcomeBack(
@@ -453,12 +466,17 @@ public final class AgentActionExecutor {
         if (owner == null || owner.level() != villager.level()) return false;
 
         if (!hasLongTermMemory(memory)) {
-            speakAsNpc(server, villager, fallbackName, "Hey! Good to see you again.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "Your owner player has logged back in and you want to greet them warmly.",
+                    "Hey! Good to see you again."));
             return true;
         }
         String greeting = generateRelationshipGreeting(npcId, villager, owner, memory);
         speakAsNpc(server, villager, fallbackName, greeting.isBlank()
-                ? "Hey! Good to see you again." : greeting);
+                ? contextualLine(villager.getName().getString(),
+                    "Your owner player has logged back in and you want to greet them warmly.",
+                    "Hey! Good to see you again.")
+                : greeting);
         return true;
     }
 
@@ -734,7 +752,9 @@ public final class AgentActionExecutor {
             return false;
         }
         if (activeScoutTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, "I am already scouting.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to scout but you are already out on a scouting mission.",
+                    "I am already scouting."));
             return true;
         }
 
@@ -801,7 +821,9 @@ public final class AgentActionExecutor {
         if (session.activeOffer != null && now > session.activeOffer.expiresAtMillis()) {
             session.activeOffer = null;
             session.lastInteractionAtMillis = now;
-            speakAsNpc(server, villager, fallbackName, "That offer expired. Ask again and I'll make a new one.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "Your trade offer to the player has expired. Let them know and invite them to ask again.",
+                    "That offer expired. Ask again and I'll make a new one."));
             return true;
         }
 
@@ -827,7 +849,9 @@ public final class AgentActionExecutor {
         }
         if (tradeIntent.type() == TradeIntentType.DECLINE_OFFER) {
             session.activeOffer = null;
-            speakAsNpc(server, villager, fallbackName, "No worries. Let me know if you want to trade later.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player declined your trade offer. Respond politely and let them know you're available anytime.",
+                    "No worries. Let me know if you want to trade later."));
             session.lastInteractionAtMillis = now;
             return true;
         }
@@ -934,7 +958,9 @@ public final class AgentActionExecutor {
         }
         ServerPlayer requester = server.getPlayerList().getPlayer(task.requesterId);
         if (requester == null || requester.level() != villager.level()) {
-            speakAsNpc(server, villager, fallbackName, "I lost track of the requester, so I am stopping the scout.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "You were scouting but lost track of the player who sent you. Let them know you are stopping.",
+                    "I lost track of the requester, so I am stopping the scout."));
             return false;
         }
 
@@ -1217,7 +1243,9 @@ public final class AgentActionExecutor {
         }
         if (offers.isEmpty()) {
             session.activeOffer = null;
-            speakAsNpc(server, villager, fallbackName, "I'm out of stock right now.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "A player asked what you sell but you have no items in stock at all right now.",
+                    "I'm out of stock right now."));
             return true;
         }
         session.lastRequestedItemId = firstItemIdWithStock;
@@ -1251,7 +1279,9 @@ public final class AgentActionExecutor {
                     new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, "", 0, null), now, draft);
         }
         if (!tradeOfferEngine.supportsItem(itemId)) {
-            speakAsNpc(server, villager, fallbackName, "I don't trade that item right now.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "A player asked to buy '" + itemId + "' but you don't carry that item.",
+                    "I don't trade that item right now."));
             return true;
         }
 
@@ -1296,7 +1326,9 @@ public final class AgentActionExecutor {
             long now,
             TradeNegotiationDraft draft) {
         if (session.activeOffer == null) {
-            speakAsNpc(server, villager, fallbackName, "I need to make an offer first.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player tried to accept a trade but you haven't made an offer yet. Ask them what they want.",
+                    "I need to make an offer first."));
             return true;
         }
         int requestedQty = tradeIntent.quantity() > 0 ? tradeIntent.quantity() : session.activeOffer.quantity();
@@ -1368,7 +1400,9 @@ public final class AgentActionExecutor {
         int quantity = Math.max(1, tradeIntent.quantity());
         Item item = resolveKnownItem(itemId);
         if (item == null) {
-            speakAsNpc(server, villager, fallbackName, "I don't trade that item.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "A player asked to counter-offer on '" + itemId + "' but you don't recognise or carry that item.",
+                    "I don't trade that item."));
             return true;
         }
         int stock = countItemInNearbyChests(server, (ServerLevel) villager.level(), villager.blockPosition(),
@@ -1409,7 +1443,9 @@ public final class AgentActionExecutor {
             TradeSession session,
             TradeNegotiationDraft draft) {
         if (session.activeOffer == null) {
-            speakAsNpc(server, villager, fallbackName, "There's no active offer yet.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player tried to counter-offer but there is no active trade offer on the table yet.",
+                    "There's no active offer yet."));
             return true;
         }
 
@@ -3272,6 +3308,17 @@ public final class AgentActionExecutor {
         return normalized;
     }
 
+    private String contextualLine(String npcName, String situation, String fallback) {
+        try {
+            String raw = llmRouter.generate(promptFactory.contextualLinePrompt(npcName, situation));
+            if (raw != null && !raw.isBlank() && raw.length() <= 200) {
+                String cleaned = raw.trim().replaceAll("^\"|\"$", "");
+                if (!cleaned.isBlank()) return cleaned;
+            }
+        } catch (Exception ignored) {}
+        return fallback;
+    }
+
     private void speakAsNpc(MinecraftServer server, Villager villager, String fallbackName, String text) {
         String npcName = villager.getName().getString();
         if (npcName == null || npcName.isBlank()) {
@@ -3895,7 +3942,9 @@ public final class AgentActionExecutor {
             JsonObject parameters,
             String reasoning) {
         if (activeScenarioTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, "I am already working on a task.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to do something but you are already busy with another task.",
+                    "I am already working on a task."));
             return true;
         }
         ServerPlayer nearest = nearestPlayer(server, villager);
@@ -3911,7 +3960,9 @@ public final class AgentActionExecutor {
                 villager.getName().getString(), nearest.getName().getString(), desc, snap);
         ScenarioPlan plan = scenarioPlanParser.parse(llmRouter.generate(planPrompt));
         if (!plan.isValid()) {
-            speakAsNpc(server, villager, fallbackName, "I could not plan that task. Could you be more specific?");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "You tried to plan a task for the player but couldn't figure out the steps. Ask them to clarify.",
+                    "I could not plan that task. Could you be more specific?"));
             return true;
         }
 
@@ -3944,7 +3995,9 @@ public final class AgentActionExecutor {
         if (player == null || player.level() != villager.level()) return false;
         if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
         if (activeScenarioTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, "I am already working on a task.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to do something but you are already busy with another task.",
+                    "I am already working on a task."));
             return true;
         }
 
@@ -3960,7 +4013,9 @@ public final class AgentActionExecutor {
         String planRaw = llmRouter.generate(planPrompt);
         ScenarioPlan plan = scenarioPlanParser.parse(planRaw);
         if (!plan.isValid()) {
-            speakAsNpc(server, villager, fallbackName, "I could not plan that. Could you be more specific?");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "You tried to plan a task for the player but couldn't figure out the steps. Ask them to clarify.",
+                    "I could not plan that. Could you be more specific?"));
             return true;
         }
 
@@ -4120,7 +4175,9 @@ public final class AgentActionExecutor {
         if (player == null || player.level() != villager.level()) return false;
         if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
         if (activeScoutTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, "I am already scouting.");
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to scout but you are already out on a scouting mission.",
+                    "I am already scouting."));
             return true;
         }
         if (!startScoutTask(server, npcId, villager, player.getUUID(), player.getName().getString(),
@@ -4294,10 +4351,19 @@ public final class AgentActionExecutor {
                         task.waitingForDelivery = true;
                         task.waitingForMaterials = false;
                         task.materialsMissingNotified = false;
+                        task.fetchRetryCount = 0;
                     } else {
-                        task.materialsMissingNotified = true;
-                        task.waitingForMaterials = true;
-                        task.retryFetchAt = System.currentTimeMillis() + 15_000L;
+                        task.fetchRetryCount++;
+                        if (task.fetchRetryCount >= ScenarioTask.MAX_FETCH_RETRIES) {
+                            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                                    "You searched for materials in nearby chests multiple times but couldn't find them. Let the player know you're cancelling the task.",
+                                    "I couldn't find the materials after several attempts. Cancelling the task."));
+                            task.cancelled = true;
+                        } else {
+                            task.materialsMissingNotified = true;
+                            task.waitingForMaterials = true;
+                            task.retryFetchAt = System.currentTimeMillis() + 15_000L;
+                        }
                     }
                 } else {
                     task.currentStepIndex++;
@@ -4473,6 +4539,8 @@ public final class AgentActionExecutor {
         private boolean waitingForMaterials = false;
         private long retryFetchAt = 0L;
         private boolean materialsMissingNotified = false;
+        private int fetchRetryCount = 0;
+        private static final int MAX_FETCH_RETRIES = 5;
 
         private ScenarioTask(UUID requesterId, String requesterName, String scenarioName, List<ScenarioStep> steps) {
             this.requesterId = requesterId;

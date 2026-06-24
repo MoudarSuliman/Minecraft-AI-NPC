@@ -111,6 +111,7 @@ public final class AutonomousNpcRuntime {
             villagerFirstMissingAt.remove(npcId);
 
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
+            actionExecutor.lookAtOwnerIfIdle(server, npcId, handle.ownerPlayerId());
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
 
             List<String> summaries = actionExecutor.pollCompletedTaskSummaries(npcId);

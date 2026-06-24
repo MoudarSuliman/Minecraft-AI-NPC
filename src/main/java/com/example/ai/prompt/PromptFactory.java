@@ -59,7 +59,10 @@ public final class PromptFactory {
                 + "   trade_accept: player agrees to a deal. Examples: 'deal', 'ok', 'yes', 'fine', 'sure'.\n"
                 + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
                 + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
-                + "   NEVER use dialogue_reply for anything trade or stock related.\n"
+                + "   EXCEPTION: conversational follow-ups that do not request a trade action — "
+                + "e.g. 'when would that be', 'how soon', 'why not', 'really?', 'are you sure', 'thank you', 'okay', 'interesting' — "
+                + "MUST use dialogue_reply, NOT trade_offer.\n"
+                + "   NEVER use dialogue_reply for anything trade or stock related UNLESS it is a conversational follow-up as above.\n"
                 + "2. CRITICAL: If latest_instruction asks to build, construct, place, create, make, or set up a structure, "
                 + "floor, wall, hut, house, shelter, or pattern of blocks — you MUST use intent build_structure. "
                 + "NEVER use dialogue_reply for a build request. "
@@ -462,9 +465,18 @@ public final class PromptFactory {
                         + "If active_offer is present and player indicates agreement (deal/yes/sure/go ahead/take it), map to accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
-                        + "Use intent none only when the utterance is truly unrelated to trade. "
+                        + "Conversational follow-ups that do NOT request stock info or a trade action must return none. "
+                        + "Examples that MUST return none: "
+                        + "'when would that be' => none; "
+                        + "'how soon' => none; "
+                        + "'why not' => none; "
+                        + "'really?' => none; "
+                        + "'are you sure' => none; "
+                        + "'thank you' => none; "
+                        + "'okay' => none; "
+                        + "'interesting' => none. "
                         + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer. "
-                + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.");
+                        + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.");
         return payload.toString();
     }
 
@@ -897,6 +909,14 @@ public final class PromptFactory {
                 + "Return strict JSON only: {\"is_challenge\": true} or {\"is_challenge\": false}. "
                 + "No other fields, no markdown.");
         return payload.toString();
+    }
+
+    public String contextualLinePrompt(String npcName, String situation) {
+        return "You are " + npcName + ", a villager merchant NPC in Minecraft. "
+                + "Respond to the following situation in ONE short sentence (max 15 words). "
+                + "Stay in character: helpful, slightly formal, merchant-like. "
+                + "Output only the sentence — no JSON, no quotes, no extra text.\n"
+                + "Situation: " + situation;
     }
 
     private JsonArray toArray(Iterable<MemoryEntry> entries) {
