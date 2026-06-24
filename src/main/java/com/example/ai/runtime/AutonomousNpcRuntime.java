@@ -219,6 +219,20 @@ public final class AutonomousNpcRuntime {
                                     String speaker, String latestInstruction,
                                     String previousInstruction,
                                     long now, boolean hasPendingInstruction) {
+        if (actionExecutor.hasActiveTradeOffer(npcId, handle.ownerPlayerId())) {
+            if (actionExecutor.tryHandleTradeInstruction(
+                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                    latestInstruction, memory, snapshot)) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "trade");
+            } else {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+            }
+            return;
+        }
+
         String prompt = promptFactory.actionSelectionPrompt(
                 snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction);
 

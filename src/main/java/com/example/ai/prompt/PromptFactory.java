@@ -470,7 +470,9 @@ public final class PromptFactory {
                         + "'go see what is there' => none; "
                         + "'explore that area' => none; "
                         + "'go and report back' => none. "
-                        + "If active_offer is present and player indicates agreement (deal/yes/sure/go ahead/take it), map to accept_offer. "
+                        + "If active_offer is present and player indicates agreement (deal/yes/go ahead/take it), map to accept_offer. "
+                        + "EXCEPTION: If memory shows the NPC recently said the player does not have enough emeralds or the trade failed, "
+                        + "then 'sure', 'u sure', 'you sure?', 'really?', 'are you sure' mean the player is questioning the outcome — map to inquire_session_status, NOT accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
                         + "Conversational follow-ups that do NOT request stock info or a trade action must return none. "
@@ -565,11 +567,16 @@ public final class PromptFactory {
 
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory) {
-        return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, null);
+        return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, null, null);
     }
 
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory, String scenarioContext) {
+        return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, scenarioContext, null);
+    }
+
+    public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
+            WorldSnapshot snapshot, MemoryContext memory, String scenarioContext, String tradeContext) {
         StringBuilder sb = new StringBuilder();
         sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
         sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
@@ -624,6 +631,10 @@ public final class PromptFactory {
             sb.append("If asked about materials, state EXACTLY what is listed — do not invent items or quantities. ");
             sb.append("If asked where to place materials, say to put them in a nearby chest. ");
             sb.append("For unrelated questions (trade, greetings, other topics), answer those normally without mentioning the build task.\n");
+        }
+        if (tradeContext != null && !tradeContext.isBlank()) {
+            sb.append("Active trade context: ").append(tradeContext).append("\n");
+            sb.append("The player's message is a follow-up to this trade situation. Reply naturally and in context — do not re-state the offer mechanically.\n");
         }
         sb.append("My abilities (what I can actually do when commanded):\n");
         sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");

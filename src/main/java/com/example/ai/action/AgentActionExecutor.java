@@ -885,8 +885,10 @@ public final class AgentActionExecutor {
         if (tradeIntent.type() == TradeIntentType.NONE) {
             if (session.activeOffer != null) {
                 session.lastInteractionAtMillis = now;
-                speakAsNpc(server, villager, fallbackName,
-                        groundedActiveOfferText(draft.responseText(), session.activeOffer));
+                String tradeCtx = "There is an active trade offer on the table: " + summarizeOffer(session.activeOffer)
+                        + ". The player's message is a conversational follow-up to this trade, not a new trade request.";
+                tryHandleDialogueInstruction(server, npcId, fallbackName, playerName, null,
+                        instruction, memory, snapshot, tradeCtx);
                 return true;
             }
             speakAsNpc(server, villager, fallbackName,
@@ -899,7 +901,7 @@ public final class AgentActionExecutor {
         return switch (tradeIntent.type()) {
             case INQUIRE_STOCK -> handleStockInquiry(server, villager, fallbackName, playerName, session, tradeIntent, now, draft);
             case INQUIRE_PAYMENT -> handlePaymentInquiry(server, villager, fallbackName, draft);
-            case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, villager, fallbackName, session, draft);
+            case INQUIRE_SESSION_STATUS -> handleSessionStatusInquiry(server, npcId, villager, fallbackName, playerName, session, instruction, memory, snapshot, draft);
             case REQUEST_OFFER -> handleTradeRequest(server, villager, fallbackName, playerName, session, tradeIntent, now, draft);
             case COUNTER_OFFER -> (session.activeOffer == null && tradeOfferEngine.supportsItem(tradeIntent.itemId()))
                     ? handleCounterWithoutOffer(server, villager, fallbackName, playerName, session, tradeIntent, now, draft)
@@ -1167,13 +1169,20 @@ public final class AgentActionExecutor {
 
     private boolean handleSessionStatusInquiry(
             MinecraftServer server,
+            UUID npcId,
             Villager villager,
             String fallbackName,
+            String playerName,
             TradeSession session,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot,
             TradeNegotiationDraft draft) {
         if (session.activeOffer != null) {
-            speakAsNpc(server, villager, fallbackName,
-                    groundedActiveOfferText(draft.responseText(), session.activeOffer));
+            String tradeCtx = "There is an active trade offer on the table: " + summarizeOffer(session.activeOffer)
+                    + ". The player is asking about the current trade situation.";
+            tryHandleDialogueInstruction(server, npcId, fallbackName, playerName, null,
+                    instruction, memory, snapshot, tradeCtx);
             return true;
         }
         speakAsNpc(server, villager, fallbackName,
@@ -1224,7 +1233,7 @@ public final class AgentActionExecutor {
                 session.lastRequestedQuantity = 1;
                 String response = "I currently have " + stock + " " + readableItemName(requestedItemId)
                         + " in stock at " + preview.unitPrice() + " emerald each.";
-                speakAsNpc(server, villager, fallbackName, groundedStockText(draft.responseText(), response));
+                speakAsNpc(server, villager, fallbackName, groundedStockText(draft.responseText(), response, preview.unitPrice()));
                 return true;
             }
         }
@@ -1266,7 +1275,7 @@ public final class AgentActionExecutor {
             message = message + ", and more.";
         }
         speakAsNpc(server, villager, fallbackName,
-                groundedStockText(draft.responseText(), "I currently sell: " + message));
+                groundedStockText(draft.responseText(), "I currently sell: " + message, session.activeOffer.unitPrice()));
         return true;
     }
 
@@ -1459,7 +1468,9 @@ public final class AgentActionExecutor {
 
         TradeOffer offer = session.activeOffer;
         if (!hasAtLeast(player, Items.EMERALD, offer.totalPrice())) {
-            speakAsNpc(server, villager, fallbackName, "You don't have enough emeralds for that trade.");
+            String msg = "You don't have enough emeralds for that trade.";
+            speakAsNpc(server, villager, fallbackName, msg);
+            recordNpcUtterance(villager.getUUID(), msg);
             return true;
         }
         Item item = resolveKnownItem(offer.itemId());
@@ -1660,12 +1671,12 @@ public final class AgentActionExecutor {
         return hasPrice && hasCurrency && hasItem && !givesPlayerEmeralds ? draftText : fallback;
     }
 
-    private String groundedStockText(String draftText, String fallback) {
+    private String groundedStockText(String draftText, String fallback, int unitPrice) {
         if (draftText == null || draftText.isBlank()) {
             return fallback;
         }
         String lower = draftText.toLowerCase();
-        if (!lower.contains("emerald")) {
+        if (!lower.contains("emerald") || !lower.contains(String.valueOf(unitPrice))) {
             return fallback;
         }
         return draftText;
@@ -3870,6 +3881,20 @@ public final class AgentActionExecutor {
             String instruction,
             MemoryContext memory,
             WorldSnapshot snapshot) {
+        return tryHandleDialogueInstruction(server, npcId, fallbackName, playerName, ownerPlayerId,
+                instruction, memory, snapshot, null);
+    }
+
+    public boolean tryHandleDialogueInstruction(
+            MinecraftServer server,
+            UUID npcId,
+            String fallbackName,
+            String playerName,
+            UUID ownerPlayerId,
+            String instruction,
+            MemoryContext memory,
+            WorldSnapshot snapshot,
+            String tradeContext) {
         if (instruction == null || instruction.isBlank()) return false;
         Villager villager = findVillager(server, npcId);
         if (villager == null) { logger.info("[DIALOGUE] skip: villager not found npc={}", npcId); return false; }
@@ -3879,7 +3904,7 @@ public final class AgentActionExecutor {
         String scenarioContext = buildScenarioContextForDialogue(server, villager, npcId);
         String replyPrompt = promptFactory.dialogueReplyPrompt(
                 villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory,
-                scenarioContext);
+                scenarioContext, tradeContext);
         String replyRaw = llmRouter.generate(replyPrompt);
         String text = parseDialogueText(replyRaw);
         if (text == null || text.isBlank()) {
@@ -3893,6 +3918,13 @@ public final class AgentActionExecutor {
     }
 
     public enum NpcState { BUILDING, SCOUTING, SEARCHING, IDLE }
+
+    public boolean hasActiveTradeOffer(UUID npcId, UUID playerId) {
+        TradeSessionKey key = new TradeSessionKey(npcId, playerId);
+        TradeSession session = tradeSessions.get(key);
+        if (session == null || session.activeOffer == null) return false;
+        return System.currentTimeMillis() <= session.activeOffer.expiresAtMillis();
+    }
 
     public NpcState getNpcState(UUID npcId) {
         if (activeScenarioTasks.containsKey(npcId)) return NpcState.BUILDING;
