@@ -97,6 +97,8 @@ public final class AgentActionExecutor {
     private final Map<UUID, String> lastActionSummaryByNpc = new ConcurrentHashMap<>();
     private final ScenarioPlanParser scenarioPlanParser = new ScenarioPlanParser();
     private final Map<UUID, String> lastTradeIntentByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, String> lastScenarioDescByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, List<String>> pendingNpcUtterances = new ConcurrentHashMap<>();
     private final Map<UUID, Boolean> tradeLlmInFlightByNpc = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, TradeSession> tradeSessions = new ConcurrentHashMap<>();
     private final Map<TradeSessionKey, Long> nextTradeGreetingAt = new ConcurrentHashMap<>();
@@ -1832,6 +1834,18 @@ public final class AgentActionExecutor {
 
     public List<String> pollCompletedTaskSummaries(UUID npcId) {
         return completedTaskSummaries.remove(npcId);
+    }
+
+    public List<String> pollNpcUtterances(UUID npcId) {
+        return pendingNpcUtterances.remove(npcId);
+    }
+
+    private void recordNpcUtterance(UUID npcId, String text) {
+        pendingNpcUtterances.compute(npcId, (id, list) -> {
+            if (list == null) list = new java.util.ArrayList<>();
+            list.add(text);
+            return list;
+        });
     }
 
     private void recordTaskSummary(UUID npcId, String summary) {
@@ -3873,6 +3887,7 @@ public final class AgentActionExecutor {
         }
 
         speakAsNpc(server, villager, fallbackName, text);
+        recordNpcUtterance(npcId, text);
         logger.info("[DIALOGUE] npc={} player={} reply='{}'", fallbackName, playerName, text);
         return true;
     }
@@ -3940,6 +3955,13 @@ public final class AgentActionExecutor {
 
     // ── Scenario Builder ─────────────────────────────────────────────────────
 
+    private void cancelActiveScenario(UUID npcId) {
+        activeScenarioTasks.remove(npcId);
+        activeDeliveries.remove(npcId);
+        activeMineToChest.remove(npcId);
+        activeMineToPlayer.remove(npcId);
+    }
+
     private boolean startScenarioDirect(
             MinecraftServer server,
             UUID npcId,
@@ -3948,10 +3970,7 @@ public final class AgentActionExecutor {
             JsonObject parameters,
             String reasoning) {
         if (activeScenarioTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
-                    "The player asked you to do something but you are already busy with another task.",
-                    "I am already working on a task."));
-            return true;
+            cancelActiveScenario(npcId);
         }
         ServerPlayer nearest = nearestPlayer(server, villager);
         if (nearest == null) return false;
@@ -3962,8 +3981,9 @@ public final class AgentActionExecutor {
         if (desc == null || desc.isBlank()) return false;
 
         WorldSnapshot snap = captureWorldSnapshot(server, npcId, fallbackName);
+        String lastDesc = lastScenarioDescByNpc.get(npcId);
         String planPrompt = promptFactory.scenarioPlanningPrompt(
-                villager.getName().getString(), nearest.getName().getString(), desc, snap);
+                villager.getName().getString(), nearest.getName().getString(), desc, snap, lastDesc);
         ScenarioPlan plan = scenarioPlanParser.parse(llmRouter.generate(planPrompt));
         if (!plan.isValid()) {
             speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
@@ -3972,6 +3992,7 @@ public final class AgentActionExecutor {
             return true;
         }
 
+        lastScenarioDescByNpc.put(npcId, desc);
         ScenarioTask task = new ScenarioTask(
                 nearest.getUUID(), nearest.getName().getString(), plan.scenario(), plan.steps());
         activeScenarioTasks.put(npcId, task);
@@ -4001,10 +4022,7 @@ public final class AgentActionExecutor {
         if (player == null || player.level() != villager.level()) return false;
         if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
         if (activeScenarioTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
-                    "The player asked you to do something but you are already busy with another task.",
-                    "I am already working on a task."));
-            return true;
+            cancelActiveScenario(npcId);
         }
 
         if (!forceStart) {
@@ -4014,8 +4032,9 @@ public final class AgentActionExecutor {
             if (!isScenarioIntent(classifyRaw)) return false;
         }
 
+        String lastDesc = lastScenarioDescByNpc.get(npcId);
         String planPrompt = promptFactory.scenarioPlanningPrompt(
-                villager.getName().getString(), player.getName().getString(), instruction, snapshot);
+                villager.getName().getString(), player.getName().getString(), instruction, snapshot, lastDesc);
         String planRaw = llmRouter.generate(planPrompt);
         ScenarioPlan plan = scenarioPlanParser.parse(planRaw);
         if (!plan.isValid()) {
@@ -4025,6 +4044,7 @@ public final class AgentActionExecutor {
             return true;
         }
 
+        lastScenarioDescByNpc.put(npcId, instruction);
         ScenarioTask task = new ScenarioTask(
                 player.getUUID(), player.getName().getString(), plan.scenario(), plan.steps());
         activeScenarioTasks.put(npcId, task);
@@ -4268,9 +4288,10 @@ public final class AgentActionExecutor {
                 speakAsNpc(server, villager, fallbackName,
                         "I have finished the " + task.scenarioName + " task.");
             }
+            String playerName = requester != null ? requester.getName().getString() : "the player";
             recordTaskSummary(villager.getUUID(),
-                    "Completed task '" + task.scenarioName + "' for "
-                    + (requester != null ? requester.getName().getString() : "player") + ".");
+                    "I already finished building the " + task.scenarioName + " for " + playerName
+                    + ". The task is DONE and I must not offer to start it again.");
             return false;
         }
 
@@ -4474,10 +4495,6 @@ public final class AgentActionExecutor {
 
     private List<BlockPos> hutPositions(BlockPos origin, int width, int height, int length) {
         java.util.LinkedHashSet<BlockPos> set = new java.util.LinkedHashSet<>();
-
-        for (int dx = 0; dx < width; dx++)
-            for (int dz = 0; dz < length; dz++)
-                set.add(origin.offset(dx, 0, dz));
 
         for (int dy = 1; dy < height; dy++) {
             for (int dx = 0; dx < width; dx++) {

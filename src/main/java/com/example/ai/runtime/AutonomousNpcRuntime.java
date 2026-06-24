@@ -119,8 +119,13 @@ public final class AutonomousNpcRuntime {
             if (summaries != null) {
                 for (String summary : summaries) {
                     memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("task_result", summary));
-                    // Also push into short-term so dialogue LLM sees the completion as recent NPC speech
                     memoryStore.appendShortTerm(npcId, MemoryEntry.dialogue(handle.npcName(), summary));
+                }
+            }
+            List<String> utterances = actionExecutor.pollNpcUtterances(npcId);
+            if (utterances != null) {
+                for (String utt : utterances) {
+                    memoryStore.appendShortTerm(npcId, MemoryEntry.dialogue(handle.npcName(), utt));
                 }
             }
 

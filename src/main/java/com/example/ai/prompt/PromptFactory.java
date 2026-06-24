@@ -620,7 +620,7 @@ public final class PromptFactory {
         sb.append("My abilities (what I can actually do when commanded):\n");
         sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");
         sb.append("  - Fetch items from nearby chests and bring them to the player\n");
-        sb.append("  - Build structures (floors, walls, simple constructions)\n");
+        sb.append("  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n");
         sb.append("  - Scout and explore in a direction and report back\n");
         sb.append("  - Trade items with the player\n");
         sb.append("  - Answer questions and hold a conversation\n");
@@ -630,6 +630,7 @@ public final class PromptFactory {
         sb.append("- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' above. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n");
         sb.append("- If asked about what was just said: use the recent conversation section.\n");
         sb.append("- Never invent facts, events, or task names not present in the data above.\n");
+        sb.append("- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n");
         sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
         sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
         sb.append("Return ONLY this JSON with no extra text:\n");
@@ -738,14 +739,33 @@ public final class PromptFactory {
             String playerName,
             String instruction,
             WorldSnapshot snapshot) {
+        return scenarioPlanningPrompt(npcName, playerName, instruction, snapshot, null);
+    }
+
+    public String scenarioPlanningPrompt(
+            String npcName,
+            String playerName,
+            String instruction,
+            WorldSnapshot snapshot,
+            String previousTask) {
         String posStr = "unknown";
         if (snapshot != null && snapshot.npcPosition() != null) {
             WorldSnapshot.Position p = snapshot.npcPosition();
             posStr = "x=" + (int) p.x() + " y=" + (int) p.y() + " z=" + (int) p.z();
         }
+        String prevContext = (previousTask != null && !previousTask.isBlank())
+                ? "Previous task the NPC was working on: \"" + previousTask + "\"\n" : "";
         return "You are planning a multi-step task for a Minecraft NPC named " + npcName + ".\n"
                 + "Player (" + playerName + ") requested: \"" + instruction + "\"\n"
                 + "NPC current position: " + posStr + "\n"
+                + prevContext
+                + "\n"
+                + "CLARIFICATION RULE: If the player's request is ambiguous or uses pronouns like 'it', 'that', 'the same',\n"
+                + "'redo', 'again' WITHOUT clearly specifying what to build or what material to use, you MUST ask for\n"
+                + "clarification instead of guessing. Do this by returning a single dialogue_reply step that asks the player\n"
+                + "to be more specific. Example: if previous task was 'build a hut' and player says 'do it in cobblestone',\n"
+                + "reply asking: 'Did you mean to build the hut in cobblestone?' ONLY infer from previous task if the\n"
+                + "instruction is clear enough (e.g. 'build the same hut but in stone' is clear enough to proceed).\n"
                 + "\n"
                 + "FIRST: If the player is NOT asking you to build, construct, place, or create a physical structure,\n"
                 + "return exactly: {\"scenario\":\"\",\"announce\":\"\",\"steps\":[]}\n"
@@ -767,10 +787,10 @@ public final class PromptFactory {
                 + "  wall    = vertical surface on one side. Uses width x height. length ignored. Example: '3x3 wall'.\n"
                 + "  pillar  = single vertical column. Uses only height. Example: 'pillar', 'column'.\n"
                 + "  outline = hollow rectangle on the ground. Uses width x length. Example: 'outline', 'border'.\n"
-                + "  hut     = complete enclosed building: floor + 4 walls + roof in one step.\n"
+                + "  hut     = enclosed building with 4 walls + roof (NO floor) in one step.\n"
                 + "            Uses width (X footprint) x length (Z footprint) x height (wall height, roof at height+1).\n"
-                + "            Block count = (width*length*2) + (2*(width+length-2)*(height-1)).\n"
-                + "            Example: 5x5 footprint, height=3 → (25*2)+(2*8*2) = 82 blocks. Fetch at least that many.\n"
+                + "            Block count = width*length + (2*(width+length-2)*(height-1)).\n"
+                + "            Example: 5x5 footprint, height=3 → 25+(2*8*2) = 57 blocks. Fetch at least that many.\n"
                 + "            Use for: 'house', 'hut', 'shelter', 'cabin', 'room', 'shack', 'enclosed building'.\n"
                 + "\n"
                 + "CRITICAL RULES:\n"
@@ -814,7 +834,7 @@ public final class PromptFactory {
                 + "\n"
                 + "EXAMPLE 3 — 'build me a small wooden hut':\n"
                 + "{\"scenario\":\"wooden hut\","
-                + "\"announce\":\"I will build a small 5x5 wooden hut with floor, walls, and roof.\","
+                + "\"announce\":\"I will build a small 5x5 wooden hut with walls and roof.\","
                 + "\"steps\":["
                 + "{\"intent\":\"fetch_from_chest\",\"parameters\":{\"item_id\":\"minecraft:oak_planks\",\"count\":100},"
                 + "\"description\":\"Fetch oak planks from chest.\"},"
