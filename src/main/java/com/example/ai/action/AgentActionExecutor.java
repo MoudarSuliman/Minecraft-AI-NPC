@@ -347,6 +347,12 @@ public final class AgentActionExecutor {
         return success;
     }
 
+    public void suppressVanillaBrain(MinecraftServer server, UUID npcId) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return;
+        villager.getBrain().removeAllBehaviors();
+    }
+
     public void lookAtOwnerIfIdle(MinecraftServer server, UUID npcId, UUID ownerPlayerId) {
         if (ownerPlayerId == null) return;
         if (getNpcState(npcId) != NpcState.IDLE) return;

@@ -9,6 +9,7 @@ import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.Commands;
@@ -35,6 +36,8 @@ public class ExampleMod implements ModInitializer {
 	public void onInitialize() {
 		runtime = AutonomousNpcRuntime.createDefault(LOGGER);
 		ServerTickEvents.END_SERVER_TICK.register(runtime::onServerTick);
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
+				server.execute(() -> runtime.onPlayerJoin(handler.player.getUUID())));
 
 		PayloadTypeRegistry.clientboundPlay().register(OpenTradePricesPayload.TYPE, OpenTradePricesPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(SaveTradePricesPayload.TYPE, SaveTradePricesPayload.CODEC);

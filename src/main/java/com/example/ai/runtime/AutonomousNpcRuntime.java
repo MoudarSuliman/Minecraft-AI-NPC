@@ -110,6 +110,7 @@ public final class AutonomousNpcRuntime {
             }
             villagerFirstMissingAt.remove(npcId);
 
+            actionExecutor.suppressVanillaBrain(server, npcId);
             actionExecutor.enforceOwnerLeash(server, npcId, handle.ownerPlayerId(), handle.npcName());
             actionExecutor.lookAtOwnerIfIdle(server, npcId, handle.ownerPlayerId());
             actionExecutor.applyNextAction(server, npcId, handle.npcName());
@@ -384,6 +385,14 @@ public final class AutonomousNpcRuntime {
         pendingInstruction.put(npcId, false);
         nextThinkAt.put(npcId, System.currentTimeMillis() + 1500L);
         lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+    }
+
+    public void onPlayerJoin(UUID playerId) {
+        for (AgentHandle handle : agents.values()) {
+            if (playerId.equals(handle.ownerPlayerId())) {
+                pendingWelcomeBack.add(handle.npcId());
+            }
+        }
     }
 
     public void registerAgent(UUID npcId, String npcName) {
