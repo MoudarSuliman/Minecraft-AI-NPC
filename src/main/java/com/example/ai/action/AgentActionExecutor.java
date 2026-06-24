@@ -4496,7 +4496,8 @@ public final class AgentActionExecutor {
     private List<BlockPos> hutPositions(BlockPos origin, int width, int height, int length) {
         java.util.LinkedHashSet<BlockPos> set = new java.util.LinkedHashSet<>();
 
-        for (int dy = 1; dy < height; dy++) {
+        // Walls: full perimeter from ground (dy=0) up to height-1, no interior floor
+        for (int dy = 0; dy < height; dy++) {
             for (int dx = 0; dx < width; dx++) {
                 set.add(origin.offset(dx, dy, 0));
                 set.add(origin.offset(dx, dy, length - 1));
@@ -4507,6 +4508,7 @@ public final class AgentActionExecutor {
             }
         }
 
+        // Roof
         for (int dx = 0; dx < width; dx++)
             for (int dz = 0; dz < length; dz++)
                 set.add(origin.offset(dx, height, dz));
