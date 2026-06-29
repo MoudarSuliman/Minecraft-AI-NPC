@@ -19,7 +19,19 @@ public record MemoryEntry(
     }
 
     public static MemoryEntry episodic(String label, String payload) {
-        return new MemoryEntry("episodic:" + label, System.currentTimeMillis(), payload, 0.6);
+        return episodic(label, payload, true);
+    }
+
+    public static MemoryEntry episodic(String label, String payload, boolean success) {
+        double base = switch (label) {
+            case "trade"                  -> 0.85;
+            case "scenario"               -> 0.80;
+            case "search", "scout"        -> 0.75;
+            case "task_result", "decision"-> 0.70;
+            default                       -> 0.60;
+        };
+        double salience = success ? base : base * 0.65;
+        return new MemoryEntry("episodic:" + label, System.currentTimeMillis(), payload, salience);
     }
 
     public JsonObject toJson() {

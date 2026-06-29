@@ -2,6 +2,7 @@ package com.example.ai.memory;
 
 import org.slf4j.Logger;
 
+import java.util.Arrays;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -13,8 +14,10 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 public final class AgentMemoryStore {
     private static final int SHORT_TERM_MAX = 12;
@@ -80,11 +83,16 @@ public final class AgentMemoryStore {
     }
 
     public MemoryContext getContext(UUID npcId) {
+        return getContext(npcId, null);
+    }
+
+    public MemoryContext getContext(UUID npcId, String query) {
         ensureLoaded(npcId);
         List<MemoryEntry> shortList   = new ArrayList<>(shortTerm.getOrDefault(npcId, List.of()));
         List<MemoryEntry> workingList = new ArrayList<>(working.getOrDefault(npcId, List.of()));
+        long now = System.currentTimeMillis();
         List<MemoryEntry> longList    = longTermCache.getOrDefault(npcId, List.of()).stream()
-                .sorted(Comparator.comparingDouble(MemoryEntry::salience).reversed())
+                .sorted(Comparator.comparingDouble((MemoryEntry e) -> effectiveSalience(e, now, query)).reversed())
                 .limit(8)
                 .toList();
         return new MemoryContext(shortList, workingList, longList);
@@ -130,6 +138,25 @@ public final class AgentMemoryStore {
         } catch (SQLException e) {
             logger.warn("Failed to persist long-term memory for {}", npcId, e);
         }
+    }
+
+    private static double effectiveSalience(MemoryEntry e, long nowMs, String query) {
+        double ageHours = (nowMs - e.timestamp()) / 3_600_000.0;
+        double recency   = 1.0 / (1.0 + ageHours / 168.0);
+        double relevance = relevanceScore(e, query);
+        return e.salience() * recency * relevance;
+    }
+
+    private static double relevanceScore(MemoryEntry e, String query) {
+        if (query == null || query.isBlank()) return 1.0;
+        Set<String> queryWords = Arrays.stream(query.toLowerCase().split("\\W+"))
+                .filter(w -> w.length() > 2)
+                .collect(Collectors.toSet());
+        if (queryWords.isEmpty()) return 1.0;
+        Set<String> contentWords = Arrays.stream(e.content().toLowerCase().split("\\W+"))
+                .collect(Collectors.toSet());
+        long matches = queryWords.stream().filter(contentWords::contains).count();
+        return 0.5 + 0.5 * Math.min(1.0, matches / (double) queryWords.size());
     }
 
     private void ensureLoaded(UUID npcId) {
