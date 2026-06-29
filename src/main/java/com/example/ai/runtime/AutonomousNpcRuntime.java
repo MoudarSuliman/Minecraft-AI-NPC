@@ -118,7 +118,7 @@ public final class AutonomousNpcRuntime {
             List<String> summaries = actionExecutor.pollCompletedTaskSummaries(npcId);
             if (summaries != null) {
                 for (String summary : summaries) {
-                    memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("task_result", summary));
+                    memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("task_result", summary));
                     memoryStore.appendShortTerm(npcId, MemoryEntry.dialogue(handle.npcName(), summary));
                 }
             }
@@ -133,7 +133,7 @@ public final class AutonomousNpcRuntime {
 
             // Fire welcome-back greeting once after server restart, before normal processing
             if (pendingWelcomeBack.contains(npcId)) {
-                MemoryContext greetMem = memoryStore.getContext(npcId);
+                MemoryContext greetMem = memoryStore.getContext(npcId, handle.ownerPlayerId());
                 thinkingNpcs.add(npcId);
                 llmExecutor.submit(() -> {
                     try {
@@ -151,7 +151,7 @@ public final class AutonomousNpcRuntime {
 
             if (now < nextThinkAt.getOrDefault(npcId, 0L)) continue;
 
-            MemoryContext memory       = memoryStore.getContext(npcId);
+            MemoryContext memory       = memoryStore.getContext(npcId, handle.ownerPlayerId());
             boolean hasPending         = pendingInstruction.getOrDefault(npcId, false);
             WorldSnapshot snapshot     = actionExecutor.captureWorldSnapshot(server, npcId, handle.npcName());
 
@@ -376,7 +376,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("dialogue",
+                memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("dialogue",
                         "Handled dialogue from " + speaker + ": " + latestInstruction));
                 lastProcessedInstructionByNpc.put(npcId, latestInstruction);
                 return;
@@ -388,7 +388,7 @@ public final class AutonomousNpcRuntime {
                     latestInstruction, memory, snapshot)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-                memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("trade",
+                memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("trade",
                         "Handled trade instruction from " + speaker + ": " + latestInstruction));
                 lastProcessedInstructionByNpc.put(npcId, latestInstruction);
                 return;
@@ -399,7 +399,7 @@ public final class AutonomousNpcRuntime {
         logger.info("LLM decision queued: agent={} intent={} priority={} reasoning={}",
                 handle.npcName(), decision.intent(), decision.priority(), decision.reasoning());
         memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
-        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic("decision",
+        memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("decision",
                 "Executed " + decision.intent().name().toLowerCase() + ": " + decision.reasoning()));
         pendingInstruction.put(npcId, false);
         nextThinkAt.put(npcId, System.currentTimeMillis() + 1500L);
@@ -473,7 +473,7 @@ public final class AutonomousNpcRuntime {
         long now = System.currentTimeMillis();
         long nextAt = nextThinkAt.getOrDefault(npcId, 0L);
         long waitMs = Math.max(0L, nextAt - now);
-        MemoryContext context = memoryStore.getContext(npcId);
+        MemoryContext context = memoryStore.getContext(npcId, handle.ownerPlayerId());
 
         lines.add(statusForAgent(npcId));
         lines.add("owner_player_id=" + (handle.ownerPlayerId() == null ? "none" : handle.ownerPlayerId()));
@@ -555,12 +555,13 @@ public final class AutonomousNpcRuntime {
     }
 
     private void storeActionMemory(UUID npcId, String speaker, String instruction, String type) {
+        UUID playerId = agents.containsKey(npcId) ? agents.get(npcId).ownerPlayerId() : null;
         String summary = actionExecutor.lastActionSummary(npcId);
         String entry = summary.isBlank()
                 ? speaker + " asked me to " + type + ": " + instruction
                 : summary + " (requested by " + speaker + ")";
         memoryStore.appendWorking(npcId, MemoryEntry.episodic(type, entry));
-        memoryStore.appendLongTerm(npcId, MemoryEntry.episodic(type, entry));
+        memoryStore.appendLongTerm(npcId, playerId, MemoryEntry.episodic(type, entry));
         lastProcessedInstructionByNpc.put(npcId, instruction);
     }
 

@@ -30,8 +30,8 @@ public final class AgentMemoryStore {
 
     private final Map<UUID, List<MemoryEntry>> shortTerm = new ConcurrentHashMap<>();
     private final Map<UUID, List<MemoryEntry>> working = new ConcurrentHashMap<>();
-    private final Map<UUID, List<MemoryEntry>> longTermCache = new ConcurrentHashMap<>();
-    private final Map<UUID, Boolean> loaded = new ConcurrentHashMap<>();
+    private final Map<String, List<MemoryEntry>> longTermCache = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> loaded = new ConcurrentHashMap<>();
 
     private AgentMemoryStore(Logger logger, Path dbPath) {
         this.logger = logger;
@@ -53,20 +53,31 @@ public final class AgentMemoryStore {
                 stmt.execute("PRAGMA journal_mode=WAL");
                 stmt.execute("""
                         CREATE TABLE IF NOT EXISTS long_term_memory (
-                            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                            npc_uuid  TEXT    NOT NULL,
-                            type      TEXT    NOT NULL,
-                            timestamp INTEGER NOT NULL,
-                            content   TEXT    NOT NULL,
-                            salience  REAL    NOT NULL
+                            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                            npc_uuid    TEXT    NOT NULL,
+                            player_uuid TEXT,
+                            type        TEXT    NOT NULL,
+                            timestamp   INTEGER NOT NULL,
+                            content     TEXT    NOT NULL,
+                            salience    REAL    NOT NULL
                         )""");
                 stmt.execute(
                         "CREATE INDEX IF NOT EXISTS idx_npc ON long_term_memory(npc_uuid)");
+                stmt.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_npc_player ON long_term_memory(npc_uuid, player_uuid)");
+                // migrate existing databases that lack the player_uuid column
+                try {
+                    stmt.execute("ALTER TABLE long_term_memory ADD COLUMN player_uuid TEXT");
+                } catch (Exception ignored) {
+                    // column already exists
+                }
             }
         } catch (Exception e) {
             logger.error("Failed to initialise SQLite memory database at {}", dbPath, e);
         }
     }
+
+    // --- short-term and working memory (NPC-scoped, not per-player) ---
 
     public void appendShortTerm(UUID npcId, MemoryEntry entry) {
         appendRam(shortTerm, npcId, entry, SHORT_TERM_MAX);
@@ -76,26 +87,52 @@ public final class AgentMemoryStore {
         appendRam(working, npcId, entry, WORKING_MAX);
     }
 
+    // --- long-term memory (per NPC + per player) ---
+
+    public void appendLongTerm(UUID npcId, UUID playerId, MemoryEntry entry) {
+        String key = cacheKey(npcId, playerId);
+        ensureLoaded(npcId, playerId);
+        appendRamByKey(longTermCache, key, entry, LONG_TERM_MAX);
+        persistLongTerm(npcId, playerId, entry);
+    }
+
+    /** Backwards-compatible overload — stores without player association. */
     public void appendLongTerm(UUID npcId, MemoryEntry entry) {
-        ensureLoaded(npcId);
-        appendRam(longTermCache, npcId, entry, LONG_TERM_MAX);
-        persistLongTerm(npcId, entry);
+        appendLongTerm(npcId, null, entry);
     }
 
-    public MemoryContext getContext(UUID npcId) {
-        return getContext(npcId, null);
+    // --- context retrieval ---
+
+    public MemoryContext getContext(UUID npcId, UUID playerId) {
+        return getContext(npcId, playerId, null);
     }
 
-    public MemoryContext getContext(UUID npcId, String query) {
-        ensureLoaded(npcId);
+    public MemoryContext getContext(UUID npcId, UUID playerId, String query) {
+        ensureLoaded(npcId, playerId);
+        String key = cacheKey(npcId, playerId);
         List<MemoryEntry> shortList   = new ArrayList<>(shortTerm.getOrDefault(npcId, List.of()));
         List<MemoryEntry> workingList = new ArrayList<>(working.getOrDefault(npcId, List.of()));
         long now = System.currentTimeMillis();
-        List<MemoryEntry> longList    = longTermCache.getOrDefault(npcId, List.of()).stream()
+        List<MemoryEntry> longList    = longTermCache.getOrDefault(key, List.of()).stream()
                 .sorted(Comparator.comparingDouble((MemoryEntry e) -> effectiveSalience(e, now, query)).reversed())
                 .limit(8)
                 .toList();
         return new MemoryContext(shortList, workingList, longList);
+    }
+
+    /** Backwards-compatible overloads. */
+    public MemoryContext getContext(UUID npcId) {
+        return getContext(npcId, (UUID) null, null);
+    }
+
+    public MemoryContext getContext(UUID npcId, String query) {
+        return getContext(npcId, (UUID) null, query);
+    }
+
+    // --- internals ---
+
+    private static String cacheKey(UUID npcId, UUID playerId) {
+        return npcId + ":" + (playerId != null ? playerId : "shared");
     }
 
     private void appendRam(Map<UUID, List<MemoryEntry>> target, UUID npcId,
@@ -108,35 +145,80 @@ public final class AgentMemoryStore {
         });
     }
 
-    private void persistLongTerm(UUID npcId, MemoryEntry entry) {
+    private void appendRamByKey(Map<String, List<MemoryEntry>> target, String key,
+                                MemoryEntry entry, int maxSize) {
+        target.compute(key, (k, list) -> {
+            List<MemoryEntry> safe = list == null ? new ArrayList<>() : new ArrayList<>(list);
+            safe.add(entry);
+            if (safe.size() > maxSize) safe.remove(0);
+            return safe;
+        });
+    }
+
+    private void persistLongTerm(UUID npcId, UUID playerId, MemoryEntry entry) {
         if (connection == null) return;
+        String playerStr = playerId != null ? playerId.toString() : null;
         try {
             try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO long_term_memory (npc_uuid, type, timestamp, content, salience) VALUES (?, ?, ?, ?, ?)")) {
+                    "INSERT INTO long_term_memory (npc_uuid, player_uuid, type, timestamp, content, salience) VALUES (?, ?, ?, ?, ?, ?)")) {
                 ps.setString(1, npcId.toString());
-                ps.setString(2, entry.type());
-                ps.setLong(3,   entry.timestamp());
-                ps.setString(4, entry.content());
-                ps.setDouble(5, entry.salience());
+                ps.setString(2, playerStr);
+                ps.setString(3, entry.type());
+                ps.setLong(4,   entry.timestamp());
+                ps.setString(5, entry.content());
+                ps.setDouble(6, entry.salience());
                 ps.executeUpdate();
             }
-            // Enforce cap: keep only the most recent LONG_TERM_MAX rows per NPC
             try (PreparedStatement ps = connection.prepareStatement("""
                     DELETE FROM long_term_memory
                     WHERE npc_uuid = ?
+                      AND (player_uuid = ? OR (player_uuid IS NULL AND ? IS NULL))
                       AND id NOT IN (
                           SELECT id FROM long_term_memory
                           WHERE npc_uuid = ?
+                            AND (player_uuid = ? OR (player_uuid IS NULL AND ? IS NULL))
                           ORDER BY timestamp DESC
                           LIMIT ?
                       )""")) {
                 ps.setString(1, npcId.toString());
-                ps.setString(2, npcId.toString());
-                ps.setInt(3,    LONG_TERM_MAX);
+                ps.setString(2, playerStr);
+                ps.setString(3, playerStr);
+                ps.setString(4, npcId.toString());
+                ps.setString(5, playerStr);
+                ps.setString(6, playerStr);
+                ps.setInt(7,    LONG_TERM_MAX);
                 ps.executeUpdate();
             }
         } catch (SQLException e) {
-            logger.warn("Failed to persist long-term memory for {}", npcId, e);
+            logger.warn("Failed to persist long-term memory for npc={} player={}", npcId, playerId, e);
+        }
+    }
+
+    private void ensureLoaded(UUID npcId, UUID playerId) {
+        String key = cacheKey(npcId, playerId);
+        if (loaded.putIfAbsent(key, true) != null) return;
+        if (connection == null) return;
+        String playerStr = playerId != null ? playerId.toString() : null;
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT type, timestamp, content, salience FROM long_term_memory " +
+                "WHERE npc_uuid = ? AND (player_uuid = ? OR (player_uuid IS NULL AND ? IS NULL)) " +
+                "ORDER BY timestamp ASC")) {
+            ps.setString(1, npcId.toString());
+            ps.setString(2, playerStr);
+            ps.setString(3, playerStr);
+            List<MemoryEntry> entries = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    entries.add(new MemoryEntry(
+                            rs.getString("type"),
+                            rs.getLong("timestamp"),
+                            rs.getString("content"),
+                            rs.getDouble("salience")));
+                }
+            }
+            longTermCache.put(key, entries);
+        } catch (SQLException e) {
+            logger.warn("Failed to load long-term memory for npc={} player={}", npcId, playerId, e);
         }
     }
 
@@ -157,27 +239,5 @@ public final class AgentMemoryStore {
                 .collect(Collectors.toSet());
         long matches = queryWords.stream().filter(contentWords::contains).count();
         return 0.5 + 0.5 * Math.min(1.0, matches / (double) queryWords.size());
-    }
-
-    private void ensureLoaded(UUID npcId) {
-        if (loaded.putIfAbsent(npcId, true) != null) return;
-        if (connection == null) return;
-        try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT type, timestamp, content, salience FROM long_term_memory WHERE npc_uuid = ? ORDER BY timestamp ASC")) {
-            ps.setString(1, npcId.toString());
-            List<MemoryEntry> entries = new ArrayList<>();
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    entries.add(new MemoryEntry(
-                            rs.getString("type"),
-                            rs.getLong("timestamp"),
-                            rs.getString("content"),
-                            rs.getDouble("salience")));
-                }
-            }
-            longTermCache.put(npcId, entries);
-        } catch (SQLException e) {
-            logger.warn("Failed to load long-term memory for {}", npcId, e);
-        }
     }
 }
