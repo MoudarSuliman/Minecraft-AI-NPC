@@ -2787,19 +2787,28 @@ public final class AgentActionExecutor {
 
         return switch (task.phase) {
             case MOVE_TO_CHEST -> {
-                boolean moving = villager.getNavigation().moveTo(
-                        task.chestPos.getX() + 0.5,
-                        task.chestPos.getY() + 0.5,
-                        task.chestPos.getZ() + 0.5,
-                        0.85);
                 double dist = villager.distanceToSqr(
                         task.chestPos.getX() + 0.5,
                         task.chestPos.getY() + 0.5,
                         task.chestPos.getZ() + 0.5);
                 if (dist <= 3.0) {
                     task.phase = DeliveryPhase.WITHDRAW_FROM_CHEST;
+                    task.navDeadlineMillis = 0L;
+                    yield true;
                 }
-                yield moving || dist <= 3.0;
+                boolean moving = villager.getNavigation().moveTo(
+                        task.chestPos.getX() + 0.5,
+                        task.chestPos.getY() + 0.5,
+                        task.chestPos.getZ() + 0.5,
+                        0.85);
+                if (moving) {
+                    task.navDeadlineMillis = 0L;
+                    yield true;
+                }
+                if (task.navDeadlineMillis == 0L) {
+                    task.navDeadlineMillis = System.currentTimeMillis() + 5_000L;
+                }
+                yield System.currentTimeMillis() < task.navDeadlineMillis;
             }
             case WITHDRAW_FROM_CHEST -> {
                 ItemStack collected = withdrawFromChest(level, task.chestPos, task.item, task.count);
@@ -3749,6 +3758,7 @@ public final class AgentActionExecutor {
         private final UUID targetPlayerId;
         private DeliveryPhase phase = DeliveryPhase.MOVE_TO_CHEST;
         private ItemStack heldStack = ItemStack.EMPTY;
+        private long navDeadlineMillis = 0L;
 
         private DeliveryTask(Item item, String itemId, int count, BlockPos chestPos, UUID targetPlayerId) {
             this.item = item;
