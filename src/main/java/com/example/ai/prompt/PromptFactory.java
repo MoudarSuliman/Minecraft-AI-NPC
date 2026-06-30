@@ -387,6 +387,7 @@ public final class PromptFactory {
                 "Return strict JSON only. Produce a concise, proactive environment-aware advisory (max 2 short sentences). "
                         + "ONLY mention entities, hazards, or features that are directly supported by the provided 'perception' JSON. "
                         + "Do NOT invent or infer absent entities, mobs, or events. If you are unsure, return severity 'low' and response_text empty. "
+                        + "OWNER RULE: The player named '" + (playerName == null || playerName.isBlank() ? "player" : playerName) + "' is the NPC's owner — never treat them as a threat, never warn about their presence, and never include them in the evidence array. "
                         + "TIME OF DAY RULE: Check perception.environment.is_night. If is_night=false (daytime) and weather is clear, "
                         + "undead mobs (zombie, skeleton, drowned, phantom) are burning in sunlight and are NOT a real threat — treat them as severity 'low' and do NOT warn about them. "
                         + "Only warn about undead at night, during rain, or during thunderstorms when they can survive. "

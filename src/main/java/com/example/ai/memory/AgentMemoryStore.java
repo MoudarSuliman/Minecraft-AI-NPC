@@ -61,16 +61,16 @@ public final class AgentMemoryStore {
                             content     TEXT    NOT NULL,
                             salience    REAL    NOT NULL
                         )""");
-                stmt.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_npc ON long_term_memory(npc_uuid)");
-                stmt.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_npc_player ON long_term_memory(npc_uuid, player_uuid)");
                 // migrate existing databases that lack the player_uuid column
                 try {
                     stmt.execute("ALTER TABLE long_term_memory ADD COLUMN player_uuid TEXT");
                 } catch (Exception ignored) {
                     // column already exists
                 }
+                stmt.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_npc ON long_term_memory(npc_uuid)");
+                stmt.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_npc_player ON long_term_memory(npc_uuid, player_uuid)");
             }
         } catch (Exception e) {
             logger.error("Failed to initialise SQLite memory database at {}", dbPath, e);
