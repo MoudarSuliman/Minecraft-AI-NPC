@@ -4416,23 +4416,10 @@ public final class AgentActionExecutor {
             case "fetch_from_chest" -> {
                 JsonObject p = step.parameters();
                 if (p.has("item_id")) {
-                    if (startFetchTask(server, npcId, villager, p, !task.materialsMissingNotified)) {
+                    if (startFetchTask(server, npcId, villager, p, true)) {
                         task.waitingForDelivery = true;
-                        task.waitingForMaterials = false;
-                        task.materialsMissingNotified = false;
-                        task.fetchRetryCount = 0;
                     } else {
-                        task.fetchRetryCount++;
-                        if (task.fetchRetryCount >= ScenarioTask.MAX_FETCH_RETRIES) {
-                            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
-                                    "You searched for materials in nearby chests multiple times but couldn't find them. Let the player know you're cancelling the task.",
-                                    "I couldn't find the materials after several attempts. Cancelling the task."));
-                            task.cancelled = true;
-                        } else {
-                            task.materialsMissingNotified = true;
-                            task.waitingForMaterials = true;
-                            task.retryFetchAt = System.currentTimeMillis() + 15_000L;
-                        }
+                        task.cancelled = true;
                     }
                 } else {
                     task.currentStepIndex++;
