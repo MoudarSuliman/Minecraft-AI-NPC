@@ -47,6 +47,7 @@ public final class AutonomousNpcRuntime {
 
     private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Set<UUID> thinkingNpcs = ConcurrentHashMap.newKeySet();
+    private com.example.ai.test.TestRunner activeTestRunner = null;
     private final Set<UUID> pendingWelcomeBack = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Long> villagerFirstMissingAt = new ConcurrentHashMap<>();
     private static final long VILLAGER_MISSING_EVICT_MS = 30_000L;
@@ -201,6 +202,35 @@ public final class AutonomousNpcRuntime {
                 bindingStore.forgetBinding(npcId);
             }
         }
+
+        if (activeTestRunner != null) {
+            activeTestRunner.tick();
+            if (activeTestRunner.isFinished()) {
+                activeTestRunner = null;
+            }
+        }
+    }
+
+    public void resetNpcForTest(UUID npcId) {
+        UUID playerId = agents.containsKey(npcId) ? agents.get(npcId).ownerPlayerId() : null;
+        actionExecutor.clearActiveTradeOffer(npcId, playerId);
+        actionExecutor.cancelAllActiveTasks(npcId);
+    }
+
+    public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester) {
+        if (activeTestRunner != null && !activeTestRunner.isFinished()) {
+            return false;
+        }
+        activeTestRunner = new com.example.ai.test.TestRunner(
+                logger,
+                npcId,
+                requester,
+                () -> getLastParsedIntent(npcId),
+                () -> isNpcIdle(npcId),
+                instruction -> enqueuePlayerUtterance(npcId, requester.getName().getString(), instruction),
+                () -> resetNpcForTest(npcId)
+        );
+        return true;
     }
 
     private void processInstruction(MinecraftServer server, AgentHandle handle, UUID npcId,
@@ -210,6 +240,9 @@ public final class AutonomousNpcRuntime {
         logger.info("[THINK] npc={} instruction='{}' speaker='{}'",
                 handle.npcName(), latestInstruction, speaker);
         String previousInstruction = lastProcessedInstructionByNpc.getOrDefault(npcId, "");
+        if (previousInstruction.equalsIgnoreCase(latestInstruction)) {
+            previousInstruction = "";
+        }
         runActionSelection(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
                 previousInstruction, now, hasPendingInstruction);
     }
@@ -226,11 +259,9 @@ public final class AutonomousNpcRuntime {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 storeActionMemory(npcId, speaker, latestInstruction, "trade");
-            } else {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
             }
-            return;
+            
         }
 
         String prompt = promptFactory.actionSelectionPrompt(
@@ -393,6 +424,9 @@ public final class AutonomousNpcRuntime {
                 lastProcessedInstructionByNpc.put(npcId, latestInstruction);
                 return;
             }
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+            return;
         }
 
         actionExecutor.execute(npcId, decision);
@@ -433,6 +467,16 @@ public final class AutonomousNpcRuntime {
 
     public boolean isAgentRegistered(UUID npcId) {
         return agents.containsKey(npcId);
+    }
+
+    public boolean isNpcIdle(UUID npcId) {
+        return !pendingInstruction.getOrDefault(npcId, false)
+                && !llmInFlight.getOrDefault(npcId, false)
+                && !thinkingNpcs.contains(npcId);
+    }
+
+    public String getLastParsedIntent(UUID npcId) {
+        return lastParsedDecisionIntentByNpc.get(npcId);
     }
 
     public void updateTradePrices(java.util.Map<String, com.example.ai.trade.PriceConfig> configs) {

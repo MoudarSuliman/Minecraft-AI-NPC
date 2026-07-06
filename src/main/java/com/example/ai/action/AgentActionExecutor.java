@@ -883,18 +883,7 @@ public final class AgentActionExecutor {
             tradeLlmInFlightByNpc.put(npcId, false);
         }
         if (tradeIntent.type() == TradeIntentType.NONE) {
-            if (session.activeOffer != null) {
-                session.lastInteractionAtMillis = now;
-                String tradeCtx = "There is an active trade offer on the table: " + summarizeOffer(session.activeOffer)
-                        + ". The player's message is a conversational follow-up to this trade, not a new trade request.";
-                tryHandleDialogueInstruction(server, npcId, fallbackName, playerName, null,
-                        instruction, memory, snapshot, tradeCtx);
-                return true;
-            }
-            speakAsNpc(server, villager, fallbackName,
-                    fallbackOrDefault(draft.responseText(), "Tell me the item and amount you want to buy."));
-            session.lastInteractionAtMillis = now;
-            return true;
+            return false;
         }
         session.lastInteractionAtMillis = now;
 
@@ -3934,6 +3923,18 @@ public final class AgentActionExecutor {
         TradeSession session = tradeSessions.get(key);
         if (session == null || session.activeOffer == null) return false;
         return System.currentTimeMillis() <= session.activeOffer.expiresAtMillis();
+    }
+
+    public void clearActiveTradeOffer(UUID npcId, UUID playerId) {
+        TradeSessionKey key = new TradeSessionKey(npcId, playerId);
+        TradeSession session = tradeSessions.get(key);
+        if (session != null) session.activeOffer = null;
+    }
+
+    public void cancelAllActiveTasks(UUID npcId) {
+        activeSearchTasks.remove(npcId);
+        activeScoutTasks.remove(npcId);
+        activeScenarioTasks.remove(npcId);
     }
 
     public NpcState getNpcState(UUID npcId) {
