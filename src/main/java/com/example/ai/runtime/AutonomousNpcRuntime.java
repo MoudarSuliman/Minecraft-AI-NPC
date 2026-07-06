@@ -344,6 +344,7 @@ public final class AutonomousNpcRuntime {
                     && decision.reasoning().toLowerCase().contains("unavailable");
             if (llmUnavailable) {
                 logger.info("LLM unavailable for agent {}, backing off 5s.", handle.npcName());
+                actionExecutor.notifyLlmUnavailable(server, npcId, handle.npcName());
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 5000L);
             } else {
