@@ -288,6 +288,7 @@ public final class PromptFactory {
         payload.addProperty("constraints",
                 "Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. "
                         + "CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. "
+                        + "REQUIRED: response_text MUST always state the item name and the exact price in emeralds explicitly — e.g. '3 emeralds', 'for 3 emeralds each'. Never omit the price. "
                         + "Never invent items, prices, or stock. Suggested prices must be integers >= 1. "
                         + "Always reference the actual stock and item names from required_facts. "
                         + "If suggesting a new price, set both suggested_unit_price and suggested_total_price. "
