@@ -847,7 +847,7 @@ public final class AgentActionExecutor {
                 tradeIntent.itemId(),
                 tradeIntent.quantity(),
                 tradeIntent.counterTotalPrice());
-        if (tradeIntent.type() == TradeIntentType.NONE && session.activeOffer == null) {
+        if (tradeIntent.type() == TradeIntentType.NONE) {
             return false;
         }
         lastTradeIntentByNpc.put(npcId, tradeIntent.type().name().toLowerCase());

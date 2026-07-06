@@ -16,7 +16,7 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "");
     }
 
     public String actionSelectionPrompt(
@@ -27,6 +27,19 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint,
             String previousInstruction
+    ) {
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "");
+    }
+
+    public String actionSelectionPrompt(
+            WorldSnapshot snapshot,
+            MemoryContext memory,
+            boolean hasPendingInstruction,
+            String latestInstruction,
+            String expectedIntent,
+            String targetHint,
+            String previousInstruction,
+            String activeOfferSummary
     ) {
         JsonObject payload = new JsonObject();
         payload.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
@@ -39,6 +52,9 @@ public final class PromptFactory {
         }
         payload.addProperty("expected_intent", expectedIntent);
         payload.addProperty("target_hint", targetHint);
+        if (activeOfferSummary != null && !activeOfferSummary.isBlank()) {
+            payload.addProperty("active_offer", activeOfferSummary);
+        }
         payload.addProperty("required_schema",
                         "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
         payload.addProperty("constraints", hasPendingInstruction
@@ -59,6 +75,11 @@ public final class PromptFactory {
                 + "   trade_accept: player agrees to a deal. Examples: 'deal', 'ok', 'yes', 'fine', 'sure'.\n"
                 + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
                 + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
+                + "   ACTIVE OFFER RULE: If active_offer is present in this prompt, the NPC has an open trade proposal. "
+                + "In that context, short affirmative replies ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold', 'agreed') -> trade_accept. "
+                + "Short rejections ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline. "
+                + "Price counter-proposals ('how about X', 'that is too much', 'I will give you X') -> trade_counter. "
+                + "Questions about the NPC identity, capabilities, or crafting are ALWAYS dialogue_reply or recipe_reply even with an active offer.\n"
                 + "   EXCEPTION — these are NEVER trade_offer, always use the intent shown:\n"
                 + "     'who are you?' -> dialogue_reply. 'what can you do?' -> dialogue_reply. "
                 + "     'what are you?' -> dialogue_reply. 'tell me about yourself' -> dialogue_reply. "
@@ -478,6 +499,14 @@ public final class PromptFactory {
                         + "then 'sure', 'u sure', 'you sure?', 'really?', 'are you sure' mean the player is questioning the outcome — map to inquire_session_status, NOT accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
                         + "For explicit emerald counter proposals, map to counter_offer and set counter_total_price. "
+                        + "Questions about the NPC's identity or general capabilities are NOT trade; return none. "
+                        + "Examples that MUST return none: "
+                        + "'what can you do' => none; "
+                        + "'what can you do?' => none; "
+                        + "'who are you' => none; "
+                        + "'what are you' => none; "
+                        + "'tell me about yourself' => none; "
+                        + "'what are your abilities' => none. "
                         + "Conversational follow-ups that do NOT request stock info or a trade action must return none. "
                         + "Examples that MUST return none: "
                         + "'when would that be' => none; "
