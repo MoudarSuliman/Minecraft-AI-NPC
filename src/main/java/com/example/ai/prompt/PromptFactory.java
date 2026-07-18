@@ -622,10 +622,33 @@ public final class PromptFactory {
         return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, scenarioContext, null);
     }
 
+    private static final String DIALOGUE_REPLY_RULES =
+            "My abilities (what I can actually do when commanded):\n"
+            + "  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n"
+            + "  - Fetch items from nearby chests and bring them to the player\n"
+            + "  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n"
+            + "  - Scout and explore in a direction and report back\n"
+            + "  - Trade items with the player\n"
+            + "  - Answer questions and hold a conversation\n"
+            + "IMPORTANT RULES:\n"
+            + "- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n"
+            + "- CRITICAL: If the player asks you to perform an action NOT in your abilities list (e.g. pick up dropped items, carry items in hand, craft items, follow the player, attack mobs), you MUST decline honestly and suggest what you CAN do instead. NEVER agree to do something you are not able to do. Saying 'sure' or 'let me do that' for impossible actions is forbidden.\n"
+            + "- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data below. Do not invent.\n"
+            + "- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' below. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n"
+            + "- If asked about what was just said: use the recent conversation section.\n"
+            + "- Never invent facts, events, or task names not present in the data below.\n"
+            + "- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n"
+            + "Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n"
+            + "NEVER repeat the player's words back. Reply in your own words.\n"
+            + "Return ONLY this JSON with no extra text:\n"
+            + "{\"text\":\"your reply here\"}\n";
+
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory, String scenarioContext, String tradeContext) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(4096);
+        // Static rules first, per-call data last, so Ollama's prefix cache covers the rulebook.
         sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
+        sb.append(DIALOGUE_REPLY_RULES);
         sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
 
         if (snapshot != null) {
@@ -683,24 +706,7 @@ public final class PromptFactory {
             sb.append("Active trade context: ").append(tradeContext).append("\n");
             sb.append("The player's message is a follow-up to this trade situation. Reply naturally and in context — do not re-state the offer mechanically.\n");
         }
-        sb.append("My abilities (what I can actually do when commanded):\n");
-        sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");
-        sb.append("  - Fetch items from nearby chests and bring them to the player\n");
-        sb.append("  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n");
-        sb.append("  - Scout and explore in a direction and report back\n");
-        sb.append("  - Trade items with the player\n");
-        sb.append("  - Answer questions and hold a conversation\n");
-        sb.append("IMPORTANT RULES:\n");
-        sb.append("- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n");
-        sb.append("- CRITICAL: If the player asks you to perform an action NOT in your abilities list (e.g. pick up dropped items, carry items in hand, craft items, follow the player, attack mobs), you MUST decline honestly and suggest what you CAN do instead. NEVER agree to do something you are not able to do. Saying 'sure' or 'let me do that' for impossible actions is forbidden.\n");
-        sb.append("- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data above. Do not invent.\n");
-        sb.append("- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' above. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n");
-        sb.append("- If asked about what was just said: use the recent conversation section.\n");
-        sb.append("- Never invent facts, events, or task names not present in the data above.\n");
-        sb.append("- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n");
-        sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
-        sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
-        sb.append("Return ONLY this JSON with no extra text:\n");
+        sb.append("Reply to the player now. Return ONLY this JSON with no extra text:\n");
         sb.append("{\"text\":\"your reply here\"}");
         return sb.toString();
     }
