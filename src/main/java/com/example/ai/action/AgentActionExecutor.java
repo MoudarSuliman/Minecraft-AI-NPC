@@ -4168,8 +4168,15 @@ public final class AgentActionExecutor {
                 int rx = p.has("relative_x") ? p.get("relative_x").getAsInt() : 0;
                 int ry = p.has("relative_y") ? p.get("relative_y").getAsInt() : 0;
                 int rz = p.has("relative_z") ? p.get("relative_z").getAsInt() : 0;
-                executePlacePattern(level, villager, blockId, pattern, width, height, length, rx, ry, rz);
-                task.currentStepIndex++;
+                int placed = executePlacePattern(level, villager, blockId, pattern, width, height, length, rx, ry, rz);
+                if (placed == 0) {
+                    speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                            "You tried to build a " + pattern + " but there was no free space nearby, so nothing was placed. Tell the player honestly and ask them to find a clearer spot.",
+                            "I couldn't build here — there's no free space. Let's try a clearer spot."));
+                    task.cancelled = true;
+                } else {
+                    task.currentStepIndex++;
+                }
             }
             case "fetch_from_chest" -> {
                 JsonObject p = step.parameters();
@@ -4233,7 +4240,7 @@ public final class AgentActionExecutor {
         logger.info("[SCENARIO] Placed {} at {}", blockId, target);
     }
 
-    private void executePlacePattern(
+    private int executePlacePattern(
             ServerLevel level, Villager villager,
             String blockId, String pattern,
             int width, int height, int length,
@@ -4241,29 +4248,40 @@ public final class AgentActionExecutor {
         Block block = resolvePlaceableBlock(blockId);
         if (block == null) {
             logger.warn("[SCENARIO] Unknown block id for pattern: {}", blockId);
-            return;
+            return 0;
         }
         String patternKey = pattern.toLowerCase(Locale.ROOT);
-        BlockPos origin = villager.blockPosition().offset(rx, ry, rz);
-        List<BlockPos> positions = patternPositions(patternKey, origin, width, height, length);
+        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
+        BlockPos requested = villager.blockPosition().offset(rx, ry, rz);
+        List<BlockPos> positions = patternPositions(patternKey, requested, width, height, length);
+        BlockPos origin = requested;
 
-        Direction facing = villager.getDirection();
-        Direction[] shiftCandidates = {facing, facing.getClockWise(), facing.getCounterClockWise(), facing.getOpposite()};
-        for (Direction dir : shiftCandidates) {
-            if (!containsNpcSpace(positions, villager)) {
-                break;
-            }
-            BlockPos shifted = origin.relative(dir, 2);
-            List<BlockPos> shiftedPositions = patternPositions(patternKey, shifted, width, height, length);
-            if (!containsNpcSpace(shiftedPositions, villager)) {
-                origin = shifted;
-                positions = shiftedPositions;
-                logger.info("[SCENARIO] Shifted {} pattern origin to {} to avoid entombing the NPC", patternKey, origin);
-                break;
+        if (containsNpcSpace(positions, villager) || (!overwrite && airCount(level, positions) == 0)) {
+            Direction facing = villager.getDirection();
+            Direction[] shiftCandidates = {facing, facing.getClockWise(), facing.getCounterClockWise(), facing.getOpposite()};
+            search:
+            for (int distance = 2; distance <= 6; distance += 2) {
+                for (Direction dir : shiftCandidates) {
+                    BlockPos candidate = requested.relative(dir, distance);
+                    List<BlockPos> candidatePositions = patternPositions(patternKey, candidate, width, height, length);
+                    if (containsNpcSpace(candidatePositions, villager)) {
+                        continue;
+                    }
+                    if (!overwrite && airCount(level, candidatePositions) < candidatePositions.size()) {
+                        continue;
+                    }
+                    origin = candidate;
+                    positions = candidatePositions;
+                    logger.info("[SCENARIO] Shifted {} pattern origin to {} to find safe free space", patternKey, origin);
+                    break search;
+                }
             }
         }
+        if (containsNpcSpace(positions, villager)) {
+            logger.info("[SCENARIO] No safe origin found for {} pattern near {}; skipping placement", patternKey, requested);
+            return 0;
+        }
 
-        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
         int placed = 0;
         int skippedOccupied = 0;
         for (BlockPos pos : positions) {
@@ -4280,6 +4298,17 @@ public final class AgentActionExecutor {
             logger.info("[SCENARIO] Skipped {} positions occupied by living entities in {} pattern", skippedOccupied, patternKey);
         }
         logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+        return placed;
+    }
+
+    private int airCount(ServerLevel level, List<BlockPos> positions) {
+        int count = 0;
+        for (BlockPos pos : positions) {
+            if (level.getBlockState(pos).isAir()) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private List<BlockPos> patternPositions(String patternKey, BlockPos origin, int width, int height, int length) {
