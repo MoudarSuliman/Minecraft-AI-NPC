@@ -455,7 +455,7 @@ public final class AutonomousNpcRuntime {
         if (decision.intent().name().startsWith("TRADE_")) {
             if (actionExecutor.tryHandleTradeInstruction(
                     server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    latestInstruction, memory, snapshot)) {
+                    latestInstruction, memory, snapshot, decision.intent())) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("trade",

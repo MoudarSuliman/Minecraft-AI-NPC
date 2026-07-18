@@ -1,6 +1,7 @@
 package com.example.ai.action;
 
 import com.example.ai.intent.AgentDecision;
+import com.example.ai.intent.AgentIntentType;
 import com.example.ai.llm.LlmRouter;
 import com.example.ai.memory.MemoryContext;
 import com.example.ai.perception.SemanticPerceptionService;
@@ -561,7 +562,8 @@ public final class AgentActionExecutor {
             UUID ownerPlayerId,
             String instruction,
             MemoryContext memory,
-            WorldSnapshot snapshot) {
+            WorldSnapshot snapshot,
+            AgentIntentType routerIntent) {
         Villager villager = findVillager(server, npcId);
         if (villager == null) {
             return false;
@@ -587,8 +589,19 @@ public final class AgentActionExecutor {
             return true;
         }
 
-        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(server, villager, player, instruction, session,
-                snapshot, memory, npcId);
+        ParsedTradeIntent llmClassified;
+        if (routerIntent == AgentIntentType.TRADE_ACCEPT && session.activeOffer != null) {
+            llmClassified = new ParsedTradeIntent(TradeIntentType.ACCEPT_OFFER, "", 0, null);
+        } else if (routerIntent == AgentIntentType.TRADE_DECLINE && session.activeOffer != null) {
+            llmClassified = new ParsedTradeIntent(TradeIntentType.DECLINE_OFFER, "", 0, null);
+        } else {
+            llmClassified = classifyTradeIntentWithLlm(server, villager, player, instruction, session,
+                    snapshot, memory, npcId);
+            if (llmClassified.type() == TradeIntentType.NONE && routerIntent == AgentIntentType.TRADE_OFFER) {
+                String fallbackItem = session.lastRequestedItemId == null ? "" : session.lastRequestedItemId;
+                llmClassified = new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, fallbackItem, 0, null);
+            }
+        }
         ParsedTradeIntent tradeIntent = resolveTradeIntent(llmClassified, session);
         logger.info(
                 "[TRADE-DEBUG] npc={} utterance='{}' llm_intent={} resolved_intent={} resolved_item={} resolved_qty={} resolved_counter={}",
