@@ -5,6 +5,7 @@ import com.example.ai.memory.MemoryEntry;
 import com.example.ai.perception.WorldSnapshot;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import java.util.List;
 import java.util.Map;
 
 public final class PromptFactory {
@@ -286,28 +287,32 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "trade_negotiation");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("mode", mode);
-        payload.addProperty("active_offer", activeOfferSummary);
-        payload.addProperty("stock_summary", stockSummary);
-        payload.addProperty("required_facts", requiredFacts);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format",
-                "{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. "
-                        + "CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. "
-                        + "REQUIRED: response_text MUST always state the item name and the exact price in emeralds explicitly — e.g. '3 emeralds', 'for 3 emeralds each'. Never omit the price. "
-                        + "Never invent items, prices, or stock. Suggested prices must be integers >= 1. "
-                        + "Always reference the actual stock and item names from required_facts. "
-                        + "If suggesting a new price, set both suggested_unit_price and suggested_total_price. "
-                        + "If counter_total_price is not relevant, omit it or set null.");
-        return payload.toString();
+        // Static rules first (cacheable prefix), slim per-call data last. Negotiation is
+        // grounded in required_facts/stock_summary; the world snapshot adds no trade value.
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("You are a Minecraft NPC merchant negotiating a trade with a player.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append("{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}\n");
+        sb.append("RULES: Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. ");
+        sb.append("CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. ");
+        sb.append("REQUIRED: response_text MUST always state the item name and the exact price in emeralds explicitly — e.g. '3 emeralds', 'for 3 emeralds each'. Never omit the price. ");
+        sb.append("Never invent items, prices, or stock. Suggested prices must be integers >= 1. ");
+        sb.append("Always reference the actual stock and item names from required_facts. ");
+        sb.append("If suggesting a new price, set both suggested_unit_price and suggested_total_price. ");
+        sb.append("If counter_total_price is not relevant, omit it or set null.\n");
+
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("mode", mode);
+        data.addProperty("active_offer", activeOfferSummary);
+        data.addProperty("stock_summary", stockSummary);
+        data.addProperty("required_facts", requiredFacts);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Write the NPC's negotiation reply now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String recipeAssistantPrompt(
@@ -471,28 +476,11 @@ public final class PromptFactory {
         return payload.toString();
     }
 
-    public String tradeIntentClassifierPrompt(
-            String npcName,
-            String playerName,
-            String playerText,
-            String activeOfferSummary,
-            String stockSummary,
-            WorldSnapshot snapshot,
-            MemoryContext memory
-    ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "trade_intent_classifier");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("active_offer", activeOfferSummary);
-        payload.addProperty("stock_summary", stockSummary);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format",
-                "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
-                        + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}");
-        payload.addProperty("constraints",
+    private static final String TRADE_CLASSIFIER_FORMAT =
+            "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
+                    + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
+
+    private static final String TRADE_CLASSIFIER_RULES =
                 "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
                         + "Treat availability/count/price/payment questions as trade intents. "
                         + "Examples that should map to inquire_stock: 'do you have sticks', 'how many sticks do you have', 'what do you sell'. "
@@ -533,8 +521,36 @@ public final class PromptFactory {
                         + "'okay' => none; "
                         + "'interesting' => none. "
                         + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer. "
-                        + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.");
-        return payload.toString();
+                        + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.";
+
+    public String tradeIntentClassifierPrompt(
+            String npcName,
+            String playerName,
+            String playerText,
+            String activeOfferSummary,
+            String stockSummary,
+            WorldSnapshot snapshot,
+            MemoryContext memory
+    ) {
+        // Static rules first (cacheable prefix), slim per-call data last. The classifier
+        // only routes trade intents: it needs the utterance, offer/stock state, and the
+        // last few conversation turns — not the world snapshot or full memory dump.
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("You are a Minecraft trade intent classifier for the NPC merchant.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append(TRADE_CLASSIFIER_FORMAT).append('\n');
+        sb.append("RULES: ").append(TRADE_CLASSIFIER_RULES).append('\n');
+
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("active_offer", activeOfferSummary);
+        data.addProperty("stock_summary", stockSummary);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Classify player_utterance now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String tradeIntentRecoveryPrompt(
@@ -925,6 +941,18 @@ public final class PromptFactory {
                 + "\"announce\":\"one sentence plan\","
                 + "\"steps\":["
                 + "{\"intent\":\"step_intent\",\"parameters\":{},\"description\":\"short description\"}]}";
+    }
+
+    private JsonArray recentShortTerm(MemoryContext memory, int limit) {
+        JsonArray array = new JsonArray();
+        if (memory == null) {
+            return array;
+        }
+        List<MemoryEntry> entries = memory.shortTerm();
+        for (int i = Math.max(0, entries.size() - limit); i < entries.size(); i++) {
+            array.add(entries.get(i).toJson());
+        }
+        return array;
     }
 
     private JsonObject memoryToJson(MemoryContext memory) {
