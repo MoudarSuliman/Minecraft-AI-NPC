@@ -431,9 +431,15 @@ public final class AutonomousNpcRuntime {
         }
 
         if (decision.intent() == AgentIntentType.BUILD_STRUCTURE) {
+            String buildInstruction = decision.parameters().has("description")
+                    ? decision.parameters().get("description").getAsString()
+                    : "";
+            if (buildInstruction.isBlank()) {
+                buildInstruction = latestInstruction;
+            }
             if (actionExecutor.tryHandleScenarioInstruction(
                     server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    latestInstruction, memory, snapshot, true)) {
+                    buildInstruction, memory, snapshot, true)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 storeActionMemory(npcId, speaker, latestInstruction, "scenario");

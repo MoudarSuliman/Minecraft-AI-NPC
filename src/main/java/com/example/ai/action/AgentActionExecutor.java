@@ -43,6 +43,9 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.core.Direction;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 
@@ -4222,6 +4225,10 @@ public final class AgentActionExecutor {
         }
         BlockPos npcPos = villager.blockPosition();
         BlockPos target = npcPos.offset(rx, ry, rz);
+        if (wouldSuffocateEntity(level, target)) {
+            logger.info("[SCENARIO] Skipped placing {} at {}: position occupied by a living entity", blockId, target);
+            return;
+        }
         level.setBlockAndUpdate(target, block.defaultBlockState());
         logger.info("[SCENARIO] Placed {} at {}", blockId, target);
     }
@@ -4236,25 +4243,69 @@ public final class AgentActionExecutor {
             logger.warn("[SCENARIO] Unknown block id for pattern: {}", blockId);
             return;
         }
-        BlockPos origin = villager.blockPosition().offset(rx, ry, rz);
         String patternKey = pattern.toLowerCase(Locale.ROOT);
-        List<BlockPos> positions = switch (patternKey) {
+        BlockPos origin = villager.blockPosition().offset(rx, ry, rz);
+        List<BlockPos> positions = patternPositions(patternKey, origin, width, height, length);
+
+        Direction facing = villager.getDirection();
+        Direction[] shiftCandidates = {facing, facing.getClockWise(), facing.getCounterClockWise(), facing.getOpposite()};
+        for (Direction dir : shiftCandidates) {
+            if (!containsNpcSpace(positions, villager)) {
+                break;
+            }
+            BlockPos shifted = origin.relative(dir, 2);
+            List<BlockPos> shiftedPositions = patternPositions(patternKey, shifted, width, height, length);
+            if (!containsNpcSpace(shiftedPositions, villager)) {
+                origin = shifted;
+                positions = shiftedPositions;
+                logger.info("[SCENARIO] Shifted {} pattern origin to {} to avoid entombing the NPC", patternKey, origin);
+                break;
+            }
+        }
+
+        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
+        int placed = 0;
+        int skippedOccupied = 0;
+        for (BlockPos pos : positions) {
+            if (wouldSuffocateEntity(level, pos)) {
+                skippedOccupied++;
+                continue;
+            }
+            if (overwrite || level.getBlockState(pos).isAir()) {
+                level.setBlockAndUpdate(pos, block.defaultBlockState());
+                placed++;
+            }
+        }
+        if (skippedOccupied > 0) {
+            logger.info("[SCENARIO] Skipped {} positions occupied by living entities in {} pattern", skippedOccupied, patternKey);
+        }
+        logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+    }
+
+    private List<BlockPos> patternPositions(String patternKey, BlockPos origin, int width, int height, int length) {
+        return switch (patternKey) {
             case "wall"    -> wallPositions(origin, width, height);
             case "pillar"  -> pillarPositions(origin, height);
             case "outline" -> outlinePositions(origin, width, length);
             case "hut"     -> hutPositions(origin, width, height, length);
             default        -> floorPositions(origin, width, length);
         };
-        // Floors, outlines and huts overwrite existing ground; walls/pillars only fill air
-        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
-        int placed = 0;
+    }
+
+    private boolean containsNpcSpace(List<BlockPos> positions, Villager villager) {
+        BlockPos feet = villager.blockPosition();
+        BlockPos head = feet.above();
         for (BlockPos pos : positions) {
-            if (overwrite || level.getBlockState(pos).isAir()) {
-                level.setBlockAndUpdate(pos, block.defaultBlockState());
-                placed++;
+            if (pos.equals(feet) || pos.equals(head)) {
+                return true;
             }
         }
-        logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+        return false;
+    }
+
+    private boolean wouldSuffocateEntity(ServerLevel level, BlockPos pos) {
+        AABB box = new AABB(pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1);
+        return !level.getEntitiesOfClass(LivingEntity.class, box, LivingEntity::isAlive).isEmpty();
     }
 
     private List<BlockPos> floorPositions(BlockPos origin, int width, int length) {
