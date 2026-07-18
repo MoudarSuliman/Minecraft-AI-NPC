@@ -418,6 +418,7 @@ public final class PromptFactory {
             + "- If asked about what was just said: use the recent conversation section.\n"
             + "- Never invent facts, events, or task names not present in the data below.\n"
             + "- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n"
+            + "- Do NOT advertise your services in every reply. Only mention what you can do when the player asks about your abilities or when it directly answers their request. When the player is just chatting, chat back naturally without pitching mining, building, or trading.\n"
             + "Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n"
             + "NEVER repeat the player's words back. Reply in your own words.\n"
             + "Return ONLY this JSON with no extra text:\n"
@@ -463,14 +464,15 @@ public final class PromptFactory {
         if (memory != null && !memory.longTerm().isEmpty()) {
             sb.append("Things I remember from past interactions:\n");
             for (MemoryEntry e : memory.longTerm()) {
-                sb.append("  [memory] ").append(e.content()).append("\n");
+                sb.append("  [").append(e.relativeAge()).append("] ").append(e.content()).append("\n");
             }
         }
         if (memory != null && !memory.shortTerm().isEmpty()) {
             sb.append("Recent conversation and events (most recent first):\n");
             int start = Math.max(0, memory.shortTerm().size() - 6);
             for (int i = memory.shortTerm().size() - 1; i >= start; i--) {
-                sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
+                MemoryEntry e = memory.shortTerm().get(i);
+                sb.append("  [").append(e.relativeAge()).append("] ").append(e.content()).append("\n");
             }
         }
 

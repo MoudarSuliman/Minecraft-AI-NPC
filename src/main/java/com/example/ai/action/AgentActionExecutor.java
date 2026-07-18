@@ -1032,8 +1032,15 @@ public final class AgentActionExecutor {
         if (offers.size() > limit) {
             message = message + ", and more.";
         }
-        speakAsNpc(server, villager, fallbackName,
-                groundedStockText(draft.responseText(), "I currently sell: " + message, session.activeOffer.unitPrice()));
+        String stockFallback = "I currently sell: " + message;
+        String draftText = groundedStockText(draft.responseText(), "", session.activeOffer.unitPrice());
+        if (draftText.isBlank()) {
+            draftText = contextualLine(villager.getName().getString(),
+                    "A player asked what you offer. Your exact current stock: " + message
+                            + ". Present it naturally in one or two sentences, keeping every item name, count, and emerald price exactly as stated.",
+                    stockFallback);
+        }
+        speakAsNpc(server, villager, fallbackName, draftText);
         return true;
     }
 
@@ -1226,7 +1233,11 @@ public final class AgentActionExecutor {
 
         TradeOffer offer = session.activeOffer;
         if (!hasAtLeast(player, Items.EMERALD, offer.totalPrice())) {
-            String msg = "You don't have enough emeralds for that trade.";
+            String msg = contextualLine(villager.getName().getString(),
+                    "The player accepted your offer (" + summarizeOffer(offer)
+                            + ") but does not have the " + offer.totalPrice()
+                            + " emeralds it costs. Tell them kindly they are short and the offer stands.",
+                    "You don't have enough emeralds for that trade.");
             speakAsNpc(server, villager, fallbackName, msg);
             recordNpcUtterance(villager.getUUID(), msg);
             return true;
