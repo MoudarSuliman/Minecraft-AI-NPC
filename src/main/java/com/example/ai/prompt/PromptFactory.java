@@ -323,24 +323,30 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "recipe_assistant");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("required_facts", requiredFacts);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format", "{\"response_text\":\"...\"}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. Keep response_text concise (max 2 sentences) and natural. "
+        // Static rules first, slim data last. The reply is grounded entirely in
+        // required_facts; the world snapshot and long-term memory add nothing here.
+        StringBuilder sb = new StringBuilder(2048);
+        sb.append("You are a Minecraft NPC merchant answering a crafting/recipe question.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append("{\"response_text\":\"...\"}\n");
+        sb.append("RULES: ");
+        sb.append("Return strict JSON only. Keep response_text concise (max 2 sentences) and natural. "
                         + "Do not invent quantities, items, stock, or prices not in required_facts. "
                         + "You MUST include the recipe requirements from required_facts. "
                         + "You MUST include the nearby ingredient status from required_facts, but only describe what is actually present. "
                         + "If required_facts available_ingredients contains items the player needs, offer to fetch or hand them over — say something like 'I can get those for you' or 'want me to grab them?'. "
                         + "If required_facts active_offer is \"none\", do NOT claim you can trade or provide items from stock. "
-                        + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.");
-        return payload.toString();
+                        + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.\n");
+
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("required_facts", requiredFacts);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Answer the recipe question now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String recipeIntentClassifierPrompt(
@@ -401,7 +407,11 @@ public final class PromptFactory {
         payload.addProperty("task", "relationship_greeting");
         payload.addProperty("npc_name", npcName);
         payload.addProperty("player_name", playerName);
-        payload.add("memory", memoryToJson(memory));
+        // The greeting rules only draw on memory.long_term; short-term/working entries
+        // would just inflate the prompt with trade chatter the rules say to avoid.
+        JsonObject memoryJson = new JsonObject();
+        memoryJson.add("long_term", toArray(memory.longTerm()));
+        payload.add("memory", memoryJson);
         payload.addProperty("format", "{\"response_text\":\"...\"}");
         payload.addProperty("constraints",
                 "Return strict JSON only. Keep response_text short (max 2 sentences), warm, and natural. "
@@ -423,8 +433,6 @@ public final class PromptFactory {
         payload.addProperty("task", "environmental_advisory");
         payload.addProperty("npc_name", npcName);
         payload.addProperty("player_name", playerName == null || playerName.isBlank() ? "player" : playerName);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
         payload.addProperty("format", "{\"response_text\":\"...\", \"severity\":\"low|medium|high\", \"evidence\":[]}");
         payload.addProperty("constraints",
                 "Return strict JSON only. Produce a concise, proactive environment-aware advisory (max 2 short sentences). "
@@ -443,6 +451,9 @@ public final class PromptFactory {
                         + "Only return a non-empty response_text when severity is 'medium' or 'high'. "
                         + "Return strict JSON in this exact format: {\"response_text\":\"...\", \"severity\":\"medium|high|low\", \"evidence\":[\"...\"]}. "
                         + "Do NOT suggest trades, inventory, prices, or cause the NPC to take actions. If nothing noteworthy, return response_text empty and severity 'low'.");
+        // Perception last (it changes every call); memory is omitted because the rules
+        // above only allow facts drawn from perception.
+        payload.add("perception", snapshot.toJson());
         return payload.toString();
     }
 
