@@ -31,34 +31,13 @@ public final class PromptFactory {
         return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "");
     }
 
-    public String actionSelectionPrompt(
-            WorldSnapshot snapshot,
-            MemoryContext memory,
-            boolean hasPendingInstruction,
-            String latestInstruction,
-            String expectedIntent,
-            String targetHint,
-            String previousInstruction,
-            String activeOfferSummary
-    ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("has_pending_instruction", hasPendingInstruction);
-        payload.addProperty("latest_instruction", latestInstruction);
-        if (previousInstruction != null && !previousInstruction.isBlank()) {
-            payload.addProperty("previous_instruction", previousInstruction);
-        }
-        payload.addProperty("expected_intent", expectedIntent);
-        payload.addProperty("target_hint", targetHint);
-        if (activeOfferSummary != null && !activeOfferSummary.isBlank()) {
-            payload.addProperty("active_offer", activeOfferSummary);
-        }
-        payload.addProperty("required_schema",
-                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
-        payload.addProperty("constraints", hasPendingInstruction
-                ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
+    private static final String ACTION_SELECTION_SCHEMA =
+            "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
+
+    // Ollama reuses its KV cache for the longest shared prompt prefix, so the static
+    // rulebook must come first and per-call data (perception, memory, instruction) last.
+    private static final String ACTION_SELECTION_RULES_PENDING =
+            "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
                 + "If has_pending_instruction is true, you MUST NOT return idle. "
                 + "IMPORTANT — intent selection rules in priority order:\n"
                 + "0. CHALLENGE DETECTION: If previous_instruction is set and latest_instruction is clearly challenging "
@@ -133,9 +112,44 @@ public final class PromptFactory {
                 + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
                 + "NEVER repeat or echo the player's message. "
                 + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. "
-                + "STRICT RULE: NEVER use dialogue_reply when the instruction contains 'build', 'construct', 'make a', 'create', or 'set up' referring to a structure — use build_structure instead."
-                : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
-        return payload.toString();
+                + "STRICT RULE: NEVER use dialogue_reply when the instruction contains 'build', 'construct', 'make a', 'create', or 'set up' referring to a structure — use build_structure instead.";
+
+    private static final String ACTION_SELECTION_RULES_IDLE =
+            "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.";
+
+    public String actionSelectionPrompt(
+            WorldSnapshot snapshot,
+            MemoryContext memory,
+            boolean hasPendingInstruction,
+            String latestInstruction,
+            String expectedIntent,
+            String targetHint,
+            String previousInstruction,
+            String activeOfferSummary
+    ) {
+        StringBuilder sb = new StringBuilder(8192);
+        sb.append("You are an embodied Minecraft NPC. Decide the NPC's next action.\n");
+        sb.append("Return ONLY strict JSON matching this schema, no markdown, no extra text:\n");
+        sb.append(ACTION_SELECTION_SCHEMA).append('\n');
+        sb.append("CONSTRAINTS:\n");
+        sb.append(hasPendingInstruction ? ACTION_SELECTION_RULES_PENDING : ACTION_SELECTION_RULES_IDLE).append('\n');
+
+        JsonObject data = new JsonObject();
+        data.addProperty("has_pending_instruction", hasPendingInstruction);
+        data.addProperty("latest_instruction", latestInstruction);
+        if (previousInstruction != null && !previousInstruction.isBlank()) {
+            data.addProperty("previous_instruction", previousInstruction);
+        }
+        data.addProperty("expected_intent", expectedIntent);
+        data.addProperty("target_hint", targetHint);
+        if (activeOfferSummary != null && !activeOfferSummary.isBlank()) {
+            data.addProperty("active_offer", activeOfferSummary);
+        }
+        data.add("perception", snapshot.toJson());
+        data.add("memory", memoryToJson(memory));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Decide the intent for latest_instruction now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String dialoguePrompt(String playerText, WorldSnapshot snapshot, MemoryContext memory) {
