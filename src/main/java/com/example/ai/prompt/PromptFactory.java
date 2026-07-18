@@ -66,7 +66,7 @@ public final class PromptFactory {
                 + "'what do I need to make a diamond pickaxe?' -> recipe_reply. 'how do I craft a furnace?' -> recipe_reply.\n"
                 + "'build me a hut with cobble stone' -> build_structure. 'make me a small shelter' -> build_structure. 'can you build?' -> dialogue_reply. 'can you build a pillar?' -> dialogue_reply. 'can u build a pillar' -> dialogue_reply. 'yes, do it' (previous_instruction='can you build a pillar?') -> build_structure.\n"
                 + "'what do you sell?' -> trade_offer. 'how much does wood cost?' -> trade_offer. 'I want to buy wood' -> trade_offer. 'do you have oak logs?' -> trade_offer.\n"
-                + "'find me a chicken' -> search_entity. 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
+                + "'find me a chicken' -> search_entity. 'find a pig' -> search_entity. 'find a sheep' -> search_entity (ALWAYS search_entity for a find/locate order, even if earlier conversation said otherwise). 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
                 + "'stop' -> cancel_task. 'come back' -> cancel_task. 'stop building' -> cancel_task.\n"
                 + "'mine some stone' -> mine_block {\"block\":\"minecraft:stone\",\"count\":1}. 'mine 3 grass blocks' -> mine_block {\"block\":\"minecraft:grass_block\",\"count\":3}.\n"
                 + "'do it' (nothing to refer to) -> ask_clarification.";
@@ -409,6 +409,7 @@ public final class PromptFactory {
             + "  - Fetch items from nearby chests and bring them to the player\n"
             + "  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n"
             + "  - Scout and explore in a direction and report back\n"
+            + "  - Search for a specific creature and lead you to it (find a pig, find a chicken, locate a sheep)\n"
             + "  - Trade items with the player\n"
             + "  - Answer questions and hold a conversation\n"
             + "IMPORTANT RULES:\n"
