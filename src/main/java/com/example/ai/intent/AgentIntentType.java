@@ -3,6 +3,7 @@ package com.example.ai.intent;
 public enum AgentIntentType {
     IDLE,
     DIALOGUE_REPLY,
+    ASK_CLARIFICATION,
     RECIPE_REPLY,
     SEARCH_ENTITY,
     SCOUT_EXPLORER,

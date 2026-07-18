@@ -353,6 +353,20 @@ public final class AutonomousNpcRuntime {
             }
             return;
         }
+        if (decision.intent() == AgentIntentType.ASK_CLARIFICATION) {
+            String question = decision.parameters().has("text")
+                    ? decision.parameters().get("text").getAsString()
+                    : "";
+            if (question.isBlank()) {
+                question = "I'm not sure what you mean — could you say that another way?";
+            }
+            actionExecutor.sayAsNpc(server, npcId, handle.npcName(), question);
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+            storeActionMemory(npcId, speaker, latestInstruction, "clarification");
+            lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+            return;
+        }
         if (decision.intent() == AgentIntentType.DIALOGUE_REPLY && !decision.parameters().has("text")) {
             logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
             nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);

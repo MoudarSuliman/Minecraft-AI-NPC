@@ -3053,6 +3053,15 @@ public final class AgentActionExecutor {
         speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
     }
 
+    public boolean sayAsNpc(MinecraftServer server, UUID npcId, String fallbackName, String text) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || text == null || text.isBlank()) {
+            return false;
+        }
+        speakAsNpc(server, villager, fallbackName, text);
+        return true;
+    }
+
     private void speakAsNpc(MinecraftServer server, Villager villager, String fallbackName, String text) {
         String npcName = villager.getName().getString();
         if (npcName == null || npcName.isBlank()) {

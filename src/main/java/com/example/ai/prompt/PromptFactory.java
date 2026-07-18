@@ -33,7 +33,7 @@ public final class PromptFactory {
     }
 
     private static final String ACTION_SELECTION_SCHEMA =
-            "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
+            "{\"intent\":\"idle|dialogue_reply|ask_clarification|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
 
     // Ollama reuses its KV cache for the longest shared prompt prefix, so the static
     // rulebook must come first and per-call data (perception, memory, instruction) last.
