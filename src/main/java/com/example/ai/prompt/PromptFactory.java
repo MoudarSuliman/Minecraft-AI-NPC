@@ -33,7 +33,7 @@ public final class PromptFactory {
     }
 
     private static final String ACTION_SELECTION_SCHEMA =
-            "{\"intent\":\"idle|dialogue_reply|ask_clarification|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
+            "{\"intent\":\"idle|dialogue_reply|ask_clarification|cancel_task|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
 
     private static final String ACTION_SELECTION_RULES_PENDING =
             "Never return idle when has_pending_instruction is true.\n"
@@ -42,16 +42,17 @@ public final class PromptFactory {
                 + "2. active_offer present + short agreement ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold') -> trade_accept.\n"
                 + "3. active_offer present + short rejection ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline.\n"
                 + "4. active_offer present + different price proposed ('how about 2 emeralds', 'that is too much') -> trade_counter.\n"
-                + "5. Question about the NPC itself — identity, abilities, feelings — or greetings, thanks, small talk -> dialogue_reply.\n"
-                + "6. Question about how to craft/make an item or its recipe -> recipe_reply.\n"
-                + "7. Direct order to build/construct/place/set up a structure (floor, wall, hut, house, shelter, platform, pattern of blocks) -> build_structure with parameters {\"description\":\"<the full instruction text>\"}. A question about building ability ('can you build?') is dialogue_reply, but any direct build order is ALWAYS build_structure, never dialogue_reply or recipe_reply.\n"
-                + "8. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
-                + "9. Order to find/locate/search for/lead to a creature -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}.\n"
-                + "10. Order to bring/fetch an item -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
-                + "11. Order to mine a block -> mine_block {\"block\":\"minecraft:...\"}. Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "12. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
-                + "13. Message is genuinely ambiguous — unresolved pronoun ('do it', 'use those') or no identifiable request -> ask_clarification with parameters {\"text\":\"<one short question asking the player what they mean>\"}.\n"
-                + "14. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
+                + "5. Order to stop, cancel, or abort what the NPC is currently doing ('stop', 'stop that', 'cancel', 'come back', 'abort', 'stop building') -> cancel_task.\n"
+                + "6. Question about the NPC itself — identity, abilities, feelings — or greetings, thanks, small talk -> dialogue_reply.\n"
+                + "7. Question about how to craft/make an item or its recipe -> recipe_reply.\n"
+                + "8. Direct order to build/construct/place/set up a structure (floor, wall, hut, house, shelter, platform, pattern of blocks) -> build_structure with parameters {\"description\":\"<the full instruction text>\"}. A question about building ability ('can you build?') is dialogue_reply, but any direct build order is ALWAYS build_structure, never dialogue_reply or recipe_reply.\n"
+                + "9. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
+                + "10. Order to find/locate/search for/lead to a creature -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}.\n"
+                + "11. Order to bring/fetch an item -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
+                + "12. Order to mine a block -> mine_block {\"block\":\"minecraft:...\"}. Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "13. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
+                + "14. Message is genuinely ambiguous — unresolved pronoun ('do it', 'use those') or no identifiable request -> ask_clarification with parameters {\"text\":\"<one short question asking the player what they mean>\"}.\n"
+                + "15. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
                 + "ADDITIONAL RULES:\n"
                 + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
                 + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
@@ -64,6 +65,7 @@ public final class PromptFactory {
                 + "'build me a hut with cobble stone' -> build_structure. 'make me a small shelter' -> build_structure. 'can you build?' -> dialogue_reply.\n"
                 + "'what do you sell?' -> trade_offer. 'how much does wood cost?' -> trade_offer. 'I want to buy wood' -> trade_offer. 'do you have oak logs?' -> trade_offer.\n"
                 + "'find me a chicken' -> search_entity. 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
+                + "'stop' -> cancel_task. 'come back' -> cancel_task. 'stop building' -> cancel_task.\n"
                 + "'do it' (nothing to refer to) -> ask_clarification.";
 
     private static final String ACTION_SELECTION_RULES_IDLE =

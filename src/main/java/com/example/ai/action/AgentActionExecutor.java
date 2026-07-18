@@ -48,9 +48,11 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -3051,6 +3053,31 @@ public final class AgentActionExecutor {
         Villager villager = findVillager(server, npcId);
         if (villager == null) return;
         speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
+    }
+
+    public boolean cancelActiveTasks(MinecraftServer server, UUID npcId, String fallbackName) {
+        Set<String> cancelled = new LinkedHashSet<>();
+        if (activeScoutTasks.remove(npcId) != null) cancelled.add("scouting");
+        if (activeSearchTasks.remove(npcId) != null) cancelled.add("searching");
+        if (activeMineToChest.remove(npcId) != null) cancelled.add("mining");
+        if (activeMineToPlayer.remove(npcId) != null) cancelled.add("mining");
+        if (activeScenarioTasks.remove(npcId) != null) cancelled.add("building");
+        if (activeDeliveries.remove(npcId) != null) cancelled.add("fetching");
+        Villager villager = findVillager(server, npcId);
+        if (villager != null) {
+            villager.getNavigation().stop();
+        }
+        if (cancelled.isEmpty()) {
+            return false;
+        }
+        String summary = String.join(", ", cancelled);
+        lastActionSummaryByNpc.put(npcId, "Cancelled on player request: " + summary + ".");
+        if (villager != null) {
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player told you to stop. You cancelled your current task (" + summary + "). Confirm briefly that you stopped.",
+                    "Alright, I stopped what I was doing."));
+        }
+        return true;
     }
 
     public boolean sayAsNpc(MinecraftServer server, UUID npcId, String fallbackName, String text) {

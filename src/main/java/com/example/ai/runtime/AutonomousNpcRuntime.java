@@ -267,6 +267,19 @@ public final class AutonomousNpcRuntime {
         AgentDecision decision = decisionParser.parse(raw);
         lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase());
 
+        if (decision.intent() == AgentIntentType.CANCEL_TASK) {
+            boolean cancelled = actionExecutor.cancelActiveTasks(server, npcId, handle.npcName());
+            if (!cancelled) {
+                actionExecutor.sayAsNpc(server, npcId, handle.npcName(),
+                        "I'm not in the middle of anything right now.");
+            }
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+            storeActionMemory(npcId, speaker, latestInstruction, "cancel");
+            lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+            return;
+        }
+
         // When NPC is busy, trade and explicit new build requests execute; everything else becomes dialogue
         if (actionExecutor.getNpcState(npcId) != AgentActionExecutor.NpcState.IDLE
                 && !decision.intent().name().startsWith("TRADE_")
