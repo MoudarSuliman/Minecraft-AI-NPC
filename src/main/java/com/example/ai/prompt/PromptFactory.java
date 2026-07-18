@@ -35,85 +35,36 @@ public final class PromptFactory {
     private static final String ACTION_SELECTION_SCHEMA =
             "{\"intent\":\"idle|dialogue_reply|ask_clarification|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
 
-    // Ollama reuses its KV cache for the longest shared prompt prefix, so the static
-    // rulebook must come first and per-call data (perception, memory, instruction) last.
     private static final String ACTION_SELECTION_RULES_PENDING =
-            "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
-                + "If has_pending_instruction is true, you MUST NOT return idle. "
-                + "IMPORTANT — intent selection rules in priority order:\n"
-                + "0. CHALLENGE DETECTION: If previous_instruction is set and latest_instruction is clearly challenging "
-                + "or asking to retry the previous action ('are you sure?', 'check again', 'really?', 'try again', 'look harder'), "
-                + "classify as if latest_instruction were previous_instruction.\n"
-                + "1. TRADE intents apply when the player's message is explicitly about buying, selling, trading, stock, "
-                + "pricing, or items the NPC sells. "
-                + "   trade_offer: player wants to buy/trade/get items, or asks what you sell, what you have in stock, "
-                + "     what something costs, or expresses general trading intent. "
-                + "     Examples: 'what do you sell?' -> trade_offer. 'what items do you have for sale?' -> trade_offer. "
-                + "     'I want to buy wood' -> trade_offer. 'give me the items' -> trade_offer. "
-                + "     'do you have oak logs?' -> trade_offer. 'how much does wood cost?' -> trade_offer. "
-                + "     'I want to trade' -> trade_offer. 'what can I buy?' -> trade_offer.\n"
-                + "   trade_accept: player agrees to a deal. Examples: 'deal', 'ok', 'yes', 'fine', 'sure'.\n"
-                + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
-                + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
-                + "   ACTIVE OFFER RULE: If active_offer is present in this prompt, the NPC has an open trade proposal. "
-                + "In that context, short affirmative replies ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold', 'agreed') -> trade_accept. "
-                + "Short rejections ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline. "
-                + "Price counter-proposals ('how about X', 'that is too much', 'I will give you X') -> trade_counter. "
-                + "Questions about the NPC identity, capabilities, or crafting are ALWAYS dialogue_reply or recipe_reply even with an active offer.\n"
-                + "   EXCEPTION — these are NEVER trade_offer, always use the intent shown:\n"
-                + "     'who are you?' -> dialogue_reply. 'what can you do?' -> dialogue_reply. "
-                + "     'what are you?' -> dialogue_reply. 'tell me about yourself' -> dialogue_reply. "
-                + "     'what do I need to make X?' -> recipe_reply. 'how do I craft X?' -> recipe_reply. "
-                + "     Conversational follow-ups: 'when would that be', 'really?', 'are you sure', 'thank you', 'okay' -> dialogue_reply.\n"
-                + "   NEVER use trade_offer for identity questions, capability questions, or crafting/recipe questions.\n"
-                + "2. CRITICAL: If latest_instruction asks to build, construct, place, create, make, or set up a structure, "
-                + "floor, wall, hut, house, shelter, or pattern of blocks — you MUST use intent build_structure. "
-                + "EXCEPTION: If the instruction is a question about capability or knowledge — e.g. 'do you know how to build', "
-                + "'can you build', 'are you able to build', 'could you build' — use dialogue_reply, NOT build_structure. "
-                + "Only use build_structure when the player is giving a direct instruction, not asking a question. "
-                + "NEVER use dialogue_reply for a direct build request. "
-                + "Examples (all MUST be build_structure): "
-                + "'build a 3x3 cobblestone floor' -> build_structure. "
-                + "'build me a hut' -> build_structure. "
-                + "'build me a hut with cobble stone' -> build_structure. "
-                + "'build me a house out of wood' -> build_structure. "
-                + "'make me a small shelter' -> build_structure. "
-                + "'construct a wall to the north' -> build_structure. "
-                + "'set up a floor here' -> build_structure. "
-                + "Parameters: {\"description\":\"<the full instruction text>\"}\n"
-                + "3. If latest_instruction asks about crafting, how to make an item, or what the recipe for something is, "
-                + "use intent recipe_reply. "
-                + "Examples: 'how do I make a sword?' -> recipe_reply. 'what is the recipe for a pickaxe?' -> recipe_reply. "
-                + "'what do I need to craft a furnace?' -> recipe_reply. "
-                + "NEVER use recipe_reply for build requests ('build me a hut' is build_structure, not recipe_reply).\n"
-                + "4. If latest_instruction asks the NPC to find, locate, lead, or search for a specific creature, "
-                + "use intent search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}. "
-                + "Examples: 'find me a chicken' -> search_entity. 'locate the nearest cow' -> search_entity. "
-                + "'lead me to a sheep' -> search_entity. 'search for a zombie' -> search_entity.\n"
-                + "5. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
-                + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
-                + "6. If latest_instruction asks to mine a block, use intent mine_block with "
-                + "parameters {\"block\":\"minecraft:...\"}.\n"
-                + "7. If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "8. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "9. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
-                + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
-                + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
-                + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb. "
-                + "NEVER use scout_explorer for questions like 'where will you scout?', 'when will you go?', 'where are you going?' — these are dialogue_reply.\n"
-                + "CONFIRMATION RULE: If the NPC previously OFFERED or SUGGESTED an action in dialogue (e.g. 'I could scout a river') "
-                + "and the player responds with enthusiasm or a question about it ('that would be dope', 'where will you scout', 'sounds good') "
-                + "WITHOUT giving an explicit command ('go', 'do it', 'yes'), use dialogue_reply to ask for confirmation first "
-                + "(e.g. 'Want me to head east and look for a river?'). Only execute the action when the player explicitly says to proceed.\n"
-                + "10. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
-                + "11. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
-                + "12. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
-                + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
-                + "NEVER repeat or echo the player's message. "
-                + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. "
-                + "STRICT RULE: NEVER use dialogue_reply when the instruction contains 'build', 'construct', 'make a', 'create', or 'set up' referring to a structure — use build_structure instead.";
+            "Never return idle when has_pending_instruction is true.\n"
+                + "DECISION TABLE — pick the FIRST row that matches latest_instruction:\n"
+                + "1. expected_intent is non-empty -> use exactly expected_intent.\n"
+                + "2. active_offer present + short agreement ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold') -> trade_accept.\n"
+                + "3. active_offer present + short rejection ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline.\n"
+                + "4. active_offer present + different price proposed ('how about 2 emeralds', 'that is too much') -> trade_counter.\n"
+                + "5. Question about the NPC itself — identity, abilities, feelings — or greetings, thanks, small talk -> dialogue_reply.\n"
+                + "6. Question about how to craft/make an item or its recipe -> recipe_reply.\n"
+                + "7. Direct order to build/construct/place/set up a structure (floor, wall, hut, house, shelter, platform, pattern of blocks) -> build_structure with parameters {\"description\":\"<the full instruction text>\"}. A question about building ability ('can you build?') is dialogue_reply, but any direct build order is ALWAYS build_structure, never dialogue_reply or recipe_reply.\n"
+                + "8. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
+                + "9. Order to find/locate/search for/lead to a creature -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}.\n"
+                + "10. Order to bring/fetch an item -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
+                + "11. Order to mine a block -> mine_block {\"block\":\"minecraft:...\"}. Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "12. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
+                + "13. Message is genuinely ambiguous — unresolved pronoun ('do it', 'use those') or no identifiable request -> ask_clarification with parameters {\"text\":\"<one short question asking the player what they mean>\"}.\n"
+                + "14. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
+                + "ADDITIONAL RULES:\n"
+                + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
+                + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
+                + "- If the NPC only SUGGESTED an action in dialogue and the player replies with enthusiasm or a question ('sounds good', 'where will you go?') without a direct command, use dialogue_reply to ask for confirmation instead of starting the action.\n"
+                + "- If target_hint is non-empty, copy it into parameters.block or parameters.item_id.\n"
+                + "- No destructive behavior, stay near the NPC, respect safety. Output strict JSON only, no markdown.\n"
+                + "EXAMPLES:\n"
+                + "'who are you?' -> dialogue_reply. 'what can you do?' -> dialogue_reply. 'thank you' -> dialogue_reply.\n"
+                + "'what do I need to make a diamond pickaxe?' -> recipe_reply. 'how do I craft a furnace?' -> recipe_reply.\n"
+                + "'build me a hut with cobble stone' -> build_structure. 'make me a small shelter' -> build_structure. 'can you build?' -> dialogue_reply.\n"
+                + "'what do you sell?' -> trade_offer. 'how much does wood cost?' -> trade_offer. 'I want to buy wood' -> trade_offer. 'do you have oak logs?' -> trade_offer.\n"
+                + "'find me a chicken' -> search_entity. 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
+                + "'do it' (nothing to refer to) -> ask_clarification.";
 
     private static final String ACTION_SELECTION_RULES_IDLE =
             "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.";
@@ -216,8 +167,6 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        // Static rules first (cacheable prefix), slim per-call data last. Negotiation is
-        // grounded in required_facts/stock_summary; the world snapshot adds no trade value.
         StringBuilder sb = new StringBuilder(4096);
         sb.append("You are a Minecraft NPC merchant negotiating a trade with a player.\n");
         sb.append("Return ONLY this JSON object with no extra text:\n");
@@ -252,8 +201,6 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        // Static rules first, slim data last. The reply is grounded entirely in
-        // required_facts; the world snapshot and long-term memory add nothing here.
         StringBuilder sb = new StringBuilder(2048);
         sb.append("You are a Minecraft NPC merchant answering a crafting/recipe question.\n");
         sb.append("Return ONLY this JSON object with no extra text:\n");
@@ -287,8 +234,6 @@ public final class PromptFactory {
         payload.addProperty("task", "relationship_greeting");
         payload.addProperty("npc_name", npcName);
         payload.addProperty("player_name", playerName);
-        // The greeting rules only draw on memory.long_term; short-term/working entries
-        // would just inflate the prompt with trade chatter the rules say to avoid.
         JsonObject memoryJson = new JsonObject();
         memoryJson.add("long_term", toArray(memory.longTerm()));
         payload.add("memory", memoryJson);
@@ -331,8 +276,6 @@ public final class PromptFactory {
                         + "Only return a non-empty response_text when severity is 'medium' or 'high'. "
                         + "Return strict JSON in this exact format: {\"response_text\":\"...\", \"severity\":\"medium|high|low\", \"evidence\":[\"...\"]}. "
                         + "Do NOT suggest trades, inventory, prices, or cause the NPC to take actions. If nothing noteworthy, return response_text empty and severity 'low'.");
-        // Perception last (it changes every call); memory is omitted because the rules
-        // above only allow facts drawn from perception.
         payload.add("perception", snapshot.toJson());
         return payload.toString();
     }
@@ -423,9 +366,6 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        // Static rules first (cacheable prefix), slim per-call data last. The classifier
-        // only routes trade intents: it needs the utterance, offer/stock state, and the
-        // last few conversation turns — not the world snapshot or full memory dump.
         StringBuilder sb = new StringBuilder(4096);
         sb.append("You are a Minecraft trade intent classifier for the NPC merchant.\n");
         sb.append("Return ONLY this JSON object with no extra text:\n");
@@ -478,7 +418,6 @@ public final class PromptFactory {
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory, String scenarioContext, String tradeContext) {
         StringBuilder sb = new StringBuilder(4096);
-        // Static rules first, per-call data last, so Ollama's prefix cache covers the rulebook.
         sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
         sb.append(DIALOGUE_REPLY_RULES);
         sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
