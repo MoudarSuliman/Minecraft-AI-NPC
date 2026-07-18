@@ -34,6 +34,7 @@ import net.minecraft.world.Containers;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.npc.villager.Villager;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.ItemStack;
@@ -2765,7 +2766,7 @@ public final class AgentActionExecutor {
         return trimmed.contains(":") ? trimmed : "minecraft:" + trimmed;
     }
 
-    private Item resolveKnownItem(String itemId) {
+    private Item exactRegisteredItem(String itemId) {
         String normalized = normalizeMinecraftId(itemId);
         if (normalized == null) return null;
         try {
@@ -2776,15 +2777,48 @@ public final class AgentActionExecutor {
         }
     }
 
-    private Block resolveKnownBlock(String blockId) {
-        String normalized = normalizeMinecraftId(blockId);
-        if (normalized == null) return null;
-        try {
-            Identifier key = Identifier.parse(normalized);
-            return BuiltInRegistries.BLOCK.get(key).map(ref -> ref.value()).orElse(null);
-        } catch (Exception e) {
+    private Item resolveKnownItem(String itemId) {
+        Item exact = exactRegisteredItem(itemId);
+        if (exact != null) {
+            return exact;
+        }
+        if (itemId == null || itemId.isBlank() || itemId.equalsIgnoreCase("none")) {
             return null;
         }
+        return resolveItemFromRecipePhrase(itemId.replace("minecraft:", "").replace('_', ' '));
+    }
+
+    private Block resolveKnownBlock(String blockId) {
+        String normalized = normalizeMinecraftId(blockId);
+        if (normalized != null) {
+            try {
+                Identifier key = Identifier.parse(normalized);
+                Block exact = BuiltInRegistries.BLOCK.get(key).map(ref -> ref.value()).orElse(null);
+                if (exact != null) {
+                    return exact;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        Item item = resolveKnownItem(blockId);
+        if (item instanceof BlockItem blockItem) {
+            return blockItem.getBlock();
+        }
+        return null;
+    }
+
+    private String canonicalItemId(String itemId) {
+        if (itemId == null || itemId.isBlank() || itemId.equalsIgnoreCase("none")) {
+            return itemId;
+        }
+        if (exactRegisteredItem(itemId) != null) {
+            return normalizeMinecraftId(itemId);
+        }
+        Item resolved = resolveKnownItem(itemId);
+        if (resolved == null || resolved == Items.AIR) {
+            return itemId;
+        }
+        return BuiltInRegistries.ITEM.getKey(resolved).toString();
     }
 
 
@@ -3340,7 +3374,7 @@ public final class AgentActionExecutor {
 
         return new ParsedTradeIntent(
                 llmIntent.type(),
-                itemId == null ? "" : itemId,
+                itemId == null ? "" : canonicalItemId(itemId),
                 quantity,
                 counter);
     }
