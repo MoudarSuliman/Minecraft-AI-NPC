@@ -1808,43 +1808,69 @@ public final class AgentActionExecutor {
             return false;
         }
 
-        BlockPos targetPos;
         if (parameters.has("x") && parameters.has("y") && parameters.has("z")) {
-            targetPos = new BlockPos(
+            BlockPos targetPos = new BlockPos(
                     parameters.get("x").getAsInt(),
                     parameters.get("y").getAsInt(),
                     parameters.get("z").getAsInt());
-        } else if (parameters.has("block")) {
-            String blockId = parameters.get("block").getAsString().toLowerCase();
-            Block targetBlock = resolveKnownBlock(blockId);
-            if (targetBlock == null) {
-                notifyNearbyPlayers(server, villager, "[LLM NPC] Unsupported mine block: " + blockId);
-                return false;
+            boolean moving = villager.getNavigation().moveTo(
+                    targetPos.getX() + 0.5,
+                    targetPos.getY() + 0.5,
+                    targetPos.getZ() + 0.5,
+                    0.9);
+            if (villager.distanceToSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5) > 4.0) {
+                return moving;
             }
-            targetPos = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
-            if (targetPos == null) {
-                notifyNearbyPlayers(server, villager, "[LLM NPC] Could not find nearby " + blockId + " to mine.");
-                return false;
+            boolean removed = level.removeBlock(targetPos, false);
+            if (removed) {
+                notifyNearbyPlayers(server, villager, "[LLM NPC] Mined block at " + targetPos.getX() + ", "
+                        + targetPos.getY() + ", " + targetPos.getZ() + ".");
             }
-        } else {
-            return false;
+            return removed;
         }
 
+        if (!parameters.has("block")) {
+            return false;
+        }
+        String blockId = parameters.get("block").getAsString().toLowerCase();
+        int count = parameters.has("count") ? Math.max(1, Math.min(16, parameters.get("count").getAsInt())) : 1;
+        Block targetBlock = resolveKnownBlock(blockId);
+        if (targetBlock == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Unsupported mine block: " + blockId);
+            return false;
+        }
+        BlockPos first = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
+        if (first == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Could not find nearby " + blockId + " to mine.");
+            return false;
+        }
         boolean moving = villager.getNavigation().moveTo(
-                targetPos.getX() + 0.5,
-                targetPos.getY() + 0.5,
-                targetPos.getZ() + 0.5,
+                first.getX() + 0.5,
+                first.getY() + 0.5,
+                first.getZ() + 0.5,
                 0.9);
-        if (villager.distanceToSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5) > 4.0) {
+        if (villager.distanceToSqr(first.getX() + 0.5, first.getY() + 0.5, first.getZ() + 0.5) > 4.0) {
             return moving;
         }
 
-        boolean removed = level.removeBlock(targetPos, false);
-        if (removed) {
-            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined block at " + targetPos.getX() + ", "
-                    + targetPos.getY() + ", " + targetPos.getZ() + ".");
+        int mined = 0;
+        while (mined < count) {
+            BlockPos pos = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
+            if (pos == null || !level.removeBlock(pos, false)) {
+                break;
+            }
+            mined++;
         }
-        return removed;
+        if (mined == 0) {
+            return false;
+        }
+        if (mined < count) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined " + mined + "x " + blockId
+                    + " nearby; no more within reach (asked for " + count + ").");
+        } else {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined " + mined + "x " + blockId + " nearby.");
+        }
+        return true;
     }
 
     private boolean startMineToChestTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {

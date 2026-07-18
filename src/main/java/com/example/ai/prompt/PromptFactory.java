@@ -49,7 +49,7 @@ public final class PromptFactory {
                 + "9. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
                 + "10. Order to find/locate/search for/lead to a creature -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}.\n"
                 + "11. Order to bring/fetch an item -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
-                + "12. Order to mine a block -> mine_block {\"block\":\"minecraft:...\"}. Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "12. Order to mine a block -> mine_block {\"block\":\"minecraft:...\",\"count\":1} — set count to the number the player asked for (1 if unspecified; if the message is just a number answering 'how many', take the block from previous_instruction). Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
                 + "13. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
                 + "14. Message is genuinely ambiguous — unresolved pronoun ('do it', 'use those') or no identifiable request -> ask_clarification with parameters {\"text\":\"<one short question asking the player what they mean>\"}.\n"
                 + "15. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
@@ -68,6 +68,7 @@ public final class PromptFactory {
                 + "'what do you sell?' -> trade_offer. 'how much does wood cost?' -> trade_offer. 'I want to buy wood' -> trade_offer. 'do you have oak logs?' -> trade_offer.\n"
                 + "'find me a chicken' -> search_entity. 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
                 + "'stop' -> cancel_task. 'come back' -> cancel_task. 'stop building' -> cancel_task.\n"
+                + "'mine some stone' -> mine_block {\"block\":\"minecraft:stone\",\"count\":1}. 'mine 3 grass blocks' -> mine_block {\"block\":\"minecraft:grass_block\",\"count\":3}.\n"
                 + "'do it' (nothing to refer to) -> ask_clarification.";
 
     private static final String ACTION_SELECTION_RULES_IDLE =
