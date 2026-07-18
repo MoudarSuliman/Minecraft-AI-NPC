@@ -70,7 +70,6 @@ public final class AgentActionExecutor {
     private static final int SCOUT_MAX_DISTANCE = 96;
     private static final int SCOUT_SURVEY_TICKS = 20;
     private static final long SCOUT_STATUS_COOLDOWN_MILLIS = 6_000L;
-    private static final double TRADE_INTENT_CONFIDENCE_THRESHOLD = 0.6;
     private static final boolean TRADE_DEBUG_CHAT = true;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
     private static final long TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS = 45_000L;
@@ -3199,29 +3198,8 @@ public final class AgentActionExecutor {
         try {
             rawClassified = llmRouter.generate(prompt);
             classified = tradeIntentClassifierParser.parse(rawClassified);
-            if (classified.intent() == TradeIntentType.NONE) {
-                String recoveryPrompt = promptFactory.tradeIntentRecoveryPrompt(
-                        instruction,
-                        session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
-                        tradeStockSummary(server, villager),
-                        session.lastRequestedItemId);
-                String recoveryRaw = llmRouter.generate(recoveryPrompt);
-                TradeIntentClassifierDraft recovered = tradeIntentClassifierParser.parse(recoveryRaw);
-                rawClassified = recoveryRaw;
-                if (recovered.intent() != TradeIntentType.NONE) {
-                    classified = recovered;
-                }
-            }
         } finally {
             tradeLlmInFlightByNpc.put(npcId, false);
-        }
-        if (classified.intent() != TradeIntentType.NONE && classified.confidence() <= 0.0) {
-            classified = new TradeIntentClassifierDraft(
-                    classified.intent(),
-                    classified.itemId(),
-                    classified.quantity(),
-                    classified.counterTotalPrice(),
-                    0.7);
         }
 
         logger.info(
@@ -3247,13 +3225,6 @@ public final class AgentActionExecutor {
         if (classified.intent() == TradeIntentType.NONE) {
             logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: none intent", villager.getName().getString());
             return ParsedTradeIntent.none();
-        }
-        if (classified.confidence() < TRADE_INTENT_CONFIDENCE_THRESHOLD) {
-            logger.info(
-                    "[TRADE-DEBUG] npc={} trade_intent_llm low confidence {} < {}, proceeding because intent is non-none",
-                    villager.getName().getString(),
-                    classified.confidence(),
-                    TRADE_INTENT_CONFIDENCE_THRESHOLD);
         }
         if (classified.intent() == TradeIntentType.ACCEPT_OFFER && session.activeOffer == null) {
             logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: accept_offer without active offer",

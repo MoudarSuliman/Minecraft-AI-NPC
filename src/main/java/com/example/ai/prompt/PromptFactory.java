@@ -444,39 +444,6 @@ public final class PromptFactory {
         return sb.toString();
     }
 
-    public String tradeIntentRecoveryPrompt(
-            String playerText,
-            String activeOfferSummary,
-            String stockSummary,
-            String lastRequestedItemId
-    ) {
-        String safePlayerText = playerText == null ? "" : playerText;
-        String safeActiveOffer = activeOfferSummary == null ? "" : activeOfferSummary;
-        String safeStockSummary = stockSummary == null ? "" : stockSummary;
-        String safeLastItem = lastRequestedItemId == null ? "" : lastRequestedItemId;
-
-        return "You are a Minecraft trade intent classifier.\n"
-                + "Classify the player's trade intent.\n"
-                + "Player utterance: " + safePlayerText + "\n"
-                + "Active offer: " + safeActiveOffer + "\n"
-                + "Stock summary: " + safeStockSummary + "\n"
-                + "Last requested item id: " + safeLastItem + "\n"
-                + "Rules:\n"
-                + "- 'do you have X', 'how many X', 'what do you sell' => inquire_stock.\n"
-                + "- 'where are X', 'where can i find X', 'you said you had X' => inquire_stock.\n"
-                + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n- 'what is the recipe for X', 'how do I craft X', 'how to make X' => none (not trade).\n"
-                + "- 'scout X', 'explore ahead', 'check the area', 'report back', 'go check out east', 'go look around', 'go see what is there', 'go check out X and let me know', 'go have a look' => none (not trade, it is a scouting request).\n"
-                + "- active offer + 'deal/yes/sure' => accept_offer.\n"
-                + "- active offer + 'no/nope/not now' => decline_offer.\n"
-                + "- explicit emerald counter => counter_offer with counter_total_price.\n"
-                                + "- If follow-up omits item and last requested item exists, reuse it.\n"
-                + "- Use none only if unrelated to trade.\n"
-                + "- Scout/explore/check area instructions are not trade.\n"
-                + "Return ONLY this JSON object with no extra text:\n"
-                + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
-                + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
-    }
-
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory) {
         return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, null, null);
