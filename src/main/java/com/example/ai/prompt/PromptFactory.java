@@ -17,7 +17,7 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "", "");
     }
 
     public String actionSelectionPrompt(
@@ -29,7 +29,7 @@ public final class PromptFactory {
             String targetHint,
             String previousInstruction
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "", "");
     }
 
     private static final String ACTION_SELECTION_SCHEMA =
@@ -55,6 +55,7 @@ public final class PromptFactory {
                 + "15. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
                 + "ADDITIONAL RULES:\n"
                 + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
+                + "- If pending_clarification is present, the NPC just asked the player the question in it about the original instruction in it. If latest_instruction answers that question ('cobblestone', 'the hut', 'the second one'), classify the original instruction as completed by that answer and fill parameters from both. If latest_instruction questions or comments on the NPC's question ('why', 'what do you mean'), use dialogue_reply. If it is a new unrelated request, route it normally and ignore pending_clarification.\n"
                 + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
                 + "- If the NPC only SUGGESTED an action in dialogue and the player replies with enthusiasm or a question ('sounds good', 'where will you go?') without a direct command, use dialogue_reply to ask for confirmation instead of starting the action.\n"
                 + "- If target_hint is non-empty, copy it into parameters.block or parameters.item_id.\n"
@@ -79,7 +80,8 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint,
             String previousInstruction,
-            String activeOfferSummary
+            String activeOfferSummary,
+            String pendingClarificationSummary
     ) {
         StringBuilder sb = new StringBuilder(8192);
         sb.append("You are an embodied Minecraft NPC. Decide the NPC's next action.\n");
@@ -98,6 +100,9 @@ public final class PromptFactory {
         data.addProperty("target_hint", targetHint);
         if (activeOfferSummary != null && !activeOfferSummary.isBlank()) {
             data.addProperty("active_offer", activeOfferSummary);
+        }
+        if (pendingClarificationSummary != null && !pendingClarificationSummary.isBlank()) {
+            data.addProperty("pending_clarification", pendingClarificationSummary);
         }
         data.add("perception", snapshot.toJson());
         data.add("memory", memoryToJson(memory));

@@ -44,6 +44,10 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, Boolean> llmInFlight = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastProcessedInstructionByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingClarification> pendingClarificationByNpc = new ConcurrentHashMap<>();
+
+    private record PendingClarification(String originalInstruction, String question, long expiresAtMillis) {
+    }
 
     private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Set<UUID> thinkingNpcs = ConcurrentHashMap.newKeySet();
@@ -253,8 +257,17 @@ public final class AutonomousNpcRuntime {
                                     String previousInstruction,
                                     long now, boolean hasPendingInstruction) {
         String activeOffer = actionExecutor.activeOfferSummary(npcId, handle.ownerPlayerId());
+        PendingClarification pendingClarification = pendingClarificationByNpc.get(npcId);
+        if (pendingClarification != null && System.currentTimeMillis() > pendingClarification.expiresAtMillis()) {
+            pendingClarificationByNpc.remove(npcId);
+            pendingClarification = null;
+        }
+        String pendingClarificationSummary = pendingClarification == null ? ""
+                : "original_instruction='" + pendingClarification.originalInstruction()
+                        + "'; npc_question='" + pendingClarification.question() + "'";
         String prompt = promptFactory.actionSelectionPrompt(
-                snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction, activeOffer);
+                snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction, activeOffer,
+                pendingClarificationSummary);
 
         llmInFlight.put(npcId, true);
         String raw;
@@ -266,6 +279,11 @@ public final class AutonomousNpcRuntime {
 
         AgentDecision decision = decisionParser.parse(raw);
         lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase());
+        if (decision.intent() != AgentIntentType.ASK_CLARIFICATION
+                && decision.intent() != AgentIntentType.DIALOGUE_REPLY
+                && decision.intent() != AgentIntentType.IDLE) {
+            pendingClarificationByNpc.remove(npcId);
+        }
 
         if (decision.intent() == AgentIntentType.CANCEL_TASK) {
             boolean cancelled = actionExecutor.cancelActiveTasks(server, npcId, handle.npcName());
@@ -373,6 +391,10 @@ public final class AutonomousNpcRuntime {
             if (question.isBlank()) {
                 question = "I'm not sure what you mean — could you say that another way?";
             }
+            PendingClarification existing = pendingClarificationByNpc.get(npcId);
+            String original = existing != null ? existing.originalInstruction() : latestInstruction;
+            pendingClarificationByNpc.put(npcId,
+                    new PendingClarification(original, question, System.currentTimeMillis() + 90_000L));
             actionExecutor.sayAsNpc(server, npcId, handle.npcName(), question);
             pendingInstruction.put(npcId, false);
             nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
