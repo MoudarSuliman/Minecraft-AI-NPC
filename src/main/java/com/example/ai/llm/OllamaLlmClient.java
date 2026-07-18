@@ -28,6 +28,9 @@ public final class OllamaLlmClient implements LlmClient {
         payload.addProperty("prompt", prompt);
         payload.addProperty("stream", false);
         payload.addProperty("format", "json");
+        // Keep the model loaded between requests; the default 5m unload causes
+        // multi-second cold reloads that surface as "LLM unavailable" backoffs.
+        payload.addProperty("keep_alive", "30m");
 
         HttpRequest request = HttpRequest.newBuilder(endpoint)
                 .timeout(Duration.ofSeconds(60))
