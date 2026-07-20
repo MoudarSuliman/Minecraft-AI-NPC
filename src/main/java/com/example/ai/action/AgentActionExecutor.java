@@ -44,6 +44,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.core.Direction;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -94,6 +95,7 @@ public final class AgentActionExecutor {
     private final TradeIntentClassifierParser tradeIntentClassifierParser = new TradeIntentClassifierParser();
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
+    private final Map<UUID, List<BlockPos>> lastBuildBlocks = new ConcurrentHashMap<>();
     private final Map<UUID, List<String>> completedTaskSummaries = new ConcurrentHashMap<>();
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
@@ -1830,10 +1832,21 @@ public final class AgentActionExecutor {
             return removed;
         }
 
+        String scope = parameters.has("scope") ? parameters.get("scope").getAsString().toLowerCase(Locale.ROOT) : "single";
+        if (scope.equals("tree")) {
+            return fellNearbyTree(server, villager, level);
+        }
+        if (scope.equals("own_build")) {
+            return removeOwnBuild(server, villager, level);
+        }
+
         if (!parameters.has("block")) {
             return false;
         }
         String blockId = parameters.get("block").getAsString().toLowerCase();
+        if (scope.equals("area") || scope.equals("clear")) {
+            return clearNearbyBlocks(server, villager, level, blockId);
+        }
         int count = parameters.has("count") ? Math.max(1, Math.min(16, parameters.get("count").getAsInt())) : 1;
         Block targetBlock = resolveKnownBlock(blockId);
         if (targetBlock == null) {
@@ -1872,6 +1885,172 @@ public final class AgentActionExecutor {
             notifyNearbyPlayers(server, villager, "[LLM NPC] Mined " + mined + "x " + blockId + " nearby.");
         }
         return true;
+    }
+
+    private boolean fellNearbyTree(MinecraftServer server, Villager villager, ServerLevel level) {
+        BlockPos base = findNearestMatching(level, villager.blockPosition(),
+                pos -> level.getBlockState(pos).is(BlockTags.LOGS), ENTITY_SCAN_RADIUS);
+        if (base == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I don't see a tree nearby to cut down.");
+            return false;
+        }
+        boolean moving = villager.getNavigation().moveTo(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5, 0.9);
+        if (villager.distanceToSqr(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5) > 9.0) {
+            return moving;
+        }
+        List<BlockPos> logs = floodFill(level, base, pos -> level.getBlockState(pos).is(BlockTags.LOGS), 256);
+        ServerPlayer receiver = nearestPlayer(server, villager);
+        int felled = 0;
+        for (BlockPos pos : logs) {
+            var state = level.getBlockState(pos);
+            if (!state.is(BlockTags.LOGS) || !level.removeBlock(pos, false)) {
+                continue;
+            }
+            felled++;
+            if (receiver != null) {
+                Item logItem = state.getBlock().asItem();
+                if (logItem != null && logItem != Items.AIR) {
+                    receiver.getInventory().add(new ItemStack(logItem, 1));
+                }
+            }
+        }
+        if (felled == 0) {
+            return false;
+        }
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Chopped down a tree (" + felled + " logs"
+                + (receiver != null ? ", delivered to " + receiver.getName().getString() : "") + ").");
+        return true;
+    }
+
+    private boolean clearNearbyBlocks(MinecraftServer server, Villager villager, ServerLevel level, String blockId) {
+        List<Block> targets = resolveBlockFamily(blockId);
+        if (targets.isEmpty()) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I don't know what '" + blockId + "' is to clear.");
+            return false;
+        }
+        BlockPos center = villager.blockPosition();
+        int radius = 10;
+        int cleared = 0;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -6; dy <= 6; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    var state = level.getBlockState(pos);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    for (Block target : targets) {
+                        if (state.is(target)) {
+                            if (level.removeBlock(pos, false)) {
+                                cleared++;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (cleared == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't find any " + blockId + " nearby to clear.");
+            return false;
+        }
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Cleared " + cleared + "x " + blockId + " nearby.");
+        return true;
+    }
+
+    private boolean removeOwnBuild(MinecraftServer server, Villager villager, ServerLevel level) {
+        List<BlockPos> built = lastBuildBlocks.get(villager.getUUID());
+        if (built == null || built.isEmpty()) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I haven't built anything I can take down.");
+            return false;
+        }
+        int removed = 0;
+        for (BlockPos pos : built) {
+            if (!level.getBlockState(pos).isAir() && level.removeBlock(pos, false)) {
+                removed++;
+            }
+        }
+        lastBuildBlocks.remove(villager.getUUID());
+        if (removed == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] My last build is already gone.");
+            return false;
+        }
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Took down my last build (" + removed + " blocks).");
+        return true;
+    }
+
+    private List<Block> resolveBlockFamily(String blockId) {
+        List<Block> result = new ArrayList<>();
+        String lower = blockId == null ? "" : blockId.toLowerCase(Locale.ROOT).replace("minecraft:", "").trim();
+        if (lower.equals("torch") || lower.equals("torches")) {
+            addIfPresent(result, "minecraft:torch");
+            addIfPresent(result, "minecraft:wall_torch");
+            return result;
+        }
+        Block direct = resolveKnownBlock(blockId);
+        if (direct != null) {
+            result.add(direct);
+        }
+        return result;
+    }
+
+    private void addIfPresent(List<Block> list, String id) {
+        Block block = resolveKnownBlock(id);
+        if (block != null) {
+            list.add(block);
+        }
+    }
+
+    private BlockPos findNearestMatching(ServerLevel level, BlockPos center,
+            java.util.function.Predicate<BlockPos> match, int radius) {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -16; dy <= 16; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    if (!match.test(pos)) {
+                        continue;
+                    }
+                    double distance = squaredDistance(center, pos);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = pos.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private List<BlockPos> floodFill(ServerLevel level, BlockPos start,
+            java.util.function.Predicate<BlockPos> match, int limit) {
+        List<BlockPos> result = new ArrayList<>();
+        java.util.Set<BlockPos> visited = new java.util.HashSet<>();
+        java.util.Deque<BlockPos> queue = new java.util.ArrayDeque<>();
+        queue.add(start.immutable());
+        visited.add(start.immutable());
+        while (!queue.isEmpty() && result.size() < limit) {
+            BlockPos pos = queue.poll();
+            if (!match.test(pos)) {
+                continue;
+            }
+            result.add(pos);
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        BlockPos next = pos.offset(dx, dy, dz).immutable();
+                        if (visited.add(next) && match.test(next)) {
+                            queue.add(next);
+                        }
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private boolean startMineToChestTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
@@ -3833,6 +4012,7 @@ public final class AgentActionExecutor {
         lastScenarioDescByNpc.put(npcId, desc);
         ScenarioTask task = new ScenarioTask(
                 nearest.getUUID(), nearest.getName().getString(), plan.scenario(), plan.steps());
+        lastBuildBlocks.remove(npcId);
         activeScenarioTasks.put(npcId, task);
         String announce = plan.announce() == null || plan.announce().isBlank()
                 ? "Starting " + plan.scenario() + "."
@@ -3885,6 +4065,7 @@ public final class AgentActionExecutor {
         lastScenarioDescByNpc.put(npcId, instruction);
         ScenarioTask task = new ScenarioTask(
                 player.getUUID(), player.getName().getString(), plan.scenario(), plan.steps());
+        lastBuildBlocks.remove(npcId);
         activeScenarioTasks.put(npcId, task);
         lastActionSummaryByNpc.put(npcId, buildScenarioPlanSummary(plan));
         String announce = plan.announce() == null || plan.announce().isBlank()
@@ -4322,6 +4503,7 @@ public final class AgentActionExecutor {
 
         int placed = 0;
         int skippedOccupied = 0;
+        List<BlockPos> placedPositions = new ArrayList<>();
         for (BlockPos pos : positions) {
             if (wouldSuffocateEntity(level, pos)) {
                 skippedOccupied++;
@@ -4329,8 +4511,12 @@ public final class AgentActionExecutor {
             }
             if (overwrite || level.getBlockState(pos).isAir()) {
                 level.setBlockAndUpdate(pos, block.defaultBlockState());
+                placedPositions.add(pos.immutable());
                 placed++;
             }
+        }
+        if (!placedPositions.isEmpty()) {
+            lastBuildBlocks.computeIfAbsent(villager.getUUID(), ignored -> new ArrayList<>()).addAll(placedPositions);
         }
         if (skippedOccupied > 0) {
             logger.info("[SCENARIO] Skipped {} positions occupied by living entities in {} pattern", skippedOccupied, patternKey);
