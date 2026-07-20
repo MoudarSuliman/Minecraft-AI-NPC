@@ -182,6 +182,7 @@ public final class AutonomousNpcRuntime {
             String instruction  = instructionTextFromEntry(latestEntry);
 
             thinkingNpcs.add(npcId);
+            actionExecutor.notifyThinking(server, npcId, handle.npcName());
             llmExecutor.submit(() -> {
                 try {
                     processInstruction(server, handle, npcId, memory, snapshot,

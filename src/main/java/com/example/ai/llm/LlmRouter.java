@@ -1,8 +1,13 @@
 package com.example.ai.llm;
 
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class LlmRouter {
+    public static final String UNAVAILABLE_SENTINEL = "llm unavailable";
+
+    private static final Logger LOG = LoggerFactory.getLogger("llm_npc");
+
     private final LlmClient primary;
     private final LlmClient escalated;
 
@@ -38,18 +43,30 @@ public final class LlmRouter {
     }
 
     public String generate(String prompt) {
+        long startMillis = System.currentTimeMillis();
         try {
-            if (shouldEscalate(prompt)) {
-                return escalated.generate(prompt);
-            }
-            return primary.generate(prompt);
+            String response = shouldEscalate(prompt) ? escalated.generate(prompt) : primary.generate(prompt);
+            logTraffic(prompt, response, startMillis, null);
+            return response;
         } catch (Exception primaryError) {
             try {
-                return escalated.generate(prompt);
+                String response = escalated.generate(prompt);
+                logTraffic(prompt, response, startMillis, "recovered-on-fallback");
+                return response;
             } catch (Exception fallbackError) {
-                return "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"llm unavailable\",\"priority\":0.05}";
+                LOG.warn("[LLM] request failed after {} ms: {}",
+                        System.currentTimeMillis() - startMillis, fallbackError.getMessage());
+                return "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"" + UNAVAILABLE_SENTINEL + "\",\"priority\":0.05}";
             }
         }
+    }
+
+    private void logTraffic(String prompt, String response, long startMillis, String note) {
+        LOG.info("[LLM] sent={} chars, received={} chars, latency={} ms{}",
+                prompt == null ? 0 : prompt.length(),
+                response == null ? 0 : response.length(),
+                System.currentTimeMillis() - startMillis,
+                note == null ? "" : " (" + note + ")");
     }
 
     private boolean shouldEscalate(String prompt) {

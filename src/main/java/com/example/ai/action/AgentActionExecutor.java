@@ -3322,6 +3322,14 @@ public final class AgentActionExecutor {
         speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
     }
 
+    public void notifyThinking(MinecraftServer server, UUID npcId, String fallbackName) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return;
+        ServerPlayer player = nearestPlayer(server, villager);
+        if (player == null) return;
+        player.sendSystemMessage(Component.literal("§7" + fallbackName + " is thinking…"), true);
+    }
+
     public boolean cancelActiveTasks(MinecraftServer server, UUID npcId, String fallbackName) {
         Set<String> cancelled = new LinkedHashSet<>();
         if (activeScoutTasks.remove(npcId) != null) cancelled.add("scouting");
@@ -3879,6 +3887,10 @@ public final class AgentActionExecutor {
                 villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory,
                 scenarioContext, tradeContext);
         String replyRaw = llmRouter.generate(replyPrompt);
+        if (replyRaw != null && replyRaw.contains(LlmRouter.UNAVAILABLE_SENTINEL)) {
+            speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
+            return true;
+        }
         String text = parseDialogueText(replyRaw);
         if (text == null || text.isBlank()) {
             text = "Hmm, I'm not sure how to respond to that.";
