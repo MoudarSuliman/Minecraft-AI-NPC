@@ -32,6 +32,8 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Containers;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.npc.villager.Villager;
 import net.minecraft.world.item.BlockItem;
@@ -4204,6 +4206,14 @@ public final class AgentActionExecutor {
         ServerPlayer player = findPlayerByName(server, playerName);
         if (player == null || player.level() != villager.level()) return false;
         if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+        if (!isSearchableCreature(entityId)) {
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to find '" + (entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId)
+                            + "', but that is not a living creature you can track down. Explain you can only locate animals and mobs, "
+                            + "and offer to scout the area or fetch an item from a chest instead.",
+                    "I can only track down living creatures, not that. I can scout the area or fetch items from a chest, though."));
+            return true;
+        }
         if (activeSearchTasks.containsKey(npcId)) {
             String label = entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId;
             speakSearchStatusWithLlm(server, villager, fallbackName, player.getName().getString(),
@@ -4252,6 +4262,23 @@ public final class AgentActionExecutor {
                 "direction=" + direction + "; distance=" + distance + "; objective=" + instruction,
                 "I will scout the area and report back.");
         return true;
+    }
+
+    private boolean isSearchableCreature(String entityId) {
+        String normalized = normalizeMinecraftId(entityId);
+        if (normalized == null) {
+            return false;
+        }
+        try {
+            Identifier key = Identifier.parse(normalized);
+            EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(key).map(ref -> ref.value()).orElse(null);
+            if (type == null) {
+                return false;
+            }
+            return type.getCategory() != MobCategory.MISC;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private boolean isScenarioIntent(String raw) {
