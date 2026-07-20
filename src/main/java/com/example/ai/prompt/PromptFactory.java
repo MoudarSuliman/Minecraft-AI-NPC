@@ -416,6 +416,7 @@ public final class PromptFactory {
             + "- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n"
             + "- CRITICAL: If the player asks you to perform an action NOT in your abilities list (e.g. pick up dropped items, carry items in hand, craft items, follow the player, attack mobs), you MUST decline honestly and suggest what you CAN do instead. NEVER agree to do something you are not able to do. Saying 'sure' or 'let me do that' for impossible actions is forbidden.\n"
             + "- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data below. Do not invent.\n"
+            + "- If asked about threats, danger, or hostile mobs: list every nearby entity marked [HOSTILE], with its distance. If none are marked hostile, say the area looks clear. Never claim you see no threats when a [HOSTILE] entity is listed.\n"
             + "- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' below. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n"
             + "- If asked about what was just said: use the recent conversation section.\n"
             + "- Never invent facts, events, or task names not present in the data below.\n"
@@ -443,7 +444,9 @@ public final class PromptFactory {
                 sb.append("Nearby entities (what I can see right now):\n");
                 for (WorldSnapshot.SeenEntity e : snapshot.nearbyEntities()) {
                     sb.append("  - ").append(e.name()).append(" (").append(e.type()).append(")")
-                      .append(" at ").append(String.format("%.1f", e.distance())).append(" blocks\n");
+                      .append(" at ").append(String.format("%.1f", e.distance())).append(" blocks")
+                      .append(isHostileType(e.type()) ? " [HOSTILE — a threat]" : "")
+                      .append("\n");
                 }
             } else {
                 sb.append("Nearby entities: none visible\n");
@@ -656,6 +659,20 @@ public final class PromptFactory {
                 + "\"announce\":\"one sentence plan\","
                 + "\"steps\":["
                 + "{\"intent\":\"step_intent\",\"parameters\":{},\"description\":\"short description\"}]}";
+    }
+
+    private boolean isHostileType(String entityType) {
+        if (entityType == null) {
+            return false;
+        }
+        String lower = entityType.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("zombie") || lower.contains("skeleton") || lower.contains("creeper")
+                || lower.contains("spider") || lower.contains("witch") || lower.contains("slime")
+                || lower.contains("enderman") || lower.contains("blaze") || lower.contains("drowned")
+                || lower.contains("warden") || lower.contains("pillager") || lower.contains("vindicator")
+                || lower.contains("husk") || lower.contains("stray") || lower.contains("phantom")
+                || lower.contains("ravager") || lower.contains("piglin") || lower.contains("hoglin")
+                || lower.contains("ghast") || lower.contains("wither") || lower.contains("vex");
     }
 
     private JsonArray recentShortTerm(MemoryContext memory, int limit) {

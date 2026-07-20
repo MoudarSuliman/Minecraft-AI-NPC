@@ -73,6 +73,7 @@ public final class AgentActionExecutor {
     private static final int SEARCH_PATROL_STALL_TICKS = 40;
     private static final long SEARCH_STATUS_COOLDOWN_MILLIS = 6_000L;
     private static final long SEARCH_TRADE_SUPPRESS_MILLIS = 60_000L;
+    private static final int ENTITY_SCAN_RADIUS = 28;
     private static final int SCOUT_BASE_DISTANCE = 48;
     private static final int SCOUT_MAX_DISTANCE = 96;
     private static final int SCOUT_SURVEY_TICKS = 20;
@@ -158,7 +159,7 @@ public final class AgentActionExecutor {
 
         BlockPos center = villager.blockPosition();
         Map<String, Integer> nearbyBlocks = scanNearbyBlocks(level, center, 8);
-        List<WorldSnapshot.SeenEntity> nearbyEntities = scanNearbyEntities(level, villager, 16);
+        List<WorldSnapshot.SeenEntity> nearbyEntities = scanNearbyEntities(level, villager, ENTITY_SCAN_RADIUS);
         WorldSnapshot.EnvironmentContext environment = buildEnvironmentContext(level, center, nearbyEntities);
         return perceptionService.capture(
                 fallbackName,
