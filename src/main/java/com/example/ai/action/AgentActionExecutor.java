@@ -98,6 +98,17 @@ public final class AgentActionExecutor {
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
     private final Map<UUID, List<BlockPos>> lastBuildBlocks = new ConcurrentHashMap<>();
+    private final Map<UUID, FellTreeTask> activeFellTasks = new ConcurrentHashMap<>();
+
+    private static final class FellTreeTask {
+        private final BlockPos base;
+        private final long deadlineMillis;
+
+        private FellTreeTask(BlockPos base, long deadlineMillis) {
+            this.base = base;
+            this.deadlineMillis = deadlineMillis;
+        }
+    }
     private final Map<UUID, List<String>> completedTaskSummaries = new ConcurrentHashMap<>();
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
@@ -328,6 +339,15 @@ public final class AgentActionExecutor {
             boolean active = advanceScenarioTask(server, villager, fallbackName, scenarioTask);
             if (!active) {
                 activeScenarioTasks.remove(npcId);
+            }
+            return active;
+        }
+
+        FellTreeTask fellTask = activeFellTasks.get(npcId);
+        if (fellTask != null) {
+            boolean active = advanceFellTreeTask(server, villager, fellTask);
+            if (!active) {
+                activeFellTasks.remove(npcId);
             }
             return active;
         }
@@ -1915,10 +1935,30 @@ public final class AgentActionExecutor {
             notifyNearbyPlayers(server, villager, "[LLM NPC] I don't see a tree nearby to cut down.");
             return false;
         }
-        boolean moving = villager.getNavigation().moveTo(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5, 0.9);
-        if (villager.distanceToSqr(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5) > 9.0) {
-            return moving;
+        if (villager.distanceToSqr(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5) <= 9.0) {
+            return fellTreeAt(server, villager, level, base);
         }
+        villager.getNavigation().moveTo(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5, 0.9);
+        activeFellTasks.put(villager.getUUID(), new FellTreeTask(base, System.currentTimeMillis() + 30_000L));
+        return true;
+    }
+
+    private boolean advanceFellTreeTask(MinecraftServer server, Villager villager, FellTreeTask task) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return false;
+        }
+        double distSqr = villager.distanceToSqr(task.base.getX() + 0.5, task.base.getY() + 0.5, task.base.getZ() + 0.5);
+        if (distSqr <= 9.0 || System.currentTimeMillis() > task.deadlineMillis) {
+            fellTreeAt(server, villager, level, task.base);
+            return false;
+        }
+        if (villager.getNavigation().isDone()) {
+            villager.getNavigation().moveTo(task.base.getX() + 0.5, task.base.getY() + 0.5, task.base.getZ() + 0.5, 0.9);
+        }
+        return true;
+    }
+
+    private boolean fellTreeAt(MinecraftServer server, Villager villager, ServerLevel level, BlockPos base) {
         List<BlockPos> logs = floodFill(level, base, pos -> level.getBlockState(pos).is(BlockTags.LOGS), 256);
         ServerPlayer receiver = nearestPlayer(server, villager);
         int felled = 0;
@@ -2744,6 +2784,7 @@ public final class AgentActionExecutor {
                 || activeDeliveries.containsKey(npcId)
                 || activeSearchTasks.containsKey(npcId)
                 || activeScoutTasks.containsKey(npcId)
+                || activeFellTasks.containsKey(npcId)
                 || activeScenarioTasks.containsKey(npcId)) {
             return true;
         }
@@ -3405,6 +3446,7 @@ public final class AgentActionExecutor {
         if (activeSearchTasks.remove(npcId) != null) cancelled.add("searching");
         if (activeMineToChest.remove(npcId) != null) cancelled.add("mining");
         if (activeMineToPlayer.remove(npcId) != null) cancelled.add("mining");
+        if (activeFellTasks.remove(npcId) != null) cancelled.add("chopping");
         if (activeScenarioTasks.remove(npcId) != null) cancelled.add("building");
         if (activeDeliveries.remove(npcId) != null) cancelled.add("fetching");
         Villager villager = findVillager(server, npcId);
