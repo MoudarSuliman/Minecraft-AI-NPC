@@ -408,13 +408,7 @@ public final class AgentActionExecutor {
         if (ownerPlayerId == null) {
             return;
         }
-        if (activeScoutTasks.containsKey(npcId)) {
-            return;
-        }
-        if (activeSearchTasks.containsKey(npcId)) {
-            return;
-        }
-        if (activeScenarioTasks.containsKey(npcId)) {
+        if (hasActiveWork(npcId)) {
             return;
         }
         Villager villager = findVillager(server, npcId);
