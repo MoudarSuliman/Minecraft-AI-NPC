@@ -61,7 +61,7 @@ public final class PromptFactory {
                 + "15. Anything else — including all conversation, greetings, small talk, opinions, and questions about the NPC or the world -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
                 + "ADDITIONAL RULES:\n"
                 + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
-                + "- If active_offer is NOT present and latest_instruction is a plain go-ahead ('yes', 'yes please', 'do it', 'go ahead', 'sure, build it') and previous_instruction asked about a task ('can you build a pillar?'), classify previous_instruction as a direct order now and fill parameters from previous_instruction (for build_structure set description to previous_instruction, not to the go-ahead words).\n"
+                + "- If active_offer is NOT present and latest_instruction is a plain go-ahead ('yes', 'yes please', 'yes pls', 'do it', 'go ahead', 'sounds great pls do') and previous_instruction or the NPC's last message in memory asked about or offered a task, classify that task as a direct order now, using the intent that task would get as a command: a chop/cut-tree offer -> mine_block {\"scope\":\"tree\"}, a build offer -> build_structure with description from the original request, a search offer -> search_entity. NEVER route a go-ahead for chopping to build_structure.\n"
                 + "- If pending_confirmation is present, the NPC has just asked the player to confirm the action described in it. An affirmative reply ('yes', 'yeah', 'ok', 'go ahead', 'do it', 'sure', 'please do') -> confirm_yes. A negative reply ('no', 'nope', 'never mind', 'don't', 'not now') -> confirm_no. If the message is instead a new unrelated request, ignore pending_confirmation and route it normally.\n"
                 + "- If pending_clarification is present, the NPC just asked the player the question in it about the original instruction in it. If latest_instruction answers that question ('cobblestone', 'the hut', 'the second one'), classify the original instruction as completed by that answer and fill parameters from both. If latest_instruction questions or comments on the NPC's question ('why', 'what do you mean'), use dialogue_reply. If it is a new unrelated request, route it normally and ignore pending_clarification.\n"
                 + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
@@ -78,7 +78,7 @@ public final class PromptFactory {
                 + "'find me a chicken' -> search_entity. 'find a pig' -> search_entity. 'find a sheep' -> search_entity (ALWAYS search_entity for a find/locate order, even if earlier conversation said otherwise). 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
                 + "'stop' -> cancel_task. 'come back' -> cancel_task. 'stop building' -> cancel_task. 'fk u' -> dialogue_reply. 'you suck' -> dialogue_reply.\n"
                 + "'mine some stone' -> mine_block {\"block\":\"minecraft:stone\",\"count\":1}. 'mine 3 grass blocks' -> mine_block {\"block\":\"minecraft:grass_block\",\"count\":3}.\n"
-                + "'cut down a tree' -> mine_block {\"scope\":\"tree\"}. 'get rid of the torches' -> mine_block {\"scope\":\"area\",\"block\":\"minecraft:torch\"}. 'break the house you built' -> mine_block {\"scope\":\"own_build\"}.\n"
+                + "'cut down a tree' -> mine_block {\"scope\":\"tree\"}. 'get rid of the torches' -> mine_block {\"scope\":\"area\",\"block\":\"minecraft:torch\"}. 'break the house you built' -> mine_block {\"scope\":\"own_build\"}. 'sounds great pls do' (previous_instruction='can you chop down a tree?') -> mine_block {\"scope\":\"tree\"}, NOT build_structure.\n"
                 + "'do it' (nothing to refer to) -> ask_clarification.";
 
     private static final String ACTION_SELECTION_RULES_IDLE =
@@ -598,6 +598,9 @@ public final class PromptFactory {
                 + "FIRST: If the player is NOT asking you to build, construct, place, or create a physical structure,\n"
                 + "return exactly: {\"scenario\":\"\",\"announce\":\"\",\"steps\":[]}\n"
                 + "Examples of non-build requests: greetings, trade questions, fetch/mine-only requests, questions about the world.\n"
+                + "CHOPPING, cutting, felling, breaking, demolishing, or removing ANYTHING is NEVER a build request:\n"
+                + "'chop down a tree' -> empty steps. 'cut a tree' -> empty steps. 'remove the wall' -> empty steps.\n"
+                + "Building means ADDING blocks to the world. If the request is about taking blocks away, return empty steps.\n"
                 + "\n"
                 + "Available step intents and their parameter formats:\n"
                 + "  fetch_from_chest: {\"item_id\":\"minecraft:cobblestone\", \"count\":9}\n"
