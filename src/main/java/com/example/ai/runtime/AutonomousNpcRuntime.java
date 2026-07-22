@@ -365,20 +365,9 @@ public final class AutonomousNpcRuntime {
             }
             return;
         }
-        if (decision.intent() == AgentIntentType.SEARCH_ENTITY) {
-            if (!isConfirmed(decision)) {
-                requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
-                return;
-            }
-            doSearch(server, handle, npcId, decision, latestInstruction, speaker);
-            return;
-        }
-        if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
-            if (!isConfirmed(decision)) {
-                requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
-                return;
-            }
-            doScout(server, handle, npcId, decision, latestInstruction, speaker);
+        if (decision.intent() == AgentIntentType.SEARCH_ENTITY
+                || decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
+            requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
             return;
         }
 
@@ -663,11 +652,6 @@ public final class AutonomousNpcRuntime {
             pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
         }
-    }
-
-    private boolean isConfirmed(AgentDecision decision) {
-        return decision.parameters().has("confirmed")
-                && decision.parameters().get("confirmed").getAsBoolean();
     }
 
     private void requestConfirmation(MinecraftServer server, AgentHandle handle, UUID npcId,
