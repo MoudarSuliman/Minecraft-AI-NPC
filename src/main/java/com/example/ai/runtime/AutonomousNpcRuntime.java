@@ -225,6 +225,9 @@ public final class AutonomousNpcRuntime {
         UUID playerId = agents.containsKey(npcId) ? agents.get(npcId).ownerPlayerId() : null;
         actionExecutor.clearActiveTradeOffer(npcId, playerId);
         actionExecutor.cancelAllActiveTasks(npcId);
+        pendingConfirmationByNpc.remove(npcId);
+        pendingClarificationByNpc.remove(npcId);
+        lastProcessedInstructionByNpc.remove(npcId);
     }
 
     public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester) {
