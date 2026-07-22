@@ -305,20 +305,24 @@ public final class AutonomousNpcRuntime {
             pendingConfirmationByNpc.remove(npcId);
             if (pendingConfirmation != null) {
                 executeConfirmedAction(server, handle, npcId, pendingConfirmation);
-            } else {
-                actionExecutor.sayAsNpc(server, npcId, handle.npcName(), "There's nothing waiting for me to confirm.");
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                return;
             }
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "There's nothing waiting for me to confirm.");
             return;
         }
         if (decision.intent() == AgentIntentType.CONFIRM_NO) {
-            pendingConfirmationByNpc.remove(npcId);
-            actionExecutor.sayAsNpc(server, npcId, handle.npcName(), "Alright, I won't do that.");
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
-            lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+            boolean hadPending = pendingConfirmationByNpc.remove(npcId) != null;
+            if (hadPending) {
+                actionExecutor.sayAsNpc(server, npcId, handle.npcName(), "Alright, I won't do that.");
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+                return;
+            }
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "Alright.");
             return;
         }
         // A new decision that is not a confirmation reply supersedes any pending confirmation.
@@ -326,14 +330,15 @@ public final class AutonomousNpcRuntime {
 
         if (decision.intent() == AgentIntentType.CANCEL_TASK) {
             boolean cancelled = actionExecutor.cancelActiveTasks(server, npcId, handle.npcName());
-            if (!cancelled) {
-                actionExecutor.sayAsNpc(server, npcId, handle.npcName(),
-                        "I'm not in the middle of anything right now.");
+            if (cancelled) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "cancel");
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+                return;
             }
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "cancel");
-            lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "I'm not in the middle of anything right now.");
             return;
         }
 
@@ -666,6 +671,21 @@ public final class AutonomousNpcRuntime {
             pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
         }
+    }
+
+    private void fallBackToDialogue(MinecraftServer server, AgentHandle handle, UUID npcId,
+                                    MemoryContext memory, WorldSnapshot snapshot,
+                                    String speaker, String latestInstruction, String lastResortLine) {
+        if (actionExecutor.tryHandleDialogueInstruction(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                latestInstruction, memory, snapshot)) {
+            storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
+        } else {
+            actionExecutor.sayAsNpc(server, npcId, handle.npcName(), lastResortLine);
+        }
+        pendingInstruction.put(npcId, false);
+        nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+        lastProcessedInstructionByNpc.put(npcId, latestInstruction);
     }
 
     private void requestConfirmation(MinecraftServer server, AgentHandle handle, UUID npcId,
