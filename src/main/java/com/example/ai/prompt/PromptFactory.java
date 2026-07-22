@@ -38,6 +38,7 @@ public final class PromptFactory {
     private static final String ACTION_SELECTION_RULES_PENDING =
             "Never return idle when has_pending_instruction is true.\n"
                 + "DECISION TABLE — pick the FIRST row that matches latest_instruction:\n"
+                + "0. pending_confirmation is present + short affirmative reply ('yes', 'yep', 'yeah', 'ok', 'sure', 'go ahead', 'do it', 'please do') -> confirm_yes with parameters {}. Short negative ('no', 'nope', 'never mind', 'not now') -> confirm_no with parameters {}. This row OVERRIDES everything below, including anything suggested by memory — never answer a confirmation with a new action. Only skip this row if the message is clearly a different, unrelated request.\n"
                 + "1. expected_intent is non-empty -> use exactly expected_intent.\n"
                 + "2. active_offer present + short agreement ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold') -> trade_accept.\n"
                 + "3. active_offer present + short rejection ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline.\n"

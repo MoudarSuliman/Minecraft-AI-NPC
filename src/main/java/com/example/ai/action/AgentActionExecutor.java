@@ -343,18 +343,25 @@ public final class AgentActionExecutor {
                 : new JsonObject();
         String reasoning = next.has("reasoning") ? next.get("reasoning").getAsString() : "";
 
-        boolean success = switch (intent) {
-            case "dialogue_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
-                    case "recipe_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
-                    case "scout_explorer" -> startScoutTask(server, npcId, villager, parameters);
-                    case "move_to" -> executeMove(server, villager, parameters);
-                    case "fetch_from_chest" -> startFetchTask(server, npcId, villager, parameters);
-                    case "mine_block" -> executeMineBlock(server, villager, parameters);
-                    case "mine_to_chest" -> startMineToChestTask(server, npcId, villager, parameters);
-                    case "mine_to_player" -> startMineToPlayerTask(server, npcId, villager, parameters);
-                    case "build_structure" -> startScenarioDirect(server, npcId, villager, fallbackName, parameters, reasoning);
-                    default -> true;
-                };
+        boolean success;
+        try {
+            success = switch (intent) {
+                case "dialogue_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
+                case "recipe_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
+                case "scout_explorer" -> startScoutTask(server, npcId, villager, parameters);
+                case "move_to" -> executeMove(server, villager, parameters);
+                case "fetch_from_chest" -> startFetchTask(server, npcId, villager, parameters);
+                case "mine_block" -> executeMineBlock(server, villager, parameters);
+                case "mine_to_chest" -> startMineToChestTask(server, npcId, villager, parameters);
+                case "mine_to_player" -> startMineToPlayerTask(server, npcId, villager, parameters);
+                case "build_structure" -> startScenarioDirect(server, npcId, villager, fallbackName, parameters, reasoning);
+                default -> true;
+            };
+        } catch (Exception e) {
+            logger.warn("Action execution failed: npc={} intent={} params={}", fallbackName, intent, parameters, e);
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't carry that out — could you rephrase?");
+            return false;
+        }
 
         logger.info("Action execution: npc={} intent={} success={}", fallbackName, intent, success);
         return success;
@@ -1760,6 +1767,17 @@ public final class AgentActionExecutor {
         return nearest;
     }
 
+    private String safeStringParam(JsonObject parameters, String key) {
+        if (parameters == null || !parameters.has(key)) {
+            return null;
+        }
+        var element = parameters.get(key);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+            return null;
+        }
+        return element.getAsString();
+    }
+
     private boolean startFetchTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
         return startFetchTask(server, npcId, villager, parameters, true);
     }
@@ -1768,11 +1786,12 @@ public final class AgentActionExecutor {
         if (!(villager.level() instanceof ServerLevel level)) {
             return false;
         }
-        if (!parameters.has("item_id")) {
+        String itemId = safeStringParam(parameters, "item_id");
+        if (itemId == null || itemId.isBlank() || itemId.contains("...")) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I'm not sure which item you mean — could you name it?");
             return false;
         }
-
-        String itemId = parameters.get("item_id").getAsString().toLowerCase();
+        itemId = itemId.toLowerCase();
         int count = parameters.has("count") ? Math.max(1, parameters.get("count").getAsInt()) : 1;
         Item item = resolveKnownItem(itemId);
         if (item == null) {

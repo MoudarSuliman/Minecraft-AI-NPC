@@ -416,10 +416,17 @@ public final class AutonomousNpcRuntime {
             lastProcessedInstructionByNpc.put(npcId, latestInstruction);
             return;
         }
-        if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST && !decision.parameters().has("item_id")) {
-            logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            return;
+        if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST) {
+            var itemElement = decision.parameters().get("item_id");
+            boolean validItem = itemElement != null && itemElement.isJsonPrimitive()
+                    && itemElement.getAsJsonPrimitive().isString()
+                    && !itemElement.getAsString().isBlank()
+                    && !itemElement.getAsString().contains("...");
+            if (!validItem) {
+                logger.info("Fetch decision missing usable parameters.item_id for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
+            }
         }
         if (decision.intent() == AgentIntentType.MINE_BLOCK) {
             String mineScope = decision.parameters().has("scope")
