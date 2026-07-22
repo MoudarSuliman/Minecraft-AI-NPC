@@ -121,10 +121,31 @@ public final class PromptFactory {
             data.addProperty("pending_confirmation", pendingConfirmationSummary);
         }
         data.add("perception", snapshot.toJson());
-        data.add("memory", memoryToJson(memory));
+        data.add("memory", trimmedMemoryToJson(memory, 8, 4, 4));
         sb.append("DATA:\n").append(data).append('\n');
         sb.append("Decide the intent for latest_instruction now. Return ONLY the JSON object.");
         return sb.toString();
+    }
+
+    private JsonObject trimmedMemoryToJson(MemoryContext memory, int shortN, int workingN, int longN) {
+        JsonObject json = new JsonObject();
+        json.add("short_term", tailArray(memory.shortTerm(), shortN));
+        json.add("working", tailArray(memory.working(), workingN));
+        JsonArray longArray = new JsonArray();
+        List<MemoryEntry> longTerm = memory.longTerm();
+        for (int i = 0; i < Math.min(longN, longTerm.size()); i++) {
+            longArray.add(longTerm.get(i).toJson());
+        }
+        json.add("long_term", longArray);
+        return json;
+    }
+
+    private JsonArray tailArray(List<MemoryEntry> entries, int limit) {
+        JsonArray array = new JsonArray();
+        for (int i = Math.max(0, entries.size() - limit); i < entries.size(); i++) {
+            array.add(entries.get(i).toJson());
+        }
+        return array;
     }
 
     public String scoutReportPrompt(

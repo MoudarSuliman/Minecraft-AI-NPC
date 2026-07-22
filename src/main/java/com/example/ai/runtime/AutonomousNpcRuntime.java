@@ -46,6 +46,7 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, String> lastProcessedInstructionByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, PendingClarification> pendingClarificationByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, PendingConfirmation> pendingConfirmationByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> consecutiveIdleRejectsByNpc = new ConcurrentHashMap<>();
 
     private record PendingClarification(String originalInstruction, String question, long expiresAtMillis) {
     }
@@ -397,12 +398,22 @@ public final class AutonomousNpcRuntime {
                 actionExecutor.notifyLlmUnavailable(server, npcId, handle.npcName());
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 5000L);
-            } else {
-                logger.info("Idle decision rejected for pending instruction on agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
             }
+            int rejects = consecutiveIdleRejectsByNpc.merge(npcId, 1, Integer::sum);
+            if (rejects >= 3) {
+                logger.info("Giving up on instruction after {} idle decisions for agent {}.", rejects, handle.npcName());
+                consecutiveIdleRejectsByNpc.remove(npcId);
+                fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                        "I'm having trouble working that one out — could you say it differently?");
+                return;
+            }
+            logger.info("Idle decision rejected for pending instruction on agent {} ({}/3). Retrying.",
+                    handle.npcName(), rejects);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
             return;
         }
+        consecutiveIdleRejectsByNpc.remove(npcId);
         if (decision.intent() == AgentIntentType.ASK_CLARIFICATION) {
             var textElement = decision.parameters().get("text");
             String lastResort = textElement != null && textElement.isJsonPrimitive()
