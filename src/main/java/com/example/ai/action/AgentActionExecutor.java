@@ -3311,11 +3311,24 @@ public final class AgentActionExecutor {
         try {
             String raw = llmRouter.generate(promptFactory.contextualLinePrompt(npcName, situation));
             if (raw != null && !raw.isBlank() && raw.length() <= 200) {
-                String cleaned = raw.trim().replaceAll("^\"|\"$", "");
-                if (!cleaned.isBlank()) return cleaned;
+                String cleaned = raw.trim().replaceAll("^\"|\"$", "").trim();
+                if (isSpeakableLine(cleaned)) {
+                    return cleaned;
+                }
             }
         } catch (Exception ignored) {}
         return fallback;
+    }
+
+    private boolean isSpeakableLine(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String trimmed = text.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            return false;
+        }
+        return trimmed.matches(".*[a-zA-Z].*");
     }
 
     public void notifyLlmUnavailable(MinecraftServer server, UUID npcId, String fallbackName) {

@@ -416,11 +416,6 @@ public final class AutonomousNpcRuntime {
             lastProcessedInstructionByNpc.put(npcId, latestInstruction);
             return;
         }
-        if (decision.intent() == AgentIntentType.DIALOGUE_REPLY && !decision.parameters().has("text")) {
-            logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            return;
-        }
         if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST && !decision.parameters().has("item_id")) {
             logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
             nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
