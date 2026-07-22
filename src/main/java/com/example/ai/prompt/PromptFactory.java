@@ -17,7 +17,7 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "", "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "", "", "");
     }
 
     public String actionSelectionPrompt(
@@ -29,11 +29,11 @@ public final class PromptFactory {
             String targetHint,
             String previousInstruction
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "", "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "", "", "");
     }
 
     private static final String ACTION_SELECTION_SCHEMA =
-            "{\"intent\":\"idle|dialogue_reply|ask_clarification|cancel_task|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
+            "{\"intent\":\"idle|dialogue_reply|ask_clarification|cancel_task|confirm_yes|confirm_no|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
 
     private static final String ACTION_SELECTION_RULES_PENDING =
             "Never return idle when has_pending_instruction is true.\n"
@@ -47,7 +47,7 @@ public final class PromptFactory {
                 + "7. Question about how to craft/make an item or its recipe -> recipe_reply.\n"
                 + "8. Direct imperative order to build/construct/place/set up a structure (floor, wall, hut, house, shelter, platform, pattern of blocks) -> build_structure with parameters {\"description\":\"<the full instruction text>\"}. Anything phrased as a QUESTION — starting with 'can you', 'can u', 'could you', 'could u', 'will you', 'would you', 'are you able to', 'do you know how to' — is dialogue_reply: answer and ask whether they want it built ('can you build a pillar?' -> dialogue_reply, 'can u build a pillar' -> dialogue_reply). A direct imperative build order is NEVER dialogue_reply or recipe_reply.\n"
                 + "9. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
-                + "10. Order to find/locate/search for/lead to a living CREATURE (animal or mob) -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}. This is ONLY for creatures. To find an ITEM or block (eggs, diamonds, a diamond block) do NOT use search_entity: use fetch_from_chest if it could be in a chest, otherwise dialogue_reply explaining you can't locate loose items but can fetch from a chest or scout.\n"
+                + "10. Order to find/locate/search for/lead to a living CREATURE (animal or mob) -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\",\"confirmed\":true|false}. This is ONLY for creatures. Set confirmed=true ONLY when the player gave a clear, direct command to search now ('find me a chicken', 'go find a cow', 'search for a pig'). Set confirmed=false when the message is a question or a terse follow-up rather than a direct order ('how about animals?', 'hb birds?', 'can you search for animals?', 'and fish?') — the NPC will ask before starting. To find an ITEM or block (eggs, diamonds, a diamond block) do NOT use search_entity: use fetch_from_chest if it could be in a chest, otherwise dialogue_reply explaining you can't locate loose items but can fetch from a chest or scout.\n"
                 + "11. Order to bring, fetch, get, or find an ITEM (not a creature) -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}. This covers 'get me an egg', 'find me an egg', 'bring me some wheat' -> fetch_from_chest, because items are retrieved from chests, not hunted in the open world.\n"
                 + "12. Order to mine, break, clear, remove, cut, or chop blocks -> mine_block. Choose parameters.scope:\n"
                 + "     - 'cut down a tree', 'chop a tree', 'fell that tree', 'chop wood' -> {\"scope\":\"tree\"} (no block needed; handles any wood species and the whole trunk).\n"
@@ -55,12 +55,13 @@ public final class PromptFactory {
                 + "     - 'break the house you built', 'take down that build', 'undo what you built', 'remove your structure' -> {\"scope\":\"own_build\"}.\n"
                 + "     - plain mining ('mine some stone', 'mine 3 cobblestone') -> {\"block\":\"minecraft:...\",\"count\":N} (count is the number asked for, 1 if unspecified; if the message is just a number answering 'how many', take the block from previous_instruction).\n"
                 + "   Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "13. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
+                + "13. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true,\"confirmed\":true|false}. Set confirmed=true only for a clear direct command ('go scout east'); set confirmed=false for a question or terse follow-up ('how about scouting?', 'can you explore?'). Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
                 + "14. Message is genuinely ambiguous — unresolved pronoun ('do it', 'use those') or no identifiable request -> ask_clarification with parameters {\"text\":\"<one short question asking the player what they mean>\"}.\n"
                 + "15. Anything else -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
                 + "ADDITIONAL RULES:\n"
                 + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
                 + "- If active_offer is NOT present and latest_instruction is a plain go-ahead ('yes', 'yes please', 'do it', 'go ahead', 'sure, build it') and previous_instruction asked about a task ('can you build a pillar?'), classify previous_instruction as a direct order now and fill parameters from previous_instruction (for build_structure set description to previous_instruction, not to the go-ahead words).\n"
+                + "- If pending_confirmation is present, the NPC has just asked the player to confirm the action described in it. An affirmative reply ('yes', 'yeah', 'ok', 'go ahead', 'do it', 'sure', 'please do') -> confirm_yes. A negative reply ('no', 'nope', 'never mind', 'don't', 'not now') -> confirm_no. If the message is instead a new unrelated request, ignore pending_confirmation and route it normally.\n"
                 + "- If pending_clarification is present, the NPC just asked the player the question in it about the original instruction in it. If latest_instruction answers that question ('cobblestone', 'the hut', 'the second one'), classify the original instruction as completed by that answer and fill parameters from both. If latest_instruction questions or comments on the NPC's question ('why', 'what do you mean'), use dialogue_reply. If it is a new unrelated request, route it normally and ignore pending_clarification.\n"
                 + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
                 + "- If the NPC only SUGGESTED an action in dialogue and the player replies with enthusiasm or a question ('sounds good', 'where will you go?') without a direct command, use dialogue_reply to ask for confirmation instead of starting the action.\n"
@@ -89,7 +90,8 @@ public final class PromptFactory {
             String targetHint,
             String previousInstruction,
             String activeOfferSummary,
-            String pendingClarificationSummary
+            String pendingClarificationSummary,
+            String pendingConfirmationSummary
     ) {
         StringBuilder sb = new StringBuilder(8192);
         sb.append("You are an embodied Minecraft NPC. Decide the NPC's next action.\n");
@@ -111,6 +113,9 @@ public final class PromptFactory {
         }
         if (pendingClarificationSummary != null && !pendingClarificationSummary.isBlank()) {
             data.addProperty("pending_clarification", pendingClarificationSummary);
+        }
+        if (pendingConfirmationSummary != null && !pendingConfirmationSummary.isBlank()) {
+            data.addProperty("pending_confirmation", pendingConfirmationSummary);
         }
         data.add("perception", snapshot.toJson());
         data.add("memory", memoryToJson(memory));
