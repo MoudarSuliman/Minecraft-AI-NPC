@@ -1938,7 +1938,9 @@ public final class AgentActionExecutor {
         if (felled == 0) {
             return false;
         }
-        notifyNearbyPlayers(server, villager, "[LLM NPC] Chopped down a tree (" + felled + " logs"
+        String tool = findChoppingToolInNearbyChests(server, level, villager.blockPosition(), CHEST_SCAN_RADIUS);
+        String toolNote = tool != null ? " using the " + tool + " from your chest" : " with my bare hands";
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Chopped down a tree" + toolNote + " (" + felled + " logs"
                 + (receiver != null ? ", delivered to " + receiver.getName().getString() : "") + ").");
         return true;
     }
@@ -2888,6 +2890,39 @@ public final class AgentActionExecutor {
         return bestPos;
     }
 
+    private String findChoppingToolInNearbyChests(MinecraftServer server, ServerLevel level, BlockPos center, int radius) {
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> findChoppingToolInNearbyChests(server, level, center, radius)).get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch tool scan to main thread", e);
+                return null;
+            }
+        }
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -16; dy <= 16; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockEntity blockEntity = level.getBlockEntity(pos);
+                    if (!(blockEntity instanceof ChestBlockEntity chest)) {
+                        continue;
+                    }
+                    for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+                        ItemStack stack = chest.getItem(slot);
+                        if (stack.isEmpty()) {
+                            continue;
+                        }
+                        String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+                        if (id.endsWith("_axe") || id.endsWith("_pickaxe")) {
+                            return readableItemName(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     private BlockPos findNearestChest(MinecraftServer server, ServerLevel level, BlockPos center, int radius) {
         if (!server.isSameThread()) {
             try {
@@ -3648,6 +3683,7 @@ public final class AgentActionExecutor {
                 player.sendSystemMessage(message);
             }
         }
+        recordNpcUtterance(villager.getUUID(), text.replaceFirst("^\\[LLM NPC\\]\\s*", ""));
     }
 
     private double squaredDistance(BlockPos a, BlockPos b) {

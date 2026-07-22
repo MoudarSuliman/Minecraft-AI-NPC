@@ -66,6 +66,7 @@ public final class PromptFactory {
                 + "- If pending_clarification is present, the NPC just asked the player the question in it about the original instruction in it. If latest_instruction answers that question ('cobblestone', 'the hut', 'the second one'), classify the original instruction as completed by that answer and fill parameters from both. If latest_instruction questions or comments on the NPC's question ('why', 'what do you mean'), use dialogue_reply. If it is a new unrelated request, route it normally and ignore pending_clarification.\n"
                 + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
                 + "- If the NPC only SUGGESTED an action in dialogue and the player replies with enthusiasm or a question ('sounds good', 'where will you go?') without a direct command, use dialogue_reply to ask for confirmation instead of starting the action.\n"
+                + "- The NPC never needs tools: mining, chopping, and building work without any tool. When cutting a tree it automatically uses an axe or pickaxe from a nearby chest if one is there, and its bare hands otherwise. NEVER emit fetch_from_chest for a tool (pickaxe, axe, shovel) as a step before another task.\n"
                 + "- If target_hint is non-empty, copy it into parameters.block or parameters.item_id.\n"
                 + "- No destructive behavior, stay near the NPC, respect safety. Output strict JSON only, no markdown.\n"
                 + "EXAMPLES:\n"
@@ -419,7 +420,7 @@ public final class PromptFactory {
     private static final String DIALOGUE_REPLY_RULES =
             "My abilities (what I can actually do when commanded):\n"
             + "  - Mine blocks (mine and store in chest, mine and deliver to player)\n"
-            + "  - Cut down trees, clear a type of block nearby, or take down a structure you built\n"
+            + "  - Cut down trees (using an axe or pickaxe from a nearby chest if one is there, bare hands otherwise), clear a type of block nearby, or take down a structure you built\n"
             + "  - Fetch items from nearby chests and bring them to the player\n"
             + "  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n"
             + "  - Scout and explore in a direction and report back\n"
