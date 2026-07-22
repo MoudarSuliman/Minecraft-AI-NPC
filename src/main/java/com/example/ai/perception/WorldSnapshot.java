@@ -41,12 +41,13 @@ public record WorldSnapshot(
         }
     }
 
-    public record SeenEntity(String type, String name, double distance) {
+    public record SeenEntity(String type, String name, double distance, String direction) {
         public JsonObject toJson() {
             JsonObject json = new JsonObject();
             json.addProperty("type", type);
             json.addProperty("name", name);
             json.addProperty("distance", distance);
+            json.addProperty("direction", direction);
             return json;
         }
     }

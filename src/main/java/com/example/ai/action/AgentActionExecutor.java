@@ -215,7 +215,8 @@ public final class AgentActionExecutor {
             double distance = entity.distanceTo(villager);
             String type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
             String name = entity.getDisplayName().getString();
-            entities.add(new WorldSnapshot.SeenEntity(type, name, distance));
+            String direction = compassDirection(entity.getX() - villager.getX(), entity.getZ() - villager.getZ());
+            entities.add(new WorldSnapshot.SeenEntity(type, name, distance, direction));
         }
         entities.sort(Comparator.comparingDouble(WorldSnapshot.SeenEntity::distance));
         if (entities.size() > 25) {
@@ -1960,6 +1961,12 @@ public final class AgentActionExecutor {
         double dx = villager.getX() - (pos.getX() + 0.5);
         double dz = villager.getZ() - (pos.getZ() + 0.5);
         return dx * dx + dz * dz;
+    }
+
+    private String compassDirection(double dx, double dz) {
+        double angle = (Math.toDegrees(Math.atan2(dx, -dz)) + 360.0) % 360.0;
+        String[] directions = {"north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"};
+        return directions[(int) Math.round(angle / 45.0) % 8];
     }
 
     private boolean fellTreeAt(MinecraftServer server, Villager villager, ServerLevel level, BlockPos base) {
