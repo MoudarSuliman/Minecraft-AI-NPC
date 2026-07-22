@@ -1929,7 +1929,12 @@ public final class AgentActionExecutor {
             notifyNearbyPlayers(server, villager, "[LLM NPC] I don't see a tree nearby to cut down.");
             return false;
         }
-        if (villager.distanceToSqr(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5) <= 9.0) {
+        int descent = 0;
+        while (descent < 32 && level.getBlockState(base.below()).is(BlockTags.LOGS)) {
+            base = base.below();
+            descent++;
+        }
+        if (horizontalDistanceSqr(villager, base) <= 9.0) {
             return fellTreeAt(server, villager, level, base);
         }
         villager.getNavigation().moveTo(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5, 0.9);
@@ -1941,8 +1946,7 @@ public final class AgentActionExecutor {
         if (!(villager.level() instanceof ServerLevel level)) {
             return false;
         }
-        double distSqr = villager.distanceToSqr(task.base.getX() + 0.5, task.base.getY() + 0.5, task.base.getZ() + 0.5);
-        if (distSqr <= 9.0 || System.currentTimeMillis() > task.deadlineMillis) {
+        if (horizontalDistanceSqr(villager, task.base) <= 9.0 || System.currentTimeMillis() > task.deadlineMillis) {
             fellTreeAt(server, villager, level, task.base);
             return false;
         }
@@ -1950,6 +1954,12 @@ public final class AgentActionExecutor {
             villager.getNavigation().moveTo(task.base.getX() + 0.5, task.base.getY() + 0.5, task.base.getZ() + 0.5, 0.9);
         }
         return true;
+    }
+
+    private double horizontalDistanceSqr(Villager villager, BlockPos pos) {
+        double dx = villager.getX() - (pos.getX() + 0.5);
+        double dz = villager.getZ() - (pos.getZ() + 0.5);
+        return dx * dx + dz * dz;
     }
 
     private boolean fellTreeAt(MinecraftServer server, Villager villager, ServerLevel level, BlockPos base) {
@@ -1970,6 +1980,7 @@ public final class AgentActionExecutor {
             }
         }
         if (felled == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't chop that tree after all — it seems to be gone.");
             return false;
         }
         String tool = findChoppingToolInNearbyChests(server, level, villager.blockPosition(), CHEST_SCAN_RADIUS);
