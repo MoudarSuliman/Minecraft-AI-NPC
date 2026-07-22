@@ -426,12 +426,21 @@ public final class AutonomousNpcRuntime {
             nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
             return;
         }
-        if (decision.intent() == AgentIntentType.MINE_BLOCK
-                && !decision.parameters().has("block")
-                && !(decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"))) {
-            logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            return;
+        if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            String mineScope = decision.parameters().has("scope")
+                    ? decision.parameters().get("scope").getAsString().toLowerCase() : "single";
+            boolean scopeTargetsSelf = mineScope.equals("tree") || mineScope.equals("own_build");
+            boolean hasBlockTarget = decision.parameters().has("block")
+                    || (decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"));
+            if (!scopeTargetsSelf && !hasBlockTarget) {
+                logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
+            }
+            if (mineScope.equals("tree") || mineScope.equals("area") || mineScope.equals("own_build")) {
+                requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
+                return;
+            }
         }
         if (decision.intent() == AgentIntentType.MINE_TO_CHEST && !decision.parameters().has("block")) {
             logger.info("Mine-to-chest decision missing parameters.block for agent {}. Retrying.", handle.npcName());
@@ -681,6 +690,18 @@ public final class AutonomousNpcRuntime {
                     ? decision.parameters().get("direction").getAsString() : "around";
             return "scout " + direction + " and report back";
         }
+        if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            String mineScope = decision.parameters().has("scope")
+                    ? decision.parameters().get("scope").getAsString().toLowerCase() : "single";
+            return switch (mineScope) {
+                case "tree" -> "cut down the nearest tree";
+                case "own_build" -> "take down the structure I built";
+                case "area" -> "clear the " + (decision.parameters().has("block")
+                        ? decision.parameters().get("block").getAsString().replace("minecraft:", "") : "blocks")
+                        + " nearby";
+                default -> "mine that";
+            };
+        }
         return "do that";
     }
 
@@ -691,6 +712,14 @@ public final class AutonomousNpcRuntime {
             doSearch(server, handle, npcId, decision, confirmation.instruction(), confirmation.speaker());
         } else if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
             doScout(server, handle, npcId, decision, confirmation.instruction(), confirmation.speaker());
+        } else if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            actionExecutor.execute(npcId, decision);
+            memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
+            memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("decision",
+                    "Executed " + decision.intent().name().toLowerCase() + ": " + decision.reasoning()));
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1500L);
+            lastProcessedInstructionByNpc.put(npcId, confirmation.instruction());
         } else {
             pendingInstruction.put(npcId, false);
             nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
