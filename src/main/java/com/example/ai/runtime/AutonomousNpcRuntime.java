@@ -404,21 +404,18 @@ public final class AutonomousNpcRuntime {
             return;
         }
         if (decision.intent() == AgentIntentType.ASK_CLARIFICATION) {
-            String question = decision.parameters().has("text")
-                    ? decision.parameters().get("text").getAsString()
-                    : "";
-            if (question.isBlank()) {
-                question = "I'm not sure what you mean — could you say that another way?";
-            }
+            var textElement = decision.parameters().get("text");
+            String lastResort = textElement != null && textElement.isJsonPrimitive()
+                    && textElement.getAsJsonPrimitive().isString()
+                    && !textElement.getAsString().isBlank()
+                    ? textElement.getAsString()
+                    : "I'm not sure what you mean — could you say that another way?";
             PendingClarification existing = pendingClarificationByNpc.get(npcId);
             String original = existing != null ? existing.originalInstruction() : latestInstruction;
             pendingClarificationByNpc.put(npcId,
-                    new PendingClarification(original, question, System.currentTimeMillis() + 90_000L));
-            actionExecutor.sayAsNpc(server, npcId, handle.npcName(), question);
-            pendingInstruction.put(npcId, false);
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-            storeActionMemory(npcId, speaker, latestInstruction, "clarification");
-            lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+                    new PendingClarification(original, "asked the player for the missing detail",
+                            System.currentTimeMillis() + 90_000L));
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction, lastResort);
             return;
         }
         if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST) {
