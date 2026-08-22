@@ -231,7 +231,8 @@ public final class AutonomousNpcRuntime {
         lastProcessedInstructionByNpc.remove(npcId);
     }
 
-    public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester) {
+    public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester,
+                                MinecraftServer server) {
         if (activeTestRunner != null && !activeTestRunner.isFinished()) {
             return false;
         }
@@ -241,9 +242,19 @@ public final class AutonomousNpcRuntime {
                 requester,
                 () -> getLastParsedIntent(npcId),
                 () -> isNpcIdle(npcId),
+                () -> actionExecutor.isVillagerAlive(server, npcId),
                 instruction -> enqueuePlayerUtterance(npcId, requester.getName().getString(), instruction),
                 () -> resetNpcForTest(npcId)
         );
+        return true;
+    }
+
+    public boolean cancelTestRun() {
+        if (activeTestRunner == null || activeTestRunner.isFinished()) {
+            return false;
+        }
+        activeTestRunner.cancel();
+        activeTestRunner = null;
         return true;
     }
 

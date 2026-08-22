@@ -97,7 +97,12 @@ public class ExampleMod implements ModInitializer {
 			);
 			dispatcher.register(
 					Commands.literal("llm_test")
-							.executes(context -> runIntentTest(context.getSource().getPlayerOrException()))
+							.executes(context -> runIntentTest(context.getSource().getPlayerOrException(),
+									context.getSource().getServer()))
+			);
+			dispatcher.register(
+					Commands.literal("llm_test_cancel")
+							.executes(context -> cancelIntentTest(context.getSource().getPlayerOrException()))
 			);
 		});
 	}
@@ -108,7 +113,7 @@ public class ExampleMod implements ModInitializer {
 		return 1;
 	}
 
-	private int runIntentTest(ServerPlayer player) {
+	private int runIntentTest(ServerPlayer player, net.minecraft.server.MinecraftServer server) {
 		Villager nearest = findNearestVillager(player, 20.0);
 		if (nearest == null) {
 			player.sendSystemMessage(Component.literal("[LLM NPC] No villager found within 20 blocks."));
@@ -118,12 +123,21 @@ public class ExampleMod implements ModInitializer {
 			player.sendSystemMessage(Component.literal("[LLM NPC] Nearest villager is not bound. Use /llm_bind_nearest first."));
 			return 0;
 		}
-		if (!runtime.startTestRun(nearest.getUUID(), player)) {
-			player.sendSystemMessage(Component.literal("[LLM NPC] A test run is already in progress."));
+		if (!runtime.startTestRun(nearest.getUUID(), player, server)) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] A test run is already in progress. Use /llm_test_cancel to stop it."));
 			return 0;
 		}
 		player.sendSystemMessage(Component.literal("[LLM NPC] Intent test started on " + nearest.getName().getString()
 				+ ". Results will stream here and write to config/llm_npc/intent_tests.csv."));
+		return 1;
+	}
+
+	private int cancelIntentTest(ServerPlayer player) {
+		if (!runtime.cancelTestRun()) {
+			player.sendSystemMessage(Component.literal("[LLM NPC] No test run is currently in progress."));
+			return 0;
+		}
+		player.sendSystemMessage(Component.literal("[LLM NPC] Test run cancelled. You can start a new one with /llm_test."));
 		return 1;
 	}
 

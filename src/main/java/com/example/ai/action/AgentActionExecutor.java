@@ -81,7 +81,7 @@ public final class AgentActionExecutor {
     private static final int SCOUT_MAX_DISTANCE = 96;
     private static final int SCOUT_SURVEY_TICKS = 20;
     private static final long SCOUT_STATUS_COOLDOWN_MILLIS = 6_000L;
-    private static final boolean TRADE_DEBUG_CHAT = true;
+    private static final boolean TRADE_DEBUG_CHAT = false;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
     private static final long TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS = 45_000L;
     private static final double OWNER_IDLE_RADIUS_SQR = 36.0; // 6 blocks
