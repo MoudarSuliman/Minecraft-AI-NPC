@@ -37,9 +37,25 @@ public record MemoryEntry(
     public JsonObject toJson() {
         JsonObject json = new JsonObject();
         json.addProperty("type", type);
-        json.addProperty("timestamp", timestamp);
+        json.addProperty("age", relativeAge());
         json.addProperty("content", content);
         json.addProperty("salience", salience);
         return json;
+    }
+
+    public String relativeAge() {
+        long deltaMillis = Math.max(0, System.currentTimeMillis() - timestamp);
+        long minutes = deltaMillis / 60_000L;
+        if (minutes < 1) {
+            return "just now";
+        }
+        if (minutes < 60) {
+            return minutes + " min ago";
+        }
+        long hours = minutes / 60;
+        if (hours < 24) {
+            return hours + " h ago";
+        }
+        return (hours / 24) + " d ago";
     }
 }

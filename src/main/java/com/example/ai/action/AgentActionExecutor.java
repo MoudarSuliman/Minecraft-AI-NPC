@@ -1,6 +1,7 @@
 package com.example.ai.action;
 
 import com.example.ai.intent.AgentDecision;
+import com.example.ai.intent.AgentIntentType;
 import com.example.ai.llm.LlmRouter;
 import com.example.ai.memory.MemoryContext;
 import com.example.ai.perception.SemanticPerceptionService;
@@ -31,8 +32,11 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Containers;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.npc.villager.Villager;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.ItemStack;
@@ -41,6 +45,10 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.core.Direction;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 
@@ -48,9 +56,11 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
@@ -66,12 +76,12 @@ public final class AgentActionExecutor {
     private static final int SEARCH_PATROL_STALL_TICKS = 40;
     private static final long SEARCH_STATUS_COOLDOWN_MILLIS = 6_000L;
     private static final long SEARCH_TRADE_SUPPRESS_MILLIS = 60_000L;
+    private static final int ENTITY_SCAN_RADIUS = 28;
     private static final int SCOUT_BASE_DISTANCE = 48;
     private static final int SCOUT_MAX_DISTANCE = 96;
     private static final int SCOUT_SURVEY_TICKS = 20;
     private static final long SCOUT_STATUS_COOLDOWN_MILLIS = 6_000L;
-    private static final double TRADE_INTENT_CONFIDENCE_THRESHOLD = 0.6;
-    private static final boolean TRADE_DEBUG_CHAT = true;
+    private static final boolean TRADE_DEBUG_CHAT = false;
     private static final long TRADE_GREETING_COOLDOWN_MILLIS = 20_000L;
     private static final long TRADE_RECENT_INTERACTION_SUPPRESS_MILLIS = 45_000L;
     private static final double OWNER_IDLE_RADIUS_SQR = 36.0; // 6 blocks
@@ -87,6 +97,18 @@ public final class AgentActionExecutor {
     private final TradeIntentClassifierParser tradeIntentClassifierParser = new TradeIntentClassifierParser();
     private final TradeNegotiationParser tradeNegotiationParser = new TradeNegotiationParser();
     private final Map<UUID, List<JsonObject>> actionOutbox = new ConcurrentHashMap<>();
+    private final Map<UUID, List<BlockPos>> lastBuildBlocks = new ConcurrentHashMap<>();
+    private final Map<UUID, FellTreeTask> activeFellTasks = new ConcurrentHashMap<>();
+
+    private static final class FellTreeTask {
+        private final BlockPos base;
+        private final long deadlineMillis;
+
+        private FellTreeTask(BlockPos base, long deadlineMillis) {
+            this.base = base;
+            this.deadlineMillis = deadlineMillis;
+        }
+    }
     private final Map<UUID, List<String>> completedTaskSummaries = new ConcurrentHashMap<>();
     private final Map<UUID, DeliveryTask> activeDeliveries = new ConcurrentHashMap<>();
     private final Map<UUID, MineToChestTask> activeMineToChest = new ConcurrentHashMap<>();
@@ -152,7 +174,7 @@ public final class AgentActionExecutor {
 
         BlockPos center = villager.blockPosition();
         Map<String, Integer> nearbyBlocks = scanNearbyBlocks(level, center, 8);
-        List<WorldSnapshot.SeenEntity> nearbyEntities = scanNearbyEntities(level, villager, 16);
+        List<WorldSnapshot.SeenEntity> nearbyEntities = scanNearbyEntities(level, villager, ENTITY_SCAN_RADIUS);
         WorldSnapshot.EnvironmentContext environment = buildEnvironmentContext(level, center, nearbyEntities);
         return perceptionService.capture(
                 fallbackName,
@@ -193,7 +215,8 @@ public final class AgentActionExecutor {
             double distance = entity.distanceTo(villager);
             String type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
             String name = entity.getDisplayName().getString();
-            entities.add(new WorldSnapshot.SeenEntity(type, name, distance));
+            String direction = compassDirection(entity.getX() - villager.getX(), entity.getZ() - villager.getZ());
+            entities.add(new WorldSnapshot.SeenEntity(type, name, distance, direction));
         }
         entities.sort(Comparator.comparingDouble(WorldSnapshot.SeenEntity::distance));
         if (entities.size() > 25) {
@@ -321,6 +344,15 @@ public final class AgentActionExecutor {
             return active;
         }
 
+        FellTreeTask fellTask = activeFellTasks.get(npcId);
+        if (fellTask != null) {
+            boolean active = advanceFellTreeTask(server, villager, fellTask);
+            if (!active) {
+                activeFellTasks.remove(npcId);
+            }
+            return active;
+        }
+
         JsonObject next = pollNextAction(npcId);
         if (next == null) {
             return false;
@@ -332,18 +364,25 @@ public final class AgentActionExecutor {
                 : new JsonObject();
         String reasoning = next.has("reasoning") ? next.get("reasoning").getAsString() : "";
 
-        boolean success = switch (intent) {
-            case "dialogue_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
-                    case "recipe_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
-                    case "scout_explorer" -> startScoutTask(server, npcId, villager, parameters);
-                    case "move_to" -> executeMove(server, villager, parameters);
-                    case "fetch_from_chest" -> startFetchTask(server, npcId, villager, parameters);
-                    case "mine_block" -> executeMineBlock(server, villager, parameters);
-                    case "mine_to_chest" -> startMineToChestTask(server, npcId, villager, parameters);
-                    case "mine_to_player" -> startMineToPlayerTask(server, npcId, villager, parameters);
-                    case "build_structure" -> startScenarioDirect(server, npcId, villager, fallbackName, parameters, reasoning);
-                    default -> true;
-                };
+        boolean success;
+        try {
+            success = switch (intent) {
+                case "dialogue_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
+                case "recipe_reply" -> executeDialogue(server, villager, fallbackName, parameters, reasoning);
+                case "scout_explorer" -> startScoutTask(server, npcId, villager, parameters);
+                case "move_to" -> executeMove(server, villager, parameters);
+                case "fetch_from_chest" -> startFetchTask(server, npcId, villager, parameters);
+                case "mine_block" -> executeMineBlock(server, villager, parameters);
+                case "mine_to_chest" -> startMineToChestTask(server, npcId, villager, parameters);
+                case "mine_to_player" -> startMineToPlayerTask(server, npcId, villager, parameters);
+                case "build_structure" -> startScenarioDirect(server, npcId, villager, fallbackName, parameters, reasoning);
+                default -> true;
+            };
+        } catch (Exception e) {
+            logger.warn("Action execution failed: npc={} intent={} params={}", fallbackName, intent, parameters, e);
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't carry that out — could you rephrase?");
+            return false;
+        }
 
         logger.info("Action execution: npc={} intent={} success={}", fallbackName, intent, success);
         return success;
@@ -370,13 +409,7 @@ public final class AgentActionExecutor {
         if (ownerPlayerId == null) {
             return;
         }
-        if (activeScoutTasks.containsKey(npcId)) {
-            return;
-        }
-        if (activeSearchTasks.containsKey(npcId)) {
-            return;
-        }
-        if (activeScenarioTasks.containsKey(npcId)) {
+        if (hasActiveWork(npcId)) {
             return;
         }
         Villager villager = findVillager(server, npcId);
@@ -552,255 +585,6 @@ public final class AgentActionExecutor {
         });
     }
 
-    public boolean tryHandleRecipeInstruction(
-            MinecraftServer server,
-            UUID npcId,
-            String fallbackName,
-            String playerName,
-            UUID ownerPlayerId,
-            String instruction,
-            MemoryContext memory,
-            WorldSnapshot snapshot) {
-        if (instruction == null || instruction.isBlank()) {
-            return false;
-        }
-        String lower = instruction.toLowerCase(Locale.ROOT);
-        Villager villager = findVillager(server, npcId);
-        if (villager == null) {
-            return false;
-        }
-        ServerPlayer player = findPlayerByName(server, playerName);
-        if (player == null || player.level() != villager.level()) {
-            return false;
-        }
-        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
-            return false;
-        }
-
-        if (!isRecipeQueryWithLlm(villager, player, instruction)) {
-            return false;
-        }
-
-        Item targetOutput = recipeTargetItem(lower, instruction);
-        if (targetOutput == null) {
-            return false;
-        }
-
-        RecipeSummary recipeSummary = summarizeRecipeFromGame(server, targetOutput);
-        long now = System.currentTimeMillis();
-        TradeSessionKey key = new TradeSessionKey(npcId, player.getUUID());
-        TradeSession session = tradeSessions.computeIfAbsent(key, ignored -> new TradeSession());
-        session.lastInteractionAtMillis = now;
-        ServerLevel level = (ServerLevel) villager.level();
-        List<RecipeIngredientStatus> ingredientStatuses = evaluateIngredientStatus(
-                server,
-                level,
-                villager.blockPosition(),
-                player,
-                recipeSummary.ingredients());
-
-        List<String> missingIngredients = new ArrayList<>();
-        List<String> availableIngredients = new ArrayList<>();
-        for (RecipeIngredientStatus status : ingredientStatuses) {
-            String entry = status.readableName() + " " + status.nearbyCount() + "/" + status.neededCount();
-            if (status.nearbyCount() >= status.neededCount()) {
-                availableIngredients.add(entry);
-            } else {
-                missingIngredients.add(entry);
-            }
-        }
-        String missingSummary = missingIngredients.isEmpty() ? "none" : String.join(", ", missingIngredients);
-        String availableSummary = availableIngredients.isEmpty() ? "none" : String.join(", ", availableIngredients);
-
-
-        StringBuilder fallbackReply = new StringBuilder();
-        fallbackReply.append("You need ").append(recipeSummary.summaryText()).append(".");
-        if (!ingredientStatuses.isEmpty()) {
-            fallbackReply.append(" Nearby stock: ");
-            List<String> stockBits = new ArrayList<>();
-            for (RecipeIngredientStatus status : ingredientStatuses) {
-                stockBits.add(status.readableName() + " " + status.nearbyCount() + "/" + status.neededCount());
-            }
-            fallbackReply.append(String.join(", ", stockBits)).append(".");
-        }
-
-        TradeOffer ingredientOffer = null;
-        RecipeIngredientStatus offeredStatus = null;
-        for (RecipeIngredientStatus status : ingredientStatuses) {
-            if (!tradeOfferEngine.supportsItem(status.itemId()) || status.nearbyCount() <= 0) {
-                continue;
-            }
-            int offerCount = Math.min(status.neededCount(), Math.max(1, status.nearbyCount()));
-            ingredientOffer = tradeOfferEngine.quote(status.itemId(), offerCount, status.nearbyCount(), 0, false, now);
-            offeredStatus = status;
-            break;
-        }
-        if (ingredientOffer != null && offeredStatus != null) {
-            session.activeOffer = ingredientOffer;
-            session.lastInteractionAtMillis = now;
-            session.lastRequestedItemId = ingredientOffer.itemId();
-            session.lastRequestedQuantity = ingredientOffer.quantity();
-            fallbackReply.append(" I can trade ")
-                    .append(ingredientOffer.quantity())
-                    .append(" ")
-                    .append(offeredStatus.readableName())
-                    .append(" for ")
-                    .append(ingredientOffer.totalPrice())
-                    .append(" emeralds if you want.");
-        }
-        fallbackReply.append(" I can help gather what is missing.");
-
-        String nearbyFacts = summarizeIngredientFacts(ingredientStatuses);
-        String requiredFacts = "recipe=" + recipeSummary.summaryText()
-                + "; output_item=" + readableItemName(BuiltInRegistries.ITEM.getKey(targetOutput).toString())
-                + "; nearby_ingredients=" + nearbyFacts
-                + "; missing_ingredients=" + missingSummary
-                + "; available_ingredients=" + availableSummary
-                + "; active_offer=" + (ingredientOffer == null ? "none" : summarizeOffer(ingredientOffer));
-        String prompt = promptFactory.recipeAssistantPrompt(
-                villager.getName().getString(),
-                player.getName().getString(),
-                instruction,
-                requiredFacts,
-                snapshot,
-                memory);
-        String responseText = parseRecipeResponseText(llmRouter.generate(prompt));
-        speakAsNpc(server, villager, fallbackName,
-                groundedRecipeText(responseText, fallbackReply.toString(), ingredientOffer,
-                        recipeSummary.summaryText(), nearbyFacts));
-        lastActionSummaryByNpc.put(npcId, "Explained recipe for "
-                + readableItemName(BuiltInRegistries.ITEM.getKey(targetOutput).toString())
-                + ": " + recipeSummary.summaryText()
-                + (missingIngredients.isEmpty() ? ". All ingredients available." : ". Missing: " + missingSummary + "."));
-        return true;
-    }
-
-    public boolean tryHandleSearchInstruction(
-            MinecraftServer server,
-            UUID npcId,
-            String fallbackName,
-            String playerName,
-            UUID ownerPlayerId,
-            String instruction,
-            MemoryContext memory) {
-        if (instruction == null || instruction.isBlank()) {
-            return false;
-        }
-        SearchRequest request = parseSearchRequestWithLlm(instruction, memory);
-        if (request == null) {
-            return false;
-        }
-
-        Villager villager = findVillager(server, npcId);
-        if (villager == null || !(villager.level() instanceof ServerLevel)) {
-            return false;
-        }
-        ServerPlayer player = findPlayerByName(server, playerName);
-        if (player == null || player.level() != villager.level()) {
-            return false;
-        }
-        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
-            return false;
-        }
-        if (activeSearchTasks.containsKey(npcId)) {
-            speakSearchStatusWithLlm(
-                    server,
-                    villager,
-                    fallbackName,
-                    player.getName().getString(),
-                    "search_already_active",
-                    "target=" + request.label(),
-                    "I am already running a search task.");
-            return true;
-        }
-
-        SearchTask task = new SearchTask(
-                request.label(),
-                request.entityTypeId(),
-                request.requirePinkSheep(),
-                player.getUUID());
-        task.nextStatusAtMillis = System.currentTimeMillis() + SEARCH_STATUS_COOLDOWN_MILLIS;
-        activeSearchTasks.put(npcId, task);
-        lastActionSummaryByNpc.put(npcId, "Searching for " + request.label()
-                + " (entity: " + request.entityTypeId() + "). Will report location when found.");
-        suppressTradeGreeting(npcId, player.getUUID(), SEARCH_TRADE_SUPPRESS_MILLIS);
-        speakSearchStatusWithLlm(
-                server,
-                villager,
-                fallbackName,
-                player.getName().getString(),
-                "search_start",
-                "target=" + request.label(),
-                "Got it. I will search for " + request.label() + " and call out its location when I find it.");
-        return true;
-    }
-
-    public boolean tryHandleScoutInstruction(
-            MinecraftServer server,
-            UUID npcId,
-            String fallbackName,
-            String playerName,
-            UUID ownerPlayerId,
-            String instruction,
-            MemoryContext memory,
-            WorldSnapshot snapshot) {
-        if (instruction == null || instruction.isBlank()) {
-            return false;
-        }
-
-        Villager villager = findVillager(server, npcId);
-        if (villager == null || !(villager.level() instanceof ServerLevel)) {
-            return false;
-        }
-        ServerPlayer player = findPlayerByName(server, playerName);
-        if (player == null || player.level() != villager.level()) {
-            return false;
-        }
-        if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) {
-            return false;
-        }
-        if (activeScoutTasks.containsKey(npcId)) {
-            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
-                    "The player asked you to scout but you are already out on a scouting mission.",
-                    "I am already scouting."));
-            return true;
-        }
-
-        String prompt = promptFactory.scoutIntentPrompt(
-                villager.getName().getString(),
-                player.getName().getString(),
-                instruction,
-                snapshot,
-                memory);
-        AgentDecision scoutDecision = new com.example.ai.intent.AgentDecisionParser().parse(llmRouter.generate(prompt));
-        if (scoutDecision.intent() != com.example.ai.intent.AgentIntentType.SCOUT_EXPLORER) {
-            return false;
-        }
-
-        if (!startScoutTask(server, npcId, villager, player.getUUID(), player.getName().getString(), instruction,
-                scoutDecision.parameters())) {
-            return false;
-        }
-
-        String direction = scoutDecision.parameters().has("direction")
-                ? scoutDecision.parameters().get("direction").getAsString()
-                : "around";
-        String distance = scoutDecision.parameters().has("distance")
-                ? String.valueOf(Math.max(24, scoutDecision.parameters().get("distance").getAsInt()))
-                : String.valueOf(SCOUT_BASE_DISTANCE);
-        lastActionSummaryByNpc.put(npcId, "Scouting " + direction + " for approximately "
-                + distance + " blocks to observe the area.");
-        speakScoutStatus(
-                server,
-                villager,
-                fallbackName,
-                player.getName().getString(),
-                "scout_start",
-                "direction=" + direction + "; distance=" + distance + "; objective=" + instruction,
-                "I will scout the area and report back.");
-        return true;
-    }
-
     public boolean tryHandleTradeInstruction(
             MinecraftServer server,
             UUID npcId,
@@ -809,7 +593,8 @@ public final class AgentActionExecutor {
             UUID ownerPlayerId,
             String instruction,
             MemoryContext memory,
-            WorldSnapshot snapshot) {
+            WorldSnapshot snapshot,
+            AgentIntentType routerIntent) {
         Villager villager = findVillager(server, npcId);
         if (villager == null) {
             return false;
@@ -835,8 +620,19 @@ public final class AgentActionExecutor {
             return true;
         }
 
-        ParsedTradeIntent llmClassified = classifyTradeIntentWithLlm(server, villager, player, instruction, session,
-                snapshot, memory, npcId);
+        ParsedTradeIntent llmClassified;
+        if (routerIntent == AgentIntentType.TRADE_ACCEPT && session.activeOffer != null) {
+            llmClassified = new ParsedTradeIntent(TradeIntentType.ACCEPT_OFFER, "", 0, null);
+        } else if (routerIntent == AgentIntentType.TRADE_DECLINE && session.activeOffer != null) {
+            llmClassified = new ParsedTradeIntent(TradeIntentType.DECLINE_OFFER, "", 0, null);
+        } else {
+            llmClassified = classifyTradeIntentWithLlm(server, villager, player, instruction, session,
+                    snapshot, memory, npcId);
+            if (llmClassified.type() == TradeIntentType.NONE && routerIntent == AgentIntentType.TRADE_OFFER) {
+                String fallbackItem = session.lastRequestedItemId == null ? "" : session.lastRequestedItemId;
+                llmClassified = new ParsedTradeIntent(TradeIntentType.INQUIRE_STOCK, fallbackItem, 0, null);
+            }
+        }
         ParsedTradeIntent tradeIntent = resolveTradeIntent(llmClassified, session);
         logger.info(
                 "[TRADE-DEBUG] npc={} utterance='{}' llm_intent={} resolved_intent={} resolved_item={} resolved_qty={} resolved_counter={}",
@@ -1263,8 +1059,15 @@ public final class AgentActionExecutor {
         if (offers.size() > limit) {
             message = message + ", and more.";
         }
-        speakAsNpc(server, villager, fallbackName,
-                groundedStockText(draft.responseText(), "I currently sell: " + message, session.activeOffer.unitPrice()));
+        String stockFallback = "I currently sell: " + message;
+        String draftText = groundedStockText(draft.responseText(), "", session.activeOffer.unitPrice());
+        if (draftText.isBlank()) {
+            draftText = contextualLine(villager.getName().getString(),
+                    "A player asked what you offer. Your exact current stock: " + message
+                            + ". Present it naturally in one or two sentences, keeping every item name, count, and emerald price exactly as stated.",
+                    stockFallback);
+        }
+        speakAsNpc(server, villager, fallbackName, draftText);
         return true;
     }
 
@@ -1457,7 +1260,11 @@ public final class AgentActionExecutor {
 
         TradeOffer offer = session.activeOffer;
         if (!hasAtLeast(player, Items.EMERALD, offer.totalPrice())) {
-            String msg = "You don't have enough emeralds for that trade.";
+            String msg = contextualLine(villager.getName().getString(),
+                    "The player accepted your offer (" + summarizeOffer(offer)
+                            + ") but does not have the " + offer.totalPrice()
+                            + " emeralds it costs. Tell them kindly they are short and the offer stands.",
+                    "You don't have enough emeralds for that trade.");
             speakAsNpc(server, villager, fallbackName, msg);
             recordNpcUtterance(villager.getUUID(), msg);
             return true;
@@ -1669,33 +1476,6 @@ public final class AgentActionExecutor {
             return fallback;
         }
         return draftText;
-    }
-
-    private boolean isRecipeQueryWithLlm(Villager villager, ServerPlayer player, String instruction) {
-        String prompt = promptFactory.recipeIntentClassifierPrompt(
-                villager.getName().getString(),
-                player.getName().getString(),
-                instruction
-        );
-        tradeLlmInFlightByNpc.put(villager.getUUID(), true);
-        String raw;
-        try {
-            raw = llmRouter.generate(prompt);
-        } finally {
-            tradeLlmInFlightByNpc.put(villager.getUUID(), false);
-        }
-        if (raw == null || raw.isBlank()) {
-            return false;
-        }
-        try {
-            JsonObject root = JsonParser.parseString(raw).getAsJsonObject();
-            if (!root.has("is_recipe")) {
-                return false;
-            }
-            return root.get("is_recipe").getAsBoolean();
-        } catch (Exception ignored) {
-            return false;
-        }
     }
 
     private String parseRecipeResponseText(String raw) {
@@ -2002,6 +1782,17 @@ public final class AgentActionExecutor {
         return nearest;
     }
 
+    private String safeStringParam(JsonObject parameters, String key) {
+        if (parameters == null || !parameters.has(key)) {
+            return null;
+        }
+        var element = parameters.get(key);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+            return null;
+        }
+        return element.getAsString();
+    }
+
     private boolean startFetchTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
         return startFetchTask(server, npcId, villager, parameters, true);
     }
@@ -2010,11 +1801,12 @@ public final class AgentActionExecutor {
         if (!(villager.level() instanceof ServerLevel level)) {
             return false;
         }
-        if (!parameters.has("item_id")) {
+        String itemId = safeStringParam(parameters, "item_id");
+        if (itemId == null || itemId.isBlank() || itemId.contains("...")) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I'm not sure which item you mean — could you name it?");
             return false;
         }
-
-        String itemId = parameters.get("item_id").getAsString().toLowerCase();
+        itemId = itemId.toLowerCase();
         int count = parameters.has("count") ? Math.max(1, parameters.get("count").getAsInt()) : 1;
         Item item = resolveKnownItem(itemId);
         if (item == null) {
@@ -2055,43 +1847,285 @@ public final class AgentActionExecutor {
             return false;
         }
 
-        BlockPos targetPos;
         if (parameters.has("x") && parameters.has("y") && parameters.has("z")) {
-            targetPos = new BlockPos(
+            BlockPos targetPos = new BlockPos(
                     parameters.get("x").getAsInt(),
                     parameters.get("y").getAsInt(),
                     parameters.get("z").getAsInt());
-        } else if (parameters.has("block")) {
-            String blockId = parameters.get("block").getAsString().toLowerCase();
-            Block targetBlock = resolveKnownBlock(blockId);
-            if (targetBlock == null) {
-                notifyNearbyPlayers(server, villager, "[LLM NPC] Unsupported mine block: " + blockId);
-                return false;
+            boolean moving = villager.getNavigation().moveTo(
+                    targetPos.getX() + 0.5,
+                    targetPos.getY() + 0.5,
+                    targetPos.getZ() + 0.5,
+                    0.9);
+            if (villager.distanceToSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5) > 4.0) {
+                return moving;
             }
-            targetPos = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
-            if (targetPos == null) {
-                notifyNearbyPlayers(server, villager, "[LLM NPC] Could not find nearby " + blockId + " to mine.");
-                return false;
+            boolean removed = level.removeBlock(targetPos, false);
+            if (removed) {
+                notifyNearbyPlayers(server, villager, "[LLM NPC] Mined block at " + targetPos.getX() + ", "
+                        + targetPos.getY() + ", " + targetPos.getZ() + ".");
             }
-        } else {
-            return false;
+            return removed;
         }
 
+        String scope = parameters.has("scope") ? parameters.get("scope").getAsString().toLowerCase(Locale.ROOT) : "single";
+        if (scope.equals("tree")) {
+            return fellNearbyTree(server, villager, level);
+        }
+        if (scope.equals("own_build")) {
+            return removeOwnBuild(server, villager, level);
+        }
+
+        if (!parameters.has("block")) {
+            return false;
+        }
+        String blockId = parameters.get("block").getAsString().toLowerCase();
+        if (scope.equals("area") || scope.equals("clear")) {
+            return clearNearbyBlocks(server, villager, level, blockId);
+        }
+        int count = parameters.has("count") ? Math.max(1, Math.min(16, parameters.get("count").getAsInt())) : 1;
+        Block targetBlock = resolveKnownBlock(blockId);
+        if (targetBlock == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Unsupported mine block: " + blockId);
+            return false;
+        }
+        BlockPos first = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
+        if (first == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Could not find nearby " + blockId + " to mine.");
+            return false;
+        }
         boolean moving = villager.getNavigation().moveTo(
-                targetPos.getX() + 0.5,
-                targetPos.getY() + 0.5,
-                targetPos.getZ() + 0.5,
+                first.getX() + 0.5,
+                first.getY() + 0.5,
+                first.getZ() + 0.5,
                 0.9);
-        if (villager.distanceToSqr(targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5) > 4.0) {
+        if (villager.distanceToSqr(first.getX() + 0.5, first.getY() + 0.5, first.getZ() + 0.5) > 4.0) {
             return moving;
         }
 
-        boolean removed = level.removeBlock(targetPos, false);
-        if (removed) {
-            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined block at " + targetPos.getX() + ", "
-                    + targetPos.getY() + ", " + targetPos.getZ() + ".");
+        int mined = 0;
+        while (mined < count) {
+            BlockPos pos = findNearestBlock(level, villager.blockPosition(), targetBlock, 6);
+            if (pos == null || !level.removeBlock(pos, false)) {
+                break;
+            }
+            mined++;
         }
-        return removed;
+        if (mined == 0) {
+            return false;
+        }
+        if (mined < count) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined " + mined + "x " + blockId
+                    + " nearby; no more within reach (asked for " + count + ").");
+        } else {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] Mined " + mined + "x " + blockId + " nearby.");
+        }
+        return true;
+    }
+
+    private boolean fellNearbyTree(MinecraftServer server, Villager villager, ServerLevel level) {
+        BlockPos base = findNearestMatching(level, villager.blockPosition(),
+                pos -> level.getBlockState(pos).is(BlockTags.LOGS), ENTITY_SCAN_RADIUS);
+        if (base == null) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I don't see a tree nearby to cut down.");
+            return false;
+        }
+        int descent = 0;
+        while (descent < 32 && level.getBlockState(base.below()).is(BlockTags.LOGS)) {
+            base = base.below();
+            descent++;
+        }
+        if (horizontalDistanceSqr(villager, base) <= 9.0) {
+            return fellTreeAt(server, villager, level, base);
+        }
+        villager.getNavigation().moveTo(base.getX() + 0.5, base.getY() + 0.5, base.getZ() + 0.5, 0.9);
+        activeFellTasks.put(villager.getUUID(), new FellTreeTask(base, System.currentTimeMillis() + 30_000L));
+        return true;
+    }
+
+    private boolean advanceFellTreeTask(MinecraftServer server, Villager villager, FellTreeTask task) {
+        if (!(villager.level() instanceof ServerLevel level)) {
+            return false;
+        }
+        if (horizontalDistanceSqr(villager, task.base) <= 9.0 || System.currentTimeMillis() > task.deadlineMillis) {
+            fellTreeAt(server, villager, level, task.base);
+            return false;
+        }
+        if (villager.getNavigation().isDone()) {
+            villager.getNavigation().moveTo(task.base.getX() + 0.5, task.base.getY() + 0.5, task.base.getZ() + 0.5, 0.9);
+        }
+        return true;
+    }
+
+    private double horizontalDistanceSqr(Villager villager, BlockPos pos) {
+        double dx = villager.getX() - (pos.getX() + 0.5);
+        double dz = villager.getZ() - (pos.getZ() + 0.5);
+        return dx * dx + dz * dz;
+    }
+
+    private String compassDirection(double dx, double dz) {
+        double angle = (Math.toDegrees(Math.atan2(dx, -dz)) + 360.0) % 360.0;
+        String[] directions = {"north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"};
+        return directions[(int) Math.round(angle / 45.0) % 8];
+    }
+
+    private boolean fellTreeAt(MinecraftServer server, Villager villager, ServerLevel level, BlockPos base) {
+        List<BlockPos> logs = floodFill(level, base, pos -> level.getBlockState(pos).is(BlockTags.LOGS), 256);
+        ServerPlayer receiver = nearestPlayer(server, villager);
+        int felled = 0;
+        for (BlockPos pos : logs) {
+            var state = level.getBlockState(pos);
+            if (!state.is(BlockTags.LOGS) || !level.removeBlock(pos, false)) {
+                continue;
+            }
+            felled++;
+            if (receiver != null) {
+                Item logItem = state.getBlock().asItem();
+                if (logItem != null && logItem != Items.AIR) {
+                    receiver.getInventory().add(new ItemStack(logItem, 1));
+                }
+            }
+        }
+        if (felled == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't chop that tree after all — it seems to be gone.");
+            return false;
+        }
+        String tool = findChoppingToolInNearbyChests(server, level, villager.blockPosition(), CHEST_SCAN_RADIUS);
+        String toolNote = tool != null ? " using the " + tool + " from your chest" : " with my bare hands";
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Chopped down a tree" + toolNote + " (" + felled + " logs"
+                + (receiver != null ? ", delivered to " + receiver.getName().getString() : "") + ").");
+        return true;
+    }
+
+    private boolean clearNearbyBlocks(MinecraftServer server, Villager villager, ServerLevel level, String blockId) {
+        List<Block> targets = resolveBlockFamily(blockId);
+        if (targets.isEmpty()) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I don't know what '" + blockId + "' is to clear.");
+            return false;
+        }
+        BlockPos center = villager.blockPosition();
+        int radius = 10;
+        int cleared = 0;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -6; dy <= 6; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    var state = level.getBlockState(pos);
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    for (Block target : targets) {
+                        if (state.is(target)) {
+                            if (level.removeBlock(pos, false)) {
+                                cleared++;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (cleared == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I couldn't find any " + blockId + " nearby to clear.");
+            return false;
+        }
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Cleared " + cleared + "x " + blockId + " nearby.");
+        return true;
+    }
+
+    private boolean removeOwnBuild(MinecraftServer server, Villager villager, ServerLevel level) {
+        List<BlockPos> built = lastBuildBlocks.get(villager.getUUID());
+        if (built == null || built.isEmpty()) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] I haven't built anything I can take down.");
+            return false;
+        }
+        int removed = 0;
+        for (BlockPos pos : built) {
+            if (!level.getBlockState(pos).isAir() && level.removeBlock(pos, false)) {
+                removed++;
+            }
+        }
+        lastBuildBlocks.remove(villager.getUUID());
+        if (removed == 0) {
+            notifyNearbyPlayers(server, villager, "[LLM NPC] My last build is already gone.");
+            return false;
+        }
+        notifyNearbyPlayers(server, villager, "[LLM NPC] Took down my last build (" + removed + " blocks).");
+        return true;
+    }
+
+    private List<Block> resolveBlockFamily(String blockId) {
+        List<Block> result = new ArrayList<>();
+        String lower = blockId == null ? "" : blockId.toLowerCase(Locale.ROOT).replace("minecraft:", "").trim();
+        if (lower.equals("torch") || lower.equals("torches")) {
+            addIfPresent(result, "minecraft:torch");
+            addIfPresent(result, "minecraft:wall_torch");
+            return result;
+        }
+        Block direct = resolveKnownBlock(blockId);
+        if (direct != null) {
+            result.add(direct);
+        }
+        return result;
+    }
+
+    private void addIfPresent(List<Block> list, String id) {
+        Block block = resolveKnownBlock(id);
+        if (block != null) {
+            list.add(block);
+        }
+    }
+
+    private BlockPos findNearestMatching(ServerLevel level, BlockPos center,
+            java.util.function.Predicate<BlockPos> match, int radius) {
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -16; dy <= 16; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    if (!match.test(pos)) {
+                        continue;
+                    }
+                    double distance = squaredDistance(center, pos);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = pos.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private List<BlockPos> floodFill(ServerLevel level, BlockPos start,
+            java.util.function.Predicate<BlockPos> match, int limit) {
+        List<BlockPos> result = new ArrayList<>();
+        java.util.Set<BlockPos> visited = new java.util.HashSet<>();
+        java.util.Deque<BlockPos> queue = new java.util.ArrayDeque<>();
+        queue.add(start.immutable());
+        visited.add(start.immutable());
+        while (!queue.isEmpty() && result.size() < limit) {
+            BlockPos pos = queue.poll();
+            if (!match.test(pos)) {
+                continue;
+            }
+            result.add(pos);
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dy == 0 && dz == 0) {
+                            continue;
+                        }
+                        BlockPos next = pos.offset(dx, dy, dz).immutable();
+                        if (visited.add(next) && match.test(next)) {
+                            queue.add(next);
+                        }
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private boolean startMineToChestTask(MinecraftServer server, UUID npcId, Villager villager, JsonObject parameters) {
@@ -2762,6 +2796,7 @@ public final class AgentActionExecutor {
                 || activeDeliveries.containsKey(npcId)
                 || activeSearchTasks.containsKey(npcId)
                 || activeScoutTasks.containsKey(npcId)
+                || activeFellTasks.containsKey(npcId)
                 || activeScenarioTasks.containsKey(npcId)) {
             return true;
         }
@@ -2908,6 +2943,39 @@ public final class AgentActionExecutor {
         return bestPos;
     }
 
+    private String findChoppingToolInNearbyChests(MinecraftServer server, ServerLevel level, BlockPos center, int radius) {
+        if (!server.isSameThread()) {
+            try {
+                return server.submit(() -> findChoppingToolInNearbyChests(server, level, center, radius)).get();
+            } catch (Exception e) {
+                logger.warn("[CHEST-SCAN] Failed to dispatch tool scan to main thread", e);
+                return null;
+            }
+        }
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -16; dy <= 16; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = center.offset(dx, dy, dz);
+                    BlockEntity blockEntity = level.getBlockEntity(pos);
+                    if (!(blockEntity instanceof ChestBlockEntity chest)) {
+                        continue;
+                    }
+                    for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+                        ItemStack stack = chest.getItem(slot);
+                        if (stack.isEmpty()) {
+                            continue;
+                        }
+                        String id = BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+                        if (id.endsWith("_axe") || id.endsWith("_pickaxe")) {
+                            return readableItemName(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
     private BlockPos findNearestChest(MinecraftServer server, ServerLevel level, BlockPos center, int radius) {
         if (!server.isSameThread()) {
             try {
@@ -3027,7 +3095,7 @@ public final class AgentActionExecutor {
         return trimmed.contains(":") ? trimmed : "minecraft:" + trimmed;
     }
 
-    private Item resolveKnownItem(String itemId) {
+    private Item exactRegisteredItem(String itemId) {
         String normalized = normalizeMinecraftId(itemId);
         if (normalized == null) return null;
         try {
@@ -3038,39 +3106,48 @@ public final class AgentActionExecutor {
         }
     }
 
-    private Block resolveKnownBlock(String blockId) {
-        String normalized = normalizeMinecraftId(blockId);
-        if (normalized == null) return null;
-        try {
-            Identifier key = Identifier.parse(normalized);
-            return BuiltInRegistries.BLOCK.get(key).map(ref -> ref.value()).orElse(null);
-        } catch (Exception e) {
+    private Item resolveKnownItem(String itemId) {
+        Item exact = exactRegisteredItem(itemId);
+        if (exact != null) {
+            return exact;
+        }
+        if (itemId == null || itemId.isBlank() || itemId.equalsIgnoreCase("none")) {
             return null;
         }
+        return resolveItemFromRecipePhrase(itemId.replace("minecraft:", "").replace('_', ' '));
     }
 
-    private SearchRequest parseSearchRequestWithLlm(String instruction, MemoryContext memory) {
-        String prompt = promptFactory.searchRequestPrompt(instruction, memory);
-        String raw = llmRouter.generate(prompt);
-        if (raw == null || raw.isBlank()) return null;
-        try {
-            int start = raw.indexOf('{');
-            int end = raw.lastIndexOf('}');
-            if (start < 0 || end <= start) return null;
-            JsonObject root = JsonParser.parseString(raw.substring(start, end + 1)).getAsJsonObject();
-            boolean isSearch = root.has("is_search") && root.get("is_search").getAsBoolean();
-            if (!isSearch) return null;
-            String label = root.has("entity_label") ? root.get("entity_label").getAsString() : "entity";
-            String entityId = root.has("entity_id") ? root.get("entity_id").getAsString() : null;
-            if (entityId == null || entityId.isBlank() || !entityId.startsWith("minecraft:")) return null;
-            boolean requirePink = label != null && label.toLowerCase(Locale.ROOT).contains("pink")
-                    && entityId.equals("minecraft:sheep");
-            logger.info("[SEARCH] parsed instruction='{}' entity_id={} label={}", instruction, entityId, label);
-            return new SearchRequest(label, entityId, requirePink);
-        } catch (Exception e) {
-            logger.warn("[SEARCH] failed to parse LLM response: {}", raw);
-            return null;
+    private Block resolveKnownBlock(String blockId) {
+        String normalized = normalizeMinecraftId(blockId);
+        if (normalized != null) {
+            try {
+                Identifier key = Identifier.parse(normalized);
+                Block exact = BuiltInRegistries.BLOCK.get(key).map(ref -> ref.value()).orElse(null);
+                if (exact != null) {
+                    return exact;
+                }
+            } catch (Exception ignored) {
+            }
         }
+        Item item = resolveKnownItem(blockId);
+        if (item instanceof BlockItem blockItem) {
+            return blockItem.getBlock();
+        }
+        return null;
+    }
+
+    private String canonicalItemId(String itemId) {
+        if (itemId == null || itemId.isBlank() || itemId.equalsIgnoreCase("none")) {
+            return itemId;
+        }
+        if (exactRegisteredItem(itemId) != null) {
+            return normalizeMinecraftId(itemId);
+        }
+        Item resolved = resolveKnownItem(itemId);
+        if (resolved == null || resolved == Items.AIR) {
+            return itemId;
+        }
+        return BuiltInRegistries.ITEM.getKey(resolved).toString();
     }
 
 
@@ -3341,17 +3418,73 @@ public final class AgentActionExecutor {
         try {
             String raw = llmRouter.generate(promptFactory.contextualLinePrompt(npcName, situation));
             if (raw != null && !raw.isBlank() && raw.length() <= 200) {
-                String cleaned = raw.trim().replaceAll("^\"|\"$", "");
-                if (!cleaned.isBlank()) return cleaned;
+                String cleaned = raw.trim().replaceAll("^\"|\"$", "").trim();
+                if (isSpeakableLine(cleaned)) {
+                    return cleaned;
+                }
             }
         } catch (Exception ignored) {}
         return fallback;
+    }
+
+    private boolean isSpeakableLine(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String trimmed = text.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            return false;
+        }
+        return trimmed.matches(".*[a-zA-Z].*");
     }
 
     public void notifyLlmUnavailable(MinecraftServer server, UUID npcId, String fallbackName) {
         Villager villager = findVillager(server, npcId);
         if (villager == null) return;
         speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
+    }
+
+    public void notifyThinking(MinecraftServer server, UUID npcId, String fallbackName) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null) return;
+        ServerPlayer player = nearestPlayer(server, villager);
+        if (player == null) return;
+        player.sendSystemMessage(Component.literal("§7" + fallbackName + " is thinking…"), true);
+    }
+
+    public boolean cancelActiveTasks(MinecraftServer server, UUID npcId, String fallbackName) {
+        Set<String> cancelled = new LinkedHashSet<>();
+        if (activeScoutTasks.remove(npcId) != null) cancelled.add("scouting");
+        if (activeSearchTasks.remove(npcId) != null) cancelled.add("searching");
+        if (activeMineToChest.remove(npcId) != null) cancelled.add("mining");
+        if (activeMineToPlayer.remove(npcId) != null) cancelled.add("mining");
+        if (activeFellTasks.remove(npcId) != null) cancelled.add("chopping");
+        if (activeScenarioTasks.remove(npcId) != null) cancelled.add("building");
+        if (activeDeliveries.remove(npcId) != null) cancelled.add("fetching");
+        Villager villager = findVillager(server, npcId);
+        if (villager != null) {
+            villager.getNavigation().stop();
+        }
+        if (cancelled.isEmpty()) {
+            return false;
+        }
+        String summary = String.join(", ", cancelled);
+        lastActionSummaryByNpc.put(npcId, "Cancelled on player request: " + summary + ".");
+        if (villager != null) {
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player told you to stop. You cancelled your current task (" + summary + "). Confirm briefly that you stopped.",
+                    "Alright, I stopped what I was doing."));
+        }
+        return true;
+    }
+
+    public boolean sayAsNpc(MinecraftServer server, UUID npcId, String fallbackName, String text) {
+        Villager villager = findVillager(server, npcId);
+        if (villager == null || text == null || text.isBlank()) {
+            return false;
+        }
+        speakAsNpc(server, villager, fallbackName, text);
+        return true;
     }
 
     private void speakAsNpc(MinecraftServer server, Villager villager, String fallbackName, String text) {
@@ -3499,29 +3632,8 @@ public final class AgentActionExecutor {
         try {
             rawClassified = llmRouter.generate(prompt);
             classified = tradeIntentClassifierParser.parse(rawClassified);
-            if (classified.intent() == TradeIntentType.NONE) {
-                String recoveryPrompt = promptFactory.tradeIntentRecoveryPrompt(
-                        instruction,
-                        session.activeOffer == null ? "" : summarizeOffer(session.activeOffer),
-                        tradeStockSummary(server, villager),
-                        session.lastRequestedItemId);
-                String recoveryRaw = llmRouter.generate(recoveryPrompt);
-                TradeIntentClassifierDraft recovered = tradeIntentClassifierParser.parse(recoveryRaw);
-                rawClassified = recoveryRaw;
-                if (recovered.intent() != TradeIntentType.NONE) {
-                    classified = recovered;
-                }
-            }
         } finally {
             tradeLlmInFlightByNpc.put(npcId, false);
-        }
-        if (classified.intent() != TradeIntentType.NONE && classified.confidence() <= 0.0) {
-            classified = new TradeIntentClassifierDraft(
-                    classified.intent(),
-                    classified.itemId(),
-                    classified.quantity(),
-                    classified.counterTotalPrice(),
-                    0.7);
         }
 
         logger.info(
@@ -3547,13 +3659,6 @@ public final class AgentActionExecutor {
         if (classified.intent() == TradeIntentType.NONE) {
             logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: none intent", villager.getName().getString());
             return ParsedTradeIntent.none();
-        }
-        if (classified.confidence() < TRADE_INTENT_CONFIDENCE_THRESHOLD) {
-            logger.info(
-                    "[TRADE-DEBUG] npc={} trade_intent_llm low confidence {} < {}, proceeding because intent is non-none",
-                    villager.getName().getString(),
-                    classified.confidence(),
-                    TRADE_INTENT_CONFIDENCE_THRESHOLD);
         }
         if (classified.intent() == TradeIntentType.ACCEPT_OFFER && session.activeOffer == null) {
             logger.info("[TRADE-DEBUG] npc={} trade_intent_llm rejected: accept_offer without active offer",
@@ -3620,7 +3725,7 @@ public final class AgentActionExecutor {
 
         return new ParsedTradeIntent(
                 llmIntent.type(),
-                itemId == null ? "" : itemId,
+                itemId == null ? "" : canonicalItemId(itemId),
                 quantity,
                 counter);
     }
@@ -3632,6 +3737,7 @@ public final class AgentActionExecutor {
                 player.sendSystemMessage(message);
             }
         }
+        recordNpcUtterance(villager.getUUID(), text.replaceFirst("^\\[LLM NPC\\]\\s*", ""));
     }
 
     private double squaredDistance(BlockPos a, BlockPos b) {
@@ -3705,12 +3811,6 @@ public final class AgentActionExecutor {
             int neededCount,
             int nearbyCount,
             boolean playerHasEnough) {
-    }
-
-    private record SearchRequest(
-            String label,
-            String entityTypeId,
-            boolean requirePinkSheep) {
     }
 
     private enum SearchPhase {
@@ -3911,6 +4011,10 @@ public final class AgentActionExecutor {
                 villager.getName().getString(), player.getName().getString(), instruction, snapshot, memory,
                 scenarioContext, tradeContext);
         String replyRaw = llmRouter.generate(replyPrompt);
+        if (replyRaw != null && replyRaw.contains(LlmRouter.UNAVAILABLE_SENTINEL)) {
+            speakAsNpc(server, villager, fallbackName, "Give me a moment, I'm having trouble thinking right now...");
+            return true;
+        }
         String text = parseDialogueText(replyRaw);
         if (text == null || text.isBlank()) {
             text = "Hmm, I'm not sure how to respond to that.";
@@ -4044,6 +4148,7 @@ public final class AgentActionExecutor {
         lastScenarioDescByNpc.put(npcId, desc);
         ScenarioTask task = new ScenarioTask(
                 nearest.getUUID(), nearest.getName().getString(), plan.scenario(), plan.steps());
+        lastBuildBlocks.remove(npcId);
         activeScenarioTasks.put(npcId, task);
         String announce = plan.announce() == null || plan.announce().isBlank()
                 ? "Starting " + plan.scenario() + "."
@@ -4096,6 +4201,7 @@ public final class AgentActionExecutor {
         lastScenarioDescByNpc.put(npcId, instruction);
         ScenarioTask task = new ScenarioTask(
                 player.getUUID(), player.getName().getString(), plan.scenario(), plan.steps());
+        lastBuildBlocks.remove(npcId);
         activeScenarioTasks.put(npcId, task);
         lastActionSummaryByNpc.put(npcId, buildScenarioPlanSummary(plan));
         String announce = plan.announce() == null || plan.announce().isBlank()
@@ -4222,6 +4328,14 @@ public final class AgentActionExecutor {
         ServerPlayer player = findPlayerByName(server, playerName);
         if (player == null || player.level() != villager.level()) return false;
         if (ownerPlayerId != null && !ownerPlayerId.equals(player.getUUID())) return false;
+        if (!isSearchableCreature(entityId)) {
+            speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                    "The player asked you to find '" + (entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId)
+                            + "', but that is not a living creature you can track down. Explain you can only locate animals and mobs, "
+                            + "and offer to scout the area or fetch an item from a chest instead.",
+                    "I can only track down living creatures, not that. I can scout the area or fetch items from a chest, though."));
+            return true;
+        }
         if (activeSearchTasks.containsKey(npcId)) {
             String label = entityLabel != null && !entityLabel.isBlank() ? entityLabel : entityId;
             speakSearchStatusWithLlm(server, villager, fallbackName, player.getName().getString(),
@@ -4270,6 +4384,23 @@ public final class AgentActionExecutor {
                 "direction=" + direction + "; distance=" + distance + "; objective=" + instruction,
                 "I will scout the area and report back.");
         return true;
+    }
+
+    private boolean isSearchableCreature(String entityId) {
+        String normalized = normalizeMinecraftId(entityId);
+        if (normalized == null) {
+            return false;
+        }
+        try {
+            Identifier key = Identifier.parse(normalized);
+            EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(key).map(ref -> ref.value()).orElse(null);
+            if (type == null) {
+                return false;
+            }
+            return type.getCategory() != MobCategory.MISC;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private boolean isScenarioIntent(String raw) {
@@ -4417,8 +4548,15 @@ public final class AgentActionExecutor {
                 int rx = p.has("relative_x") ? p.get("relative_x").getAsInt() : 0;
                 int ry = p.has("relative_y") ? p.get("relative_y").getAsInt() : 0;
                 int rz = p.has("relative_z") ? p.get("relative_z").getAsInt() : 0;
-                executePlacePattern(level, villager, blockId, pattern, width, height, length, rx, ry, rz);
-                task.currentStepIndex++;
+                int placed = executePlacePattern(level, villager, blockId, pattern, width, height, length, rx, ry, rz);
+                if (placed == 0) {
+                    speakAsNpc(server, villager, fallbackName, contextualLine(villager.getName().getString(),
+                            "You tried to build a " + pattern + " but there was no free space nearby, so nothing was placed. Tell the player honestly and ask them to find a clearer spot.",
+                            "I couldn't build here — there's no free space. Let's try a clearer spot."));
+                    task.cancelled = true;
+                } else {
+                    task.currentStepIndex++;
+                }
             }
             case "fetch_from_chest" -> {
                 JsonObject p = step.parameters();
@@ -4474,11 +4612,15 @@ public final class AgentActionExecutor {
         }
         BlockPos npcPos = villager.blockPosition();
         BlockPos target = npcPos.offset(rx, ry, rz);
+        if (wouldSuffocateEntity(level, target)) {
+            logger.info("[SCENARIO] Skipped placing {} at {}: position occupied by a living entity", blockId, target);
+            return;
+        }
         level.setBlockAndUpdate(target, block.defaultBlockState());
         logger.info("[SCENARIO] Placed {} at {}", blockId, target);
     }
 
-    private void executePlacePattern(
+    private int executePlacePattern(
             ServerLevel level, Villager villager,
             String blockId, String pattern,
             int width, int height, int length,
@@ -4486,27 +4628,98 @@ public final class AgentActionExecutor {
         Block block = resolvePlaceableBlock(blockId);
         if (block == null) {
             logger.warn("[SCENARIO] Unknown block id for pattern: {}", blockId);
-            return;
+            return 0;
         }
-        BlockPos origin = villager.blockPosition().offset(rx, ry, rz);
         String patternKey = pattern.toLowerCase(Locale.ROOT);
-        List<BlockPos> positions = switch (patternKey) {
+        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
+        BlockPos requested = villager.blockPosition().offset(rx, ry, rz);
+        List<BlockPos> positions = patternPositions(patternKey, requested, width, height, length);
+        BlockPos origin = requested;
+
+        if (containsNpcSpace(positions, villager) || (!overwrite && airCount(level, positions) == 0)) {
+            Direction facing = villager.getDirection();
+            Direction[] shiftCandidates = {facing, facing.getClockWise(), facing.getCounterClockWise(), facing.getOpposite()};
+            search:
+            for (int distance = 2; distance <= 6; distance += 2) {
+                for (Direction dir : shiftCandidates) {
+                    BlockPos candidate = requested.relative(dir, distance);
+                    List<BlockPos> candidatePositions = patternPositions(patternKey, candidate, width, height, length);
+                    if (containsNpcSpace(candidatePositions, villager)) {
+                        continue;
+                    }
+                    if (!overwrite && airCount(level, candidatePositions) < candidatePositions.size()) {
+                        continue;
+                    }
+                    origin = candidate;
+                    positions = candidatePositions;
+                    logger.info("[SCENARIO] Shifted {} pattern origin to {} to find safe free space", patternKey, origin);
+                    break search;
+                }
+            }
+        }
+        if (containsNpcSpace(positions, villager)) {
+            logger.info("[SCENARIO] No safe origin found for {} pattern near {}; skipping placement", patternKey, requested);
+            return 0;
+        }
+
+        int placed = 0;
+        int skippedOccupied = 0;
+        List<BlockPos> placedPositions = new ArrayList<>();
+        for (BlockPos pos : positions) {
+            if (wouldSuffocateEntity(level, pos)) {
+                skippedOccupied++;
+                continue;
+            }
+            if (overwrite || level.getBlockState(pos).isAir()) {
+                level.setBlockAndUpdate(pos, block.defaultBlockState());
+                placedPositions.add(pos.immutable());
+                placed++;
+            }
+        }
+        if (!placedPositions.isEmpty()) {
+            lastBuildBlocks.computeIfAbsent(villager.getUUID(), ignored -> new ArrayList<>()).addAll(placedPositions);
+        }
+        if (skippedOccupied > 0) {
+            logger.info("[SCENARIO] Skipped {} positions occupied by living entities in {} pattern", skippedOccupied, patternKey);
+        }
+        logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+        return placed;
+    }
+
+    private int airCount(ServerLevel level, List<BlockPos> positions) {
+        int count = 0;
+        for (BlockPos pos : positions) {
+            if (level.getBlockState(pos).isAir()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private List<BlockPos> patternPositions(String patternKey, BlockPos origin, int width, int height, int length) {
+        return switch (patternKey) {
             case "wall"    -> wallPositions(origin, width, height);
             case "pillar"  -> pillarPositions(origin, height);
             case "outline" -> outlinePositions(origin, width, length);
             case "hut"     -> hutPositions(origin, width, height, length);
             default        -> floorPositions(origin, width, length);
         };
-        // Floors, outlines and huts overwrite existing ground; walls/pillars only fill air
-        boolean overwrite = patternKey.equals("floor") || patternKey.equals("outline") || patternKey.equals("hut");
-        int placed = 0;
+    }
+
+    private boolean containsNpcSpace(List<BlockPos> positions, Villager villager) {
+        BlockPos feet = villager.blockPosition();
+        BlockPos head = feet.above();
         for (BlockPos pos : positions) {
-            if (overwrite || level.getBlockState(pos).isAir()) {
-                level.setBlockAndUpdate(pos, block.defaultBlockState());
-                placed++;
+            if (pos.equals(feet) || pos.equals(head)) {
+                return true;
             }
         }
-        logger.info("[SCENARIO] Placed {} blocks of {} in {} pattern at {}", placed, blockId, pattern, origin);
+        return false;
+    }
+
+    private boolean wouldSuffocateEntity(ServerLevel level, BlockPos pos) {
+        AABB box = new AABB(pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1);
+        return !level.getEntitiesOfClass(LivingEntity.class, box, LivingEntity::isAlive).isEmpty();
     }
 
     private List<BlockPos> floorPositions(BlockPos origin, int width, int length) {

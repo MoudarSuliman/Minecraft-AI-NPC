@@ -5,6 +5,7 @@ import com.example.ai.memory.MemoryEntry;
 import com.example.ai.perception.WorldSnapshot;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import java.util.List;
 import java.util.Map;
 
 public final class PromptFactory {
@@ -16,7 +17,7 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, "", "", "", "");
     }
 
     public String actionSelectionPrompt(
@@ -28,8 +29,60 @@ public final class PromptFactory {
             String targetHint,
             String previousInstruction
     ) {
-        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "");
+        return actionSelectionPrompt(snapshot, memory, hasPendingInstruction, latestInstruction, expectedIntent, targetHint, previousInstruction, "", "", "");
     }
+
+    private static final String ACTION_SELECTION_SCHEMA =
+            "{\"intent\":\"idle|dialogue_reply|ask_clarification|cancel_task|confirm_yes|confirm_no|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}";
+
+    private static final String ACTION_SELECTION_RULES_PENDING =
+            "Never return idle when has_pending_instruction is true.\n"
+                + "DECISION TABLE — pick the FIRST row that matches latest_instruction:\n"
+                + "0. pending_confirmation is present + short affirmative reply ('yes', 'yep', 'yeah', 'ok', 'sure', 'go ahead', 'do it', 'please do') -> confirm_yes with parameters {}. Short negative ('no', 'nope', 'never mind', 'not now') -> confirm_no with parameters {}. This row OVERRIDES everything below, including anything suggested by memory — never answer a confirmation with a new action. Only skip this row if the message is clearly a different, unrelated request.\n"
+                + "1. expected_intent is non-empty -> use exactly expected_intent.\n"
+                + "2. active_offer present + short agreement or a take/buy request ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold', 'give me one', 'give me 1', 'gimme', 'deal me one', 'I'll take it', 'buy it') -> trade_accept. With an offer already on the table, a bare 'give me'/'gimme' means accept THAT offer — never treat it as vague.\n"
+                + "3. active_offer present + short rejection ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline.\n"
+                + "4. active_offer present + different price proposed ('how about 2 emeralds', 'that is too much') -> trade_counter.\n"
+                + "5. Order to stop, cancel, or abort what the NPC is currently doing ('stop', 'stop that', 'cancel', 'come back', 'abort', 'stop building') -> cancel_task. ONLY for stopping the NPC's activity — insults, profanity, or venting ('fk u', 'screw you', 'you suck') are NOT cancel_task; they are dialogue_reply (respond calmly, stay in character).\n"
+                + "6. Question about the NPC itself — identity, abilities, feelings — or greetings, thanks, small talk -> dialogue_reply.\n"
+                + "7. Question about how to craft/make an item or its recipe -> recipe_reply.\n"
+                + "8. Direct imperative order to build/construct/place/set up a structure (floor, wall, hut, house, shelter, platform, pattern of blocks) -> build_structure with parameters {\"description\":\"<the full instruction text>\"}. Anything phrased as a QUESTION — starting with 'can you', 'can u', 'could you', 'could u', 'will you', 'would you', 'are you able to', 'do you know how to' — is dialogue_reply: answer and ask whether they want it built ('can you build a pillar?' -> dialogue_reply, 'can u build a pillar' -> dialogue_reply). A direct imperative build order is NEVER dialogue_reply or recipe_reply.\n"
+                + "9. Message about buying, selling, trading, stock, prices, or what the NPC has for sale -> trade_offer.\n"
+                + "10. Order to find/locate/search for/lead to a living CREATURE (animal or mob) -> search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}. This is ONLY for creatures; the NPC always asks the player to confirm before starting. To find an ITEM or block (eggs, diamonds, a diamond block) do NOT use search_entity: use fetch_from_chest if it could be in a chest, otherwise dialogue_reply explaining you can't locate loose items but can fetch from a chest or scout.\n"
+                + "11. Direct imperative order to bring, fetch, get, or find an ITEM (not a creature) -> fetch_from_chest with parameters {\"item_id\":\"minecraft:...\",\"count\":1}. This covers 'get me an egg', 'find me an egg', 'bring me some wheat' -> fetch_from_chest, because items are retrieved from chests, not hunted in the open world. A QUESTION about items — 'can you search for eggs', 'can you get eggs?', 'do you have wheat?' — is dialogue_reply: answer and offer to fetch from a chest, do not fetch yet.\n"
+                + "12. Order to mine, break, clear, remove, cut, or chop blocks -> mine_block. Choose parameters.scope:\n"
+                + "     - 'cut down a tree', 'chop a tree', 'fell that tree', 'chop wood' -> {\"scope\":\"tree\"} (no block needed; handles any wood species and the whole trunk).\n"
+                + "     - 'get rid of the torches', 'clear the glass', 'remove all the cobblestone' -> {\"scope\":\"area\",\"block\":\"minecraft:...\"} (clears every matching block nearby).\n"
+                + "     - 'break the house you built', 'take down that build', 'undo what you built', 'remove your structure' -> {\"scope\":\"own_build\"}.\n"
+                + "     - plain mining ('mine some stone', 'mine 3 cobblestone') -> {\"block\":\"minecraft:...\",\"count\":N} (count is the number asked for, 1 if unspecified; if the message is just a number answering 'how many', take the block from previous_instruction).\n"
+                + "   Mine and store in a chest -> mine_to_chest {\"block\":\"minecraft:...\",\"count\":1}. Mine and hand to the player -> mine_to_player {\"block\":\"minecraft:...\",\"count\":1}.\n"
+                + "13. Order with an explicit travel verb ('go', 'scout', 'explore', 'check out', 'head to', 'travel') to look around and report back -> scout_explorer with parameters {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. The NPC always asks the player to confirm before departing. Questions about scouting plans ('where will you scout?', 'when will you go?') are dialogue_reply, and so is any message without a travel verb.\n"
+                + "14. Message clearly wants an ACTION but is missing a needed detail — no target ('can you search?'), an unresolved pronoun with no referent ('do it', 'use those') -> ask_clarification with parameters {\"text\":\"<one short question asking for the SPECIFIC missing detail of latest_instruction — the target, item, direction, or amount>\"}. The question must be about latest_instruction, not about older messages (earlier conversation may only help resolve what a pronoun refers to). NEVER use ask_clarification for conversation, greetings, small talk, opinions, or any question the NPC can simply answer — those are always dialogue_reply. A question about something the NPC just SAID ('in which direction?' right after the NPC mentioned mobs, 'how far?', 'how many?') is dialogue_reply answered from the world data, NOT a clarification.\n"
+                + "15. Anything else — including all conversation, greetings, small talk, opinions, and questions about the NPC or the world -> dialogue_reply with parameters {\"text\":\"<the NPC's reply in its own words — never echo the player's message>\"}.\n"
+                + "ADDITIONAL RULES:\n"
+                + "- If previous_instruction is set and latest_instruction challenges or retries it ('are you sure?', 'check again', 'try again', 'look harder'), classify as if latest_instruction were previous_instruction.\n"
+                + "- If active_offer is NOT present and latest_instruction is a plain go-ahead ('yes', 'yes please', 'yes pls', 'do it', 'go ahead', 'sounds great pls do') and previous_instruction or the NPC's last message in memory asked about or offered a task, classify that task as a direct order now, using the intent that task would get as a command: a chop/cut-tree offer -> mine_block {\"scope\":\"tree\"}, a build offer -> build_structure with description from the original request, a search offer -> search_entity. NEVER route a go-ahead for chopping to build_structure.\n"
+                + "- If pending_confirmation is present, the NPC has just asked the player to confirm the action described in it. An affirmative reply ('yes', 'yeah', 'ok', 'go ahead', 'do it', 'sure', 'please do') -> confirm_yes. A negative reply ('no', 'nope', 'never mind', 'don't', 'not now') -> confirm_no. If the message is instead a new unrelated request, ignore pending_confirmation and route it normally.\n"
+                + "- If pending_clarification is present, the NPC just asked the player the question in it about the original instruction in it. If latest_instruction answers that question ('cobblestone', 'the hut', 'the second one'), classify the original instruction as completed by that answer and fill parameters from both. If latest_instruction questions or comments on the NPC's question ('why', 'what do you mean'), use dialogue_reply. If the player says the NPC misunderstood ('nah I meant...', 'no, I was asking about...'), the clarification is void: use dialogue_reply about what the player actually meant, and NEVER ask the same clarification question again. If the reply still does NOT supply the missing detail (e.g. answer 'search' to 'what should I search for?'), use ask_clarification again with a DIFFERENT, more specific question — never repeat the same wording. If it is a new unrelated request, route it normally and ignore pending_clarification.\n"
+                + "- Rows 2-4 cover only short trade responses: identity, capability, and crafting questions are NEVER trade intents, even with an active offer.\n"
+                + "- If the NPC only SUGGESTED an action in dialogue and the player replies with enthusiasm or a question ('sounds good', 'where will you go?') without a direct command, use dialogue_reply to ask for confirmation instead of starting the action.\n"
+                + "- The NPC never needs tools: mining, chopping, and building work without any tool. When cutting a tree it automatically uses an axe or pickaxe from a nearby chest if one is there, and its bare hands otherwise. NEVER emit fetch_from_chest for a tool (pickaxe, axe, shovel) as a step before another task.\n"
+                + "- If target_hint is non-empty, copy it into parameters.block or parameters.item_id.\n"
+                + "- No destructive behavior, stay near the NPC, respect safety. Output strict JSON only, no markdown.\n"
+                + "EXAMPLES:\n"
+                + "'who are you?' -> dialogue_reply. 'what can you do?' -> dialogue_reply. 'thank you' -> dialogue_reply.\n"
+                + "'wassup' -> dialogue_reply. 'how's your day been' -> dialogue_reply. 'you sound aggressive' -> dialogue_reply. 'how are you' -> dialogue_reply.\n"
+                + "'what do I need to make a diamond pickaxe?' -> recipe_reply. 'how do I craft a furnace?' -> recipe_reply.\n"
+                + "'build me a hut with cobble stone' -> build_structure. 'make me a small shelter' -> build_structure. 'can you build?' -> dialogue_reply. 'can you build a pillar?' -> dialogue_reply. 'can u build a pillar' -> dialogue_reply. 'yes, do it' (previous_instruction='can you build a pillar?') -> build_structure.\n"
+                + "'what do you sell?' -> trade_offer. 'how much does wood cost?' -> trade_offer. 'I want to buy wood' -> trade_offer. 'do you have oak logs?' -> trade_offer.\n"
+                + "'find me a chicken' -> search_entity. 'find a pig' -> search_entity. 'find a sheep' -> search_entity (ALWAYS search_entity for a find/locate order, even if earlier conversation said otherwise). 'go check out east' -> scout_explorer. 'where will you scout?' -> dialogue_reply.\n"
+                + "'stop' -> cancel_task. 'come back' -> cancel_task. 'stop building' -> cancel_task. 'fk u' -> dialogue_reply. 'you suck' -> dialogue_reply.\n"
+                + "'mine some stone' -> mine_block {\"block\":\"minecraft:stone\",\"count\":1}. 'mine 3 grass blocks' -> mine_block {\"block\":\"minecraft:grass_block\",\"count\":3}.\n"
+                + "'cut down a tree' -> mine_block {\"scope\":\"tree\"}. 'get rid of the torches' -> mine_block {\"scope\":\"area\",\"block\":\"minecraft:torch\"}. 'break the house you built' -> mine_block {\"scope\":\"own_build\"}. 'sounds great pls do' (previous_instruction='can you chop down a tree?') -> mine_block {\"scope\":\"tree\"}, NOT build_structure.\n"
+                + "'do it' (nothing to refer to) -> ask_clarification {\"text\":\"What would you like me to do, exactly?\"}. 'can you search?' -> ask_clarification {\"text\":\"Sure — what should I search for?\"}.";
+
+    private static final String ACTION_SELECTION_RULES_IDLE =
+            "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.";
 
     public String actionSelectionPrompt(
             WorldSnapshot snapshot,
@@ -39,174 +92,60 @@ public final class PromptFactory {
             String expectedIntent,
             String targetHint,
             String previousInstruction,
-            String activeOfferSummary
+            String activeOfferSummary,
+            String pendingClarificationSummary,
+            String pendingConfirmationSummary
     ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("role", "You are an embodied Minecraft NPC. Return JSON only.");
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("has_pending_instruction", hasPendingInstruction);
-        payload.addProperty("latest_instruction", latestInstruction);
+        StringBuilder sb = new StringBuilder(8192);
+        sb.append("You are an embodied Minecraft NPC. Decide the NPC's next action.\n");
+        sb.append("Return ONLY strict JSON matching this schema, no markdown, no extra text:\n");
+        sb.append(ACTION_SELECTION_SCHEMA).append('\n');
+        sb.append("CONSTRAINTS:\n");
+        sb.append(hasPendingInstruction ? ACTION_SELECTION_RULES_PENDING : ACTION_SELECTION_RULES_IDLE).append('\n');
+
+        JsonObject data = new JsonObject();
+        data.addProperty("has_pending_instruction", hasPendingInstruction);
+        data.addProperty("latest_instruction", latestInstruction);
         if (previousInstruction != null && !previousInstruction.isBlank()) {
-            payload.addProperty("previous_instruction", previousInstruction);
+            data.addProperty("previous_instruction", previousInstruction);
         }
-        payload.addProperty("expected_intent", expectedIntent);
-        payload.addProperty("target_hint", targetHint);
+        data.addProperty("expected_intent", expectedIntent);
+        data.addProperty("target_hint", targetHint);
         if (activeOfferSummary != null && !activeOfferSummary.isBlank()) {
-            payload.addProperty("active_offer", activeOfferSummary);
+            data.addProperty("active_offer", activeOfferSummary);
         }
-        payload.addProperty("required_schema",
-                        "{\"intent\":\"idle|dialogue_reply|recipe_reply|search_entity|scout_explorer|move_to|fetch_from_chest|mine_block|mine_to_chest|mine_to_player|trade_offer|trade_accept|trade_decline|trade_counter|place_block|break_block|build_structure\",\"parameters\":{},\"reasoning\":\"...\",\"priority\":0.0}");
-        payload.addProperty("constraints", hasPendingInstruction
-                ? "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown. "
-                + "If has_pending_instruction is true, you MUST NOT return idle. "
-                + "IMPORTANT — intent selection rules in priority order:\n"
-                + "0. CHALLENGE DETECTION: If previous_instruction is set and latest_instruction is clearly challenging "
-                + "or asking to retry the previous action ('are you sure?', 'check again', 'really?', 'try again', 'look harder'), "
-                + "classify as if latest_instruction were previous_instruction.\n"
-                + "1. TRADE intents apply when the player's message is explicitly about buying, selling, trading, stock, "
-                + "pricing, or items the NPC sells. "
-                + "   trade_offer: player wants to buy/trade/get items, or asks what you sell, what you have in stock, "
-                + "     what something costs, or expresses general trading intent. "
-                + "     Examples: 'what do you sell?' -> trade_offer. 'what items do you have for sale?' -> trade_offer. "
-                + "     'I want to buy wood' -> trade_offer. 'give me the items' -> trade_offer. "
-                + "     'do you have oak logs?' -> trade_offer. 'how much does wood cost?' -> trade_offer. "
-                + "     'I want to trade' -> trade_offer. 'what can I buy?' -> trade_offer.\n"
-                + "   trade_accept: player agrees to a deal. Examples: 'deal', 'ok', 'yes', 'fine', 'sure'.\n"
-                + "   trade_decline: player rejects an offer. Examples: 'no thanks', 'forget it', 'never mind'.\n"
-                + "   trade_counter: player proposes different terms. Examples: 'how about 2 emeralds?', 'that is too much'.\n"
-                + "   ACTIVE OFFER RULE: If active_offer is present in this prompt, the NPC has an open trade proposal. "
-                + "In that context, short affirmative replies ('deal', 'yes', 'ok', 'fine', 'sure', 'take it', 'sold', 'agreed') -> trade_accept. "
-                + "Short rejections ('no', 'no thanks', 'forget it', 'never mind', 'pass') -> trade_decline. "
-                + "Price counter-proposals ('how about X', 'that is too much', 'I will give you X') -> trade_counter. "
-                + "Questions about the NPC identity, capabilities, or crafting are ALWAYS dialogue_reply or recipe_reply even with an active offer.\n"
-                + "   EXCEPTION — these are NEVER trade_offer, always use the intent shown:\n"
-                + "     'who are you?' -> dialogue_reply. 'what can you do?' -> dialogue_reply. "
-                + "     'what are you?' -> dialogue_reply. 'tell me about yourself' -> dialogue_reply. "
-                + "     'what do I need to make X?' -> recipe_reply. 'how do I craft X?' -> recipe_reply. "
-                + "     Conversational follow-ups: 'when would that be', 'really?', 'are you sure', 'thank you', 'okay' -> dialogue_reply.\n"
-                + "   NEVER use trade_offer for identity questions, capability questions, or crafting/recipe questions.\n"
-                + "2. CRITICAL: If latest_instruction asks to build, construct, place, create, make, or set up a structure, "
-                + "floor, wall, hut, house, shelter, or pattern of blocks — you MUST use intent build_structure. "
-                + "EXCEPTION: If the instruction is a question about capability or knowledge — e.g. 'do you know how to build', "
-                + "'can you build', 'are you able to build', 'could you build' — use dialogue_reply, NOT build_structure. "
-                + "Only use build_structure when the player is giving a direct instruction, not asking a question. "
-                + "NEVER use dialogue_reply for a direct build request. "
-                + "Examples (all MUST be build_structure): "
-                + "'build a 3x3 cobblestone floor' -> build_structure. "
-                + "'build me a hut' -> build_structure. "
-                + "'build me a hut with cobble stone' -> build_structure. "
-                + "'build me a house out of wood' -> build_structure. "
-                + "'make me a small shelter' -> build_structure. "
-                + "'construct a wall to the north' -> build_structure. "
-                + "'set up a floor here' -> build_structure. "
-                + "Parameters: {\"description\":\"<the full instruction text>\"}\n"
-                + "3. If latest_instruction asks about crafting, how to make an item, or what the recipe for something is, "
-                + "use intent recipe_reply. "
-                + "Examples: 'how do I make a sword?' -> recipe_reply. 'what is the recipe for a pickaxe?' -> recipe_reply. "
-                + "'what do I need to craft a furnace?' -> recipe_reply. "
-                + "NEVER use recipe_reply for build requests ('build me a hut' is build_structure, not recipe_reply).\n"
-                + "4. If latest_instruction asks the NPC to find, locate, lead, or search for a specific creature, "
-                + "use intent search_entity with parameters {\"entity_id\":\"minecraft:chicken\",\"entity_label\":\"a chicken\"}. "
-                + "Examples: 'find me a chicken' -> search_entity. 'locate the nearest cow' -> search_entity. "
-                + "'lead me to a sheep' -> search_entity. 'search for a zombie' -> search_entity.\n"
-                + "5. If latest_instruction asks to bring/fetch an item, use intent fetch_from_chest with "
-                + "parameters {\"item_id\":\"minecraft:...\",\"count\":1}.\n"
-                + "6. If latest_instruction asks to mine a block, use intent mine_block with "
-                + "parameters {\"block\":\"minecraft:...\"}.\n"
-                + "7. If latest_instruction asks to mine and put/store in chest, use intent mine_to_chest with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "8. If latest_instruction asks to mine and give to player, use intent mine_to_player with "
-                + "parameters {\"block\":\"minecraft:...\",\"count\":1}.\n"
-                + "9. scout_explorer ONLY when latest_instruction contains explicit travel/exploration verbs: "
-                + "'go', 'scout', 'explore', 'check out', 'head to', 'travel', 'report back after going'. "
-                + "Parameters: {\"direction\":\"north|south|east|west|forward|around\",\"distance\":48,\"focus\":\"biome|structures|hostiles|resources|anything\",\"return_report\":true}. "
-                + "NEVER use scout_explorer for greetings, questions, build requests, vague replies ('ok', 'use those'), or anything without a travel verb. "
-                + "NEVER use scout_explorer for questions like 'where will you scout?', 'when will you go?', 'where are you going?' — these are dialogue_reply.\n"
-                + "CONFIRMATION RULE: If the NPC previously OFFERED or SUGGESTED an action in dialogue (e.g. 'I could scout a river') "
-                + "and the player responds with enthusiasm or a question about it ('that would be dope', 'where will you scout', 'sounds good') "
-                + "WITHOUT giving an explicit command ('go', 'do it', 'yes'), use dialogue_reply to ask for confirmation first "
-                + "(e.g. 'Want me to head east and look for a river?'). Only execute the action when the player explicitly says to proceed.\n"
-                + "10. If expected_intent is non-empty, you MUST set intent exactly to expected_intent.\n"
-                + "11. If target_hint is non-empty, use it in parameters.block or parameters.item_id.\n"
-                + "12. All other questions or conversation — greetings, questions about abilities, small talk — use dialogue_reply. "
-                + "For dialogue_reply, parameters.text MUST be the NPC's own reply in its own words — "
-                + "NEVER repeat or echo the player's message. "
-                + "Examples: 'can you build?' -> dialogue_reply. 'you there?' -> dialogue_reply. 'hello' -> dialogue_reply. "
-                + "STRICT RULE: NEVER use dialogue_reply when the instruction contains 'build', 'construct', 'make a', 'create', or 'set up' referring to a structure — use build_structure instead."
-                : "No destructive behavior, stay near NPC, respect safety, output strict JSON only with no markdown.");
-        return payload.toString();
+        if (pendingClarificationSummary != null && !pendingClarificationSummary.isBlank()) {
+            data.addProperty("pending_clarification", pendingClarificationSummary);
+        }
+        if (pendingConfirmationSummary != null && !pendingConfirmationSummary.isBlank()) {
+            data.addProperty("pending_confirmation", pendingConfirmationSummary);
+        }
+        data.add("perception", snapshot.toJson());
+        data.add("memory", trimmedMemoryToJson(memory, 8, 4, 4));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Decide the intent for latest_instruction now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
-    public String dialoguePrompt(String playerText, WorldSnapshot snapshot, MemoryContext memory) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "dialogue");
-        payload.addProperty("player_utterance", playerText);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format", "{\"intent\":\"dialogue_reply\",\"parameters\":{\"text\":\"...\"},\"reasoning\":\"...\",\"priority\":0.0}");
-        return payload.toString();
+    private JsonObject trimmedMemoryToJson(MemoryContext memory, int shortN, int workingN, int longN) {
+        JsonObject json = new JsonObject();
+        json.add("short_term", tailArray(memory.shortTerm(), shortN));
+        json.add("working", tailArray(memory.working(), workingN));
+        JsonArray longArray = new JsonArray();
+        List<MemoryEntry> longTerm = memory.longTerm();
+        for (int i = 0; i < Math.min(longN, longTerm.size()); i++) {
+            longArray.add(longTerm.get(i).toJson());
+        }
+        json.add("long_term", longArray);
+        return json;
     }
 
-    public String planningPrompt(String objective, WorldSnapshot snapshot, MemoryContext memory) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "planning");
-        payload.addProperty("objective", objective);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format",
-                "{\"intent\":\"build_structure\",\"parameters\":{\"steps\":[{\"intent\":\"move_to\",\"parameters\":{}},{\"intent\":\"place_block\",\"parameters\":{}}]},\"reasoning\":\"...\",\"priority\":0.0}");
-        return payload.toString();
-    }
-
-    public String scoutIntentPrompt(
-            String npcName,
-            String playerName,
-            String playerText,
-            WorldSnapshot snapshot,
-            MemoryContext memory) {
-        String direction = "around";
-        String lower = playerText == null ? "" : playerText.toLowerCase(java.util.Locale.ROOT);
-        if (lower.contains("north")) direction = "north";
-        else if (lower.contains("south")) direction = "south";
-        else if (lower.contains("east")) direction = "east";
-        else if (lower.contains("west")) direction = "west";
-        return "Classify this Minecraft player instruction.\n"
-                + "Player (" + playerName + ") said to NPC (" + npcName + "): \"" + playerText + "\"\n"
-                + "\n"
-                + "RULE: Only classify as scout_explorer if the player is explicitly asking the NPC to physically\n"
-                + "TRAVEL to a location, look around there, and COME BACK to report. Everything else is idle.\n"
-                + "\n"
-                + "idle examples (NOT scouting):\n"
-                + "  'you there?' -> idle\n"
-                + "  'hey' -> idle\n"
-                + "  'hello' -> idle\n"
-                + "  'are you there?' -> idle\n"
-                + "  'what are you doing?' -> idle\n"
-                + "  'do you have sticks' -> idle\n"
-                + "  'how much does glass cost' -> idle\n"
-                + "  'craft me a pickaxe' -> idle\n"
-                + "  'can you help me' -> idle\n"
-                + "\n"
-                + "scout_explorer examples (scouting ONLY):\n"
-                + "  'go check out east and let me know what you see' -> scout_explorer, direction=east\n"
-                + "  'go check out east' -> scout_explorer, direction=east\n"
-                + "  'scout north for me' -> scout_explorer, direction=north\n"
-                + "  'go look around and tell me what you find' -> scout_explorer, direction=around\n"
-                + "  'explore to the west' -> scout_explorer, direction=west\n"
-                + "  'go see what is over there and report back' -> scout_explorer, direction=around\n"
-                + "\n"
-                + "The player said: \"" + playerText + "\"\n"
-                + "Does this instruction require the NPC to physically TRAVEL somewhere and come back? "
-                + (lower.contains("go") || lower.contains("scout") || lower.contains("explore") || lower.contains("check out")
-                        ? "The message contains a movement/scout verb."
-                        : "The message does NOT contain a movement or scouting verb — default to idle.")
-                + "\n\n"
-                + "Return ONLY valid JSON, no extra text.\n"
-                + "If this is NOT a scouting request (the default):\n"
-                + "{\"intent\":\"idle\",\"parameters\":{},\"reasoning\":\"not a scout request\",\"priority\":0.0}\n"
-                + "If this IS explicitly a scouting request:\n"
-                + "{\"intent\":\"scout_explorer\",\"parameters\":{\"direction\":\"" + direction + "\",\"distance\":48,\"focus\":\"anything\",\"return_report\":true},\"reasoning\":\"player asked to explore\",\"priority\":0.8}";
+    private JsonArray tailArray(List<MemoryEntry> entries, int limit) {
+        JsonArray array = new JsonArray();
+        for (int i = Math.max(0, entries.size() - limit); i < entries.size(); i++) {
+            array.add(entries.get(i).toJson());
+        }
+        return array;
     }
 
     public String scoutReportPrompt(
@@ -272,28 +211,30 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "trade_negotiation");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("mode", mode);
-        payload.addProperty("active_offer", activeOfferSummary);
-        payload.addProperty("stock_summary", stockSummary);
-        payload.addProperty("required_facts", requiredFacts);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format",
-                "{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. "
-                        + "CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. "
-                        + "REQUIRED: response_text MUST always state the item name and the exact price in emeralds explicitly — e.g. '3 emeralds', 'for 3 emeralds each'. Never omit the price. "
-                        + "Never invent items, prices, or stock. Suggested prices must be integers >= 1. "
-                        + "Always reference the actual stock and item names from required_facts. "
-                        + "If suggesting a new price, set both suggested_unit_price and suggested_total_price. "
-                        + "If counter_total_price is not relevant, omit it or set null.");
-        return payload.toString();
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("You are a Minecraft NPC merchant negotiating a trade with a player.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append("{\"response_text\":\"...\",\"suggested_unit_price\":1,\"suggested_total_price\":2,\"counter_total_price\":123,\"reasoning\":\"...\",\"priority\":0.0}\n");
+        sb.append("RULES: Return strict JSON only. Keep the text natural, brief, and consistent with required_facts. ");
+        sb.append("CRITICAL: Only use 'emeralds' for payment currency - NEVER use 'gold', 'coins', or other currencies. ");
+        sb.append("REQUIRED: response_text MUST always state the item name and the exact price in emeralds explicitly — e.g. '3 emeralds', 'for 3 emeralds each'. Never omit the price. ");
+        sb.append("Never invent items, prices, or stock. Suggested prices must be integers >= 1. ");
+        sb.append("Always reference the actual stock and item names from required_facts. ");
+        sb.append("If suggesting a new price, set both suggested_unit_price and suggested_total_price. ");
+        sb.append("If counter_total_price is not relevant, omit it or set null.\n");
+
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("mode", mode);
+        data.addProperty("active_offer", activeOfferSummary);
+        data.addProperty("stock_summary", stockSummary);
+        data.addProperty("required_facts", requiredFacts);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Write the NPC's negotiation reply now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String recipeAssistantPrompt(
@@ -304,73 +245,28 @@ public final class PromptFactory {
             WorldSnapshot snapshot,
             MemoryContext memory
     ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "recipe_assistant");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("required_facts", requiredFacts);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format", "{\"response_text\":\"...\"}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. Keep response_text concise (max 2 sentences) and natural. "
+        StringBuilder sb = new StringBuilder(2048);
+        sb.append("You are a Minecraft NPC merchant answering a crafting/recipe question.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append("{\"response_text\":\"...\"}\n");
+        sb.append("RULES: ");
+        sb.append("Return strict JSON only. Keep response_text concise (max 2 sentences) and natural. "
                         + "Do not invent quantities, items, stock, or prices not in required_facts. "
                         + "You MUST include the recipe requirements from required_facts. "
                         + "You MUST include the nearby ingredient status from required_facts, but only describe what is actually present. "
                         + "If required_facts available_ingredients contains items the player needs, offer to fetch or hand them over — say something like 'I can get those for you' or 'want me to grab them?'. "
                         + "If required_facts active_offer is \"none\", do NOT claim you can trade or provide items from stock. "
-                        + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.");
-        return payload.toString();
-    }
+                        + "If required_facts includes an active_offer (not \"none\"), you MUST mention the exact offer with emerald currency and ask if the player wants to trade.\n");
 
-    public String recipeIntentClassifierPrompt(
-            String npcName,
-            String playerName,
-            String playerText
-    ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "recipe_intent_classifier");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("format", "{\"is_recipe\":true,\"confidence\":0.0}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. "
-                        + "Set is_recipe=true ONLY when the player is explicitly asking HOW TO CRAFT or what the recipe FOR an item is "
-                        + "(e.g. 'what is the recipe for a diamond pickaxe', 'how do I craft a furnace', 'how do I make a sword'). "
-                        + "Set is_recipe=false for ALL of these:\n"
-                        + "- Build/construct requests (player wants the NPC to physically build something): "
-                        + "  'build me a hut with cobble stone' -> false. "
-                        + "  'build me a hut with cobblestone' -> false. "
-                        + "  'build a 3x3 cobblestone floor' -> false. "
-                        + "  'construct a wall' -> false. "
-                        + "  'make me a shelter out of wood' -> false. "
-                        + "  'set up a floor here' -> false. "
-                        + "- Trade requests, stock questions, or unrelated chat -> false. "
-                        + "KEY RULE: If the player says 'build', 'construct', 'make a [structure]', 'set up' — that is a build order, NOT a recipe question. Return is_recipe=false.");
-        return payload.toString();
-    }
-
-    public String recipeTargetResolverPrompt(
-            String npcName,
-            String playerName,
-            String playerText
-    ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "recipe_target_resolution");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("format", "{\"target_phrase\":\"...\",\"item_id\":\"minecraft:...\",\"confidence\":0.0}");
-        payload.addProperty("constraints",
-                "Return strict JSON only. "
-                        + "Extract the intended craftable target from player_utterance. "
-                        + "Set target_phrase to a short noun phrase like 'diamond pickaxe'. "
-                        + "Set item_id only if reasonably sure (minecraft namespace). "
-                        + "If uncertain, keep item_id empty and still provide best target_phrase. "
-                        + "Do not include extra text.");
-        return payload.toString();
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("required_facts", requiredFacts);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Answer the recipe question now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String relationshipGreetingPrompt(
@@ -382,7 +278,9 @@ public final class PromptFactory {
         payload.addProperty("task", "relationship_greeting");
         payload.addProperty("npc_name", npcName);
         payload.addProperty("player_name", playerName);
-        payload.add("memory", memoryToJson(memory));
+        JsonObject memoryJson = new JsonObject();
+        memoryJson.add("long_term", toArray(memory.longTerm()));
+        payload.add("memory", memoryJson);
         payload.addProperty("format", "{\"response_text\":\"...\"}");
         payload.addProperty("constraints",
                 "Return strict JSON only. Keep response_text short (max 2 sentences), warm, and natural. "
@@ -404,8 +302,6 @@ public final class PromptFactory {
         payload.addProperty("task", "environmental_advisory");
         payload.addProperty("npc_name", npcName);
         payload.addProperty("player_name", playerName == null || playerName.isBlank() ? "player" : playerName);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
         payload.addProperty("format", "{\"response_text\":\"...\", \"severity\":\"low|medium|high\", \"evidence\":[]}");
         payload.addProperty("constraints",
                 "Return strict JSON only. Produce a concise, proactive environment-aware advisory (max 2 short sentences). "
@@ -424,6 +320,7 @@ public final class PromptFactory {
                         + "Only return a non-empty response_text when severity is 'medium' or 'high'. "
                         + "Return strict JSON in this exact format: {\"response_text\":\"...\", \"severity\":\"medium|high|low\", \"evidence\":[\"...\"]}. "
                         + "Do NOT suggest trades, inventory, prices, or cause the NPC to take actions. If nothing noteworthy, return response_text empty and severity 'low'.");
+        payload.add("perception", snapshot.toJson());
         return payload.toString();
     }
 
@@ -457,28 +354,11 @@ public final class PromptFactory {
         return payload.toString();
     }
 
-    public String tradeIntentClassifierPrompt(
-            String npcName,
-            String playerName,
-            String playerText,
-            String activeOfferSummary,
-            String stockSummary,
-            WorldSnapshot snapshot,
-            MemoryContext memory
-    ) {
-        JsonObject payload = new JsonObject();
-        payload.addProperty("task", "trade_intent_classifier");
-        payload.addProperty("npc_name", npcName);
-        payload.addProperty("player_name", playerName);
-        payload.addProperty("player_utterance", playerText);
-        payload.addProperty("active_offer", activeOfferSummary);
-        payload.addProperty("stock_summary", stockSummary);
-        payload.add("perception", snapshot.toJson());
-        payload.add("memory", memoryToJson(memory));
-        payload.addProperty("format",
-                "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
-                        + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}");
-        payload.addProperty("constraints",
+    private static final String TRADE_CLASSIFIER_FORMAT =
+            "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
+                    + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
+
+    private static final String TRADE_CLASSIFIER_RULES =
                 "Return strict JSON only. Choose exactly one intent. Use confidence 0..1. "
                         + "Treat availability/count/price/payment questions as trade intents. "
                         + "Examples that should map to inquire_stock: 'do you have sticks', 'how many sticks do you have', 'what do you sell'. "
@@ -495,7 +375,7 @@ public final class PromptFactory {
                         + "'go see what is there' => none; "
                         + "'explore that area' => none; "
                         + "'go and report back' => none. "
-                        + "If active_offer is present and player indicates agreement (deal/yes/go ahead/take it), map to accept_offer. "
+                        + "If active_offer is present and player indicates agreement OR asks to take/buy it (deal/yes/go ahead/take it/give me one/gimme/deal me one/I'll take it/buy it), map to accept_offer. "
                         + "EXCEPTION: If memory shows the NPC recently said the player does not have enough emeralds or the trade failed, "
                         + "then 'sure', 'u sure', 'you sure?', 'really?', 'are you sure' mean the player is questioning the outcome — map to inquire_session_status, NOT accept_offer. "
                         + "If active_offer is present and player rejects (no/nope/not now), map to decline_offer. "
@@ -519,83 +399,33 @@ public final class PromptFactory {
                         + "'okay' => none; "
                         + "'interesting' => none. "
                         + "Never invent item ids; only use known Minecraft item ids from stock_summary or active_offer. "
-                        + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.");
-        return payload.toString();
-    }
+                        + "If no specific item is mentioned, set item_id to \"none\" — NEVER use \"minecraft:air\" or any placeholder item id.";
 
-    public String tradeIntentRecoveryPrompt(
+    public String tradeIntentClassifierPrompt(
+            String npcName,
+            String playerName,
             String playerText,
             String activeOfferSummary,
             String stockSummary,
-            String lastRequestedItemId
+            WorldSnapshot snapshot,
+            MemoryContext memory
     ) {
-        String safePlayerText = playerText == null ? "" : playerText;
-        String safeActiveOffer = activeOfferSummary == null ? "" : activeOfferSummary;
-        String safeStockSummary = stockSummary == null ? "" : stockSummary;
-        String safeLastItem = lastRequestedItemId == null ? "" : lastRequestedItemId;
+        StringBuilder sb = new StringBuilder(4096);
+        sb.append("You are a Minecraft trade intent classifier for the NPC merchant.\n");
+        sb.append("Return ONLY this JSON object with no extra text:\n");
+        sb.append(TRADE_CLASSIFIER_FORMAT).append('\n');
+        sb.append("RULES: ").append(TRADE_CLASSIFIER_RULES).append('\n');
 
-        return "You are a Minecraft trade intent classifier.\n"
-                + "Classify the player's trade intent.\n"
-                + "Player utterance: " + safePlayerText + "\n"
-                + "Active offer: " + safeActiveOffer + "\n"
-                + "Stock summary: " + safeStockSummary + "\n"
-                + "Last requested item id: " + safeLastItem + "\n"
-                + "Rules:\n"
-                + "- 'do you have X', 'how many X', 'what do you sell' => inquire_stock.\n"
-                + "- 'where are X', 'where can i find X', 'you said you had X' => inquire_stock.\n"
-                + "- 'can I get X', 'give me X', 'I want X' => request_offer.\n- 'what is the recipe for X', 'how do I craft X', 'how to make X' => none (not trade).\n"
-                + "- 'scout X', 'explore ahead', 'check the area', 'report back', 'go check out east', 'go look around', 'go see what is there', 'go check out X and let me know', 'go have a look' => none (not trade, it is a scouting request).\n"
-                + "- active offer + 'deal/yes/sure' => accept_offer.\n"
-                + "- active offer + 'no/nope/not now' => decline_offer.\n"
-                + "- explicit emerald counter => counter_offer with counter_total_price.\n"
-                                + "- If follow-up omits item and last requested item exists, reuse it.\n"
-                + "- Use none only if unrelated to trade.\n"
-                + "- Scout/explore/check area instructions are not trade.\n"
-                + "Return ONLY this JSON object with no extra text:\n"
-                + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
-                + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
-    }
-
-    public String tradeIntentDisambiguationPrompt(
-            String playerText,
-            String activeOfferSummary,
-            String stockSummary,
-            String lastRequestedItemId,
-            String initialIntent,
-            String initialItemId,
-            int initialQuantity,
-            Integer initialCounterTotalPrice,
-            double initialConfidence
-    ) {
-        String safePlayerText = playerText == null ? "" : playerText;
-        String safeActiveOffer = activeOfferSummary == null ? "" : activeOfferSummary;
-        String safeStockSummary = stockSummary == null ? "" : stockSummary;
-        String safeLastItem = lastRequestedItemId == null ? "" : lastRequestedItemId;
-        String safeInitialIntent = initialIntent == null ? "none" : initialIntent;
-        String safeInitialItem = initialItemId == null ? "" : initialItemId;
-        String safeInitialCounter = initialCounterTotalPrice == null ? "null" : String.valueOf(initialCounterTotalPrice);
-        return "You are a Minecraft trade intent classifier.\n"
-                + "Decide the single best trade intent for the player's message.\n"
-                + "Player utterance: " + safePlayerText + "\n"
-                + "Active offer: " + safeActiveOffer + "\n"
-                + "Stock summary: " + safeStockSummary + "\n"
-                + "Last requested item id: " + safeLastItem + "\n"
-                + "Initial classification: intent=" + safeInitialIntent
-                + ", item_id=" + safeInitialItem
-                + ", quantity=" + initialQuantity
-                + ", counter_total_price=" + safeInitialCounter
-                + ", confidence=" + initialConfidence + "\n"
-                + "Rules:\n"
-                + "- Use request_offer when player asks to receive/get/buy now (e.g. 'give me 1 stick', 'can I get 2 sticks', 'i want 1 stick').\n"
-                + "- Use inquire_stock only for availability/count questions (e.g. 'do you have sticks', 'how many sticks').\n"
-                + "- Use inquire_stock for location/availability follow-ups (e.g. 'where are the sticks', 'you said you had sticks').\n"
-                + "- Use inquire_session_status for clarification/confusion about the current offer or last trade statement (e.g. 'what does that mean', 'can you explain', 'why 2 emeralds', 'what do you mean').\n- Use none for recipe/crafting/how-to-make questions (e.g. 'what is the recipe for a diamond pickaxe').\n"
-                + "- Do NOT use request_offer for clarification or stock/location follow-ups.\n"
-                + "- If follow-up omits item and last requested item id exists, reuse it.\n"
-                + "- Use none only if unrelated to trade.\n"
-                + "Return ONLY this JSON object with no extra text:\n"
-                + "{\"intent\":\"none|inquire_stock|inquire_payment|inquire_session_status|request_offer|accept_offer|decline_offer|counter_offer\","
-                + "\"item_id\":\"minecraft:...\",\"quantity\":1,\"counter_total_price\":1,\"confidence\":0.0}";
+        JsonObject data = new JsonObject();
+        data.addProperty("npc_name", npcName);
+        data.addProperty("player_name", playerName);
+        data.addProperty("player_utterance", playerText);
+        data.addProperty("active_offer", activeOfferSummary);
+        data.addProperty("stock_summary", stockSummary);
+        data.add("memory", recentShortTerm(memory, 6));
+        sb.append("DATA:\n").append(data).append('\n');
+        sb.append("Classify player_utterance now. Return ONLY the JSON object.");
+        return sb.toString();
     }
 
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
@@ -608,10 +438,40 @@ public final class PromptFactory {
         return dialogueReplyPrompt(npcName, playerName, playerText, snapshot, memory, scenarioContext, null);
     }
 
+    private static final String DIALOGUE_REPLY_RULES =
+            "My abilities (what I can actually do when commanded):\n"
+            + "  - Mine blocks (mine and store in chest, mine and deliver to player)\n"
+            + "  - Cut down trees (using an axe or pickaxe from a nearby chest if one is there, bare hands otherwise), clear a type of block nearby, or take down a structure you built\n"
+            + "  - Fetch items from nearby chests and bring them to the player\n"
+            + "  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n"
+            + "  - Scout and explore in a direction and report back\n"
+            + "  - Search for a specific creature and lead you to it (find a pig, find a chicken, locate a sheep)\n"
+            + "  - Trade items with the player\n"
+            + "  - Answer questions and hold a conversation\n"
+            + "IMPORTANT RULES:\n"
+            + "- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n"
+            + "- CRITICAL: If the player asks you to perform an action NOT in your abilities list (e.g. pick up dropped items, carry items in hand, craft items, follow the player, attack mobs), you MUST decline honestly and suggest what you CAN do instead. NEVER agree to do something you are not able to do. Saying 'sure' or 'let me do that' for impossible actions is forbidden.\n"
+            + "- FOLLOW-UPS: A short or elliptical message ('so only animals?', 'even from chests?', 'why not?', 'how about blocks?', 'and that one?') is almost always a follow-up to what was JUST discussed in the recent conversation below. Interpret it in that context and answer what the player is really asking. Do NOT treat it as a new question about your surroundings. Example: right after you said you can search for creatures, 'so only animals?' means 'can you only search for animals?' — answer about your search ability, not about what mobs are nearby.\n"
+            + "- If the player asks you to find, get, or bring an ITEM you cannot locate loose in the world (an egg, a diamond, wheat), do not simply refuse. In the SAME reply, offer to fetch it from a nearby chest if they have one — since you can fetch items from chests, never decline an item request while hiding that ability.\n"
+            + "- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data below. Do not invent.\n"
+            + "- If asked about threats, danger, or hostile mobs: list every nearby entity marked [HOSTILE], with its distance. If none are marked hostile, say the area looks clear. Never claim you see no threats when a [HOSTILE] entity is listed.\n"
+            + "- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' below. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n"
+            + "- If asked about what was just said: use the recent conversation section.\n"
+            + "- If the player asks what you meant by something you said earlier, explain that statement in fresh words. NEVER reuse sentences from your own earlier replies, even partially reworded or with words added — every reply must be newly written for the current message.\n"
+            + "- CRITICAL: You cannot start or perform tasks from a chat reply — chat only talks. NEVER say you are starting, doing, or about to do a task ('I'll go ahead and start searching', 'I'm on my way', 'let me fetch that'). If the player seems to want an action, ask exactly what they want or tell them how to ask for it.\n"
+            + "- Never invent facts, events, or task names not present in the data below.\n"
+            + "- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n"
+            + "- Do NOT advertise your services in every reply. Only mention what you can do when the player asks about your abilities or when it directly answers their request. When the player is just chatting, chat back naturally without pitching mining, building, or trading.\n"
+            + "Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n"
+            + "NEVER repeat the player's words back. Reply in your own words.\n"
+            + "Return ONLY this JSON with no extra text:\n"
+            + "{\"text\":\"your reply here\"}\n";
+
     public String dialogueReplyPrompt(String npcName, String playerName, String playerText,
             WorldSnapshot snapshot, MemoryContext memory, String scenarioContext, String tradeContext) {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(4096);
         sb.append("You are a Minecraft NPC named ").append(npcName).append(". Reply naturally to the player.\n");
+        sb.append(DIALOGUE_REPLY_RULES);
         sb.append("Player (").append(playerName).append(") said: \"").append(playerText).append("\"\n");
 
         if (snapshot != null) {
@@ -624,7 +484,10 @@ public final class PromptFactory {
                 sb.append("Nearby entities (what I can see right now):\n");
                 for (WorldSnapshot.SeenEntity e : snapshot.nearbyEntities()) {
                     sb.append("  - ").append(e.name()).append(" (").append(e.type()).append(")")
-                      .append(" at ").append(String.format("%.1f", e.distance())).append(" blocks\n");
+                      .append(" at ").append(String.format("%.1f", e.distance())).append(" blocks")
+                      .append(" to the ").append(e.direction())
+                      .append(isHostileType(e.type()) ? " [HOSTILE — a threat]" : "")
+                      .append("\n");
                 }
             } else {
                 sb.append("Nearby entities: none visible\n");
@@ -647,14 +510,15 @@ public final class PromptFactory {
         if (memory != null && !memory.longTerm().isEmpty()) {
             sb.append("Things I remember from past interactions:\n");
             for (MemoryEntry e : memory.longTerm()) {
-                sb.append("  [memory] ").append(e.content()).append("\n");
+                sb.append("  [").append(e.relativeAge()).append("] ").append(e.content()).append("\n");
             }
         }
         if (memory != null && !memory.shortTerm().isEmpty()) {
             sb.append("Recent conversation and events (most recent first):\n");
             int start = Math.max(0, memory.shortTerm().size() - 6);
             for (int i = memory.shortTerm().size() - 1; i >= start; i--) {
-                sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
+                MemoryEntry e = memory.shortTerm().get(i);
+                sb.append("  [").append(e.relativeAge()).append("] ").append(e.content()).append("\n");
             }
         }
 
@@ -669,77 +533,8 @@ public final class PromptFactory {
             sb.append("Active trade context: ").append(tradeContext).append("\n");
             sb.append("The player's message is a follow-up to this trade situation. Reply naturally and in context — do not re-state the offer mechanically.\n");
         }
-        sb.append("My abilities (what I can actually do when commanded):\n");
-        sb.append("  - Mine blocks (mine_block, mine and store in chest, mine and deliver to player)\n");
-        sb.append("  - Fetch items from nearby chests and bring them to the player\n");
-        sb.append("  - Build structures: floor, wall, pillar, outline, or hut (walls + roof, no floor) — in any supported block\n");
-        sb.append("  - Scout and explore in a direction and report back\n");
-        sb.append("  - Trade items with the player\n");
-        sb.append("  - Answer questions and hold a conversation\n");
-        sb.append("IMPORTANT RULES:\n");
-        sb.append("- If asked about your abilities or what you can do: answer using ONLY the abilities listed above. Do not invent new ones.\n");
-        sb.append("- CRITICAL: If the player asks you to perform an action NOT in your abilities list (e.g. pick up dropped items, carry items in hand, craft items, follow the player, attack mobs), you MUST decline honestly and suggest what you CAN do instead. NEVER agree to do something you are not able to do. Saying 'sure' or 'let me do that' for impossible actions is forbidden.\n");
-        sb.append("- If asked about surroundings (entities, weather, blocks): answer ONLY from the world data above. Do not invent.\n");
-        sb.append("- If asked what tasks you have done, completed, or remember: look in 'Things I remember from past interactions' above. List them directly and specifically. Do NOT say 'I don't remember' if entries exist.\n");
-        sb.append("- If asked about what was just said: use the recent conversation section.\n");
-        sb.append("- Never invent facts, events, or task names not present in the data above.\n");
-        sb.append("- Never invent sizes, heights, counts, or dimensions for structures not yet built. If asked about size of something only suggested (not built), ask the player what size they want.\n");
-        sb.append("Keep the reply short (1-2 sentences), friendly, and in character as a villager.\n");
-        sb.append("NEVER repeat the player's words back. Reply in your own words.\n");
-        sb.append("Return ONLY this JSON with no extra text:\n");
+        sb.append("Reply to the player now. Return ONLY this JSON with no extra text:\n");
         sb.append("{\"text\":\"your reply here\"}");
-        return sb.toString();
-    }
-
-    public String searchRequestPrompt(String playerText, MemoryContext memory) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("You are helping a Minecraft NPC understand a player's request.\n\n");
-        // Only include recent context when the instruction contains a pronoun that needs resolving
-        String lower = playerText == null ? "" : playerText.toLowerCase(java.util.Locale.ROOT);
-        boolean hasPronoun = lower.contains(" it") || lower.contains(" that") || lower.contains(" there")
-                || lower.contains(" one") || lower.contains(" them");
-        if (hasPronoun && memory != null && !memory.shortTerm().isEmpty()) {
-            sb.append("Recent conversation (use ONLY to resolve pronouns like 'it', 'that', 'there'):\n");
-            int start = Math.max(0, memory.shortTerm().size() - 4);
-            for (int i = start; i < memory.shortTerm().size(); i++) {
-                sb.append("  ").append(memory.shortTerm().get(i).content()).append("\n");
-            }
-            sb.append("\n");
-        }
-        sb.append("Player said: \"").append(playerText).append("\"\n\n");
-        sb.append("TASK: Decide if the player is explicitly asking the NPC to GO and find a specific creature.\n\n");
-        sb.append("RULE: Return is_search=true ONLY when the instruction contains a clear action verb\n");
-        sb.append("(find, locate, search for, look for, lead me to, take me to, show me, where is,\n");
-        sb.append("guide me to, bring me to) AND names or refers to a specific creature.\n");
-        sb.append("If either is missing, return is_search=false.\n\n");
-        sb.append("EXAMPLES — NOT a search (return {\"is_search\": false}):\n");
-        sb.append("  'how r u doing' → {\"is_search\": false}\n");
-        sb.append("  'what's up?' → {\"is_search\": false}\n");
-        sb.append("  'hello' → {\"is_search\": false}\n");
-        sb.append("  'it is a nice day' → {\"is_search\": false}\n");
-        sb.append("  'are there any enemies nearby?' → {\"is_search\": false}\n");
-        sb.append("  'do you see any mobs?' → {\"is_search\": false}\n");
-        sb.append("  'did you find it?' → {\"is_search\": false}\n");
-        sb.append("  'any luck?' → {\"is_search\": false}\n\n");
-        sb.append("EXAMPLES — IS a search:\n");
-        sb.append("  'find me a chicken' → {\"is_search\": true, \"entity_label\": \"a chicken\", \"entity_id\": \"minecraft:chicken\"}\n");
-        sb.append("  'locate a sheep' → {\"is_search\": true, \"entity_label\": \"a sheep\", \"entity_id\": \"minecraft:sheep\"}\n");
-        sb.append("  'lead me to the nearest cow' → {\"is_search\": true, \"entity_label\": \"a cow\", \"entity_id\": \"minecraft:cow\"}\n");
-        sb.append("  'search for a zombie' → {\"is_search\": true, \"entity_label\": \"a zombie\", \"entity_id\": \"minecraft:zombie\"}\n\n");
-        sb.append("If yes, identify the target creature and its Minecraft entity ID.\n");
-        sb.append("Use the full Minecraft entity ID format: minecraft:<name>\n");
-        sb.append("Examples: minecraft:chicken, minecraft:cow, minecraft:pig, minecraft:sheep,\n");
-        sb.append("minecraft:horse, minecraft:zombie, minecraft:skeleton, minecraft:creeper,\n");
-        sb.append("minecraft:spider, minecraft:enderman, minecraft:villager, minecraft:wolf,\n");
-        sb.append("minecraft:cat, minecraft:fox, minecraft:rabbit, minecraft:bee, minecraft:bat,\n");
-        sb.append("minecraft:squid, minecraft:dolphin, minecraft:cod, minecraft:salmon,\n");
-        sb.append("minecraft:llama, minecraft:parrot, minecraft:ocelot, minecraft:panda,\n");
-        sb.append("minecraft:polar_bear, minecraft:turtle, minecraft:witch, minecraft:pillager.\n\n");
-        sb.append("If the player refers to 'it' or 'that one', resolve from the recent conversation above.\n\n");
-        sb.append("Return ONLY this JSON with no extra text:\n");
-        sb.append("{\"is_search\": true, \"entity_label\": \"a chicken\", \"entity_id\": \"minecraft:chicken\"}\n");
-        sb.append("Or if not a search request:\n");
-        sb.append("{\"is_search\": false}");
         return sb.toString();
     }
 
@@ -826,6 +621,9 @@ public final class PromptFactory {
                 + "FIRST: If the player is NOT asking you to build, construct, place, or create a physical structure,\n"
                 + "return exactly: {\"scenario\":\"\",\"announce\":\"\",\"steps\":[]}\n"
                 + "Examples of non-build requests: greetings, trade questions, fetch/mine-only requests, questions about the world.\n"
+                + "CHOPPING, cutting, felling, breaking, demolishing, or removing ANYTHING is NEVER a build request:\n"
+                + "'chop down a tree' -> empty steps. 'cut a tree' -> empty steps. 'remove the wall' -> empty steps.\n"
+                + "Building means ADDING blocks to the world. If the request is about taking blocks away, return empty steps.\n"
                 + "\n"
                 + "Available step intents and their parameter formats:\n"
                 + "  fetch_from_chest: {\"item_id\":\"minecraft:cobblestone\", \"count\":9}\n"
@@ -905,6 +703,32 @@ public final class PromptFactory {
                 + "\"announce\":\"one sentence plan\","
                 + "\"steps\":["
                 + "{\"intent\":\"step_intent\",\"parameters\":{},\"description\":\"short description\"}]}";
+    }
+
+    private boolean isHostileType(String entityType) {
+        if (entityType == null) {
+            return false;
+        }
+        String lower = entityType.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("zombie") || lower.contains("skeleton") || lower.contains("creeper")
+                || lower.contains("spider") || lower.contains("witch") || lower.contains("slime")
+                || lower.contains("enderman") || lower.contains("blaze") || lower.contains("drowned")
+                || lower.contains("warden") || lower.contains("pillager") || lower.contains("vindicator")
+                || lower.contains("husk") || lower.contains("stray") || lower.contains("phantom")
+                || lower.contains("ravager") || lower.contains("piglin") || lower.contains("hoglin")
+                || lower.contains("ghast") || lower.contains("wither") || lower.contains("vex");
+    }
+
+    private JsonArray recentShortTerm(MemoryContext memory, int limit) {
+        JsonArray array = new JsonArray();
+        if (memory == null) {
+            return array;
+        }
+        List<MemoryEntry> entries = memory.shortTerm();
+        for (int i = Math.max(0, entries.size() - limit); i < entries.size(); i++) {
+            array.add(entries.get(i).toJson());
+        }
+        return array;
     }
 
     private JsonObject memoryToJson(MemoryContext memory) {

@@ -54,16 +54,19 @@ public final class TestRunner {
     private final ServerPlayer requester;
     private final Supplier<String> lastIntentGetter;
     private final Supplier<Boolean> isIdleChecker;
+    private final Supplier<Boolean> isAliveChecker;
     private final Consumer<String> instructionSubmitter;
     private final Runnable offerClearer;
 
     private static final int MAX_RETRIES = 3;
     private static final long RATE_LIMIT_LATENCY_THRESHOLD_MS = 1_500L;
     private static final long RETRY_GAP_MS = 6_000L;
+    private static final long CASE_TIMEOUT_MS = 60_000L;
 
     private Phase phase = Phase.DELAY;
     private int caseIndex = 0;
     private int retryCount = 0;
+    private int timeoutCount = 0;
     private long startMs = 0L;
     private long resumeAt = 0L;
     private boolean finished = false;
@@ -74,6 +77,7 @@ public final class TestRunner {
             ServerPlayer requester,
             Supplier<String> lastIntentGetter,
             Supplier<Boolean> isIdleChecker,
+            Supplier<Boolean> isAliveChecker,
             Consumer<String> instructionSubmitter,
             Runnable offerClearer) {
         this.logger = logger;
@@ -81,6 +85,7 @@ public final class TestRunner {
         this.requester = requester;
         this.lastIntentGetter = lastIntentGetter;
         this.isIdleChecker = isIdleChecker;
+        this.isAliveChecker = isAliveChecker;
         this.instructionSubmitter = instructionSubmitter;
         this.offerClearer = offerClearer;
     }
@@ -92,6 +97,11 @@ public final class TestRunner {
     public void tick() {
         if (finished) return;
         long now = System.currentTimeMillis();
+
+        if (!isAliveChecker.get()) {
+            abort("NPC is no longer alive (killed or despawned)");
+            return;
+        }
 
         if (phase == Phase.DELAY) {
             if (now < resumeAt) return;
@@ -109,7 +119,22 @@ public final class TestRunner {
 
         if (phase == Phase.WAITING) {
             if (now - startMs < 800) return;   // give the LLM call time to start
-            if (!isIdleChecker.get()) return;   // still processing
+
+            if (!isIdleChecker.get()) {
+                if (now - startMs < CASE_TIMEOUT_MS) return;   // still processing
+                TestCase timedOut = CASES.get(caseIndex);
+                timeoutCount++;
+                MetricsLogger.recordTest(npcId, timedOut.expectedIntent(), "timeout", startMs);
+                send(String.format("[TEST %d/%d] TIMEOUT | expected=%s no result after %ds",
+                        caseIndex + 1, CASES.size(), timedOut.expectedIntent(), CASE_TIMEOUT_MS / 1000));
+                logger.warn("[TEST] run={} TIMEOUT category={} expected={} after {}ms",
+                        caseIndex + 1, timedOut.category(), timedOut.expectedIntent(), now - startMs);
+                retryCount = 0;
+                caseIndex++;
+                resumeAt = now + 3_000L;
+                phase = Phase.DELAY;
+                return;
+            }
 
             long latency = now - startMs;
             TestCase tc = CASES.get(caseIndex);
@@ -143,10 +168,27 @@ public final class TestRunner {
         }
     }
 
+    public void cancel() {
+        if (finished) return;
+        finished = true;
+        send(String.format("[TEST] Cancelled at case %d/%d. Partial results written to config/llm_npc/intent_tests.csv",
+                Math.min(caseIndex + 1, CASES.size()), CASES.size()));
+        logger.info("[TEST] Test run cancelled by request at case {}/{}.", caseIndex + 1, CASES.size());
+    }
+
+    private void abort(String reason) {
+        finished = true;
+        send(String.format("[TEST] Aborted at case %d/%d: %s. Partial results written to config/llm_npc/intent_tests.csv",
+                Math.min(caseIndex + 1, CASES.size()), CASES.size(), reason));
+        logger.warn("[TEST] Test run aborted at case {}/{}: {}", caseIndex + 1, CASES.size(), reason);
+    }
+
     private void finish() {
         finished = true;
-        send("[TEST] All " + CASES.size() + " cases complete. Results written to config/llm_npc/intent_tests.csv");
-        logger.info("[TEST] Test run complete. {} cases executed.", CASES.size());
+        String suffix = timeoutCount > 0 ? String.format(" (%d timed out)", timeoutCount) : "";
+        send("[TEST] All " + CASES.size() + " cases complete" + suffix
+                + ". Results written to config/llm_npc/intent_tests.csv");
+        logger.info("[TEST] Test run complete. {} cases executed, {} timed out.", CASES.size(), timeoutCount);
     }
 
     private void send(String msg) {

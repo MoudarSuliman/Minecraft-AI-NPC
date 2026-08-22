@@ -44,6 +44,16 @@ public final class AutonomousNpcRuntime {
     private final Map<UUID, Boolean> llmInFlight = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastParsedDecisionIntentByNpc = new ConcurrentHashMap<>();
     private final Map<UUID, String> lastProcessedInstructionByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingClarification> pendingClarificationByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingConfirmation> pendingConfirmationByNpc = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> consecutiveIdleRejectsByNpc = new ConcurrentHashMap<>();
+
+    private record PendingClarification(String originalInstruction, String question, long expiresAtMillis) {
+    }
+
+    private record PendingConfirmation(AgentDecision decision, String instruction, String speaker,
+                                       String description, long expiresAtMillis) {
+    }
 
     private final ExecutorService llmExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final Set<UUID> thinkingNpcs = ConcurrentHashMap.newKeySet();
@@ -178,6 +188,7 @@ public final class AutonomousNpcRuntime {
             String instruction  = instructionTextFromEntry(latestEntry);
 
             thinkingNpcs.add(npcId);
+            actionExecutor.notifyThinking(server, npcId, handle.npcName());
             llmExecutor.submit(() -> {
                 try {
                     processInstruction(server, handle, npcId, memory, snapshot,
@@ -215,9 +226,13 @@ public final class AutonomousNpcRuntime {
         UUID playerId = agents.containsKey(npcId) ? agents.get(npcId).ownerPlayerId() : null;
         actionExecutor.clearActiveTradeOffer(npcId, playerId);
         actionExecutor.cancelAllActiveTasks(npcId);
+        pendingConfirmationByNpc.remove(npcId);
+        pendingClarificationByNpc.remove(npcId);
+        lastProcessedInstructionByNpc.remove(npcId);
     }
 
-    public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester) {
+    public boolean startTestRun(UUID npcId, net.minecraft.server.level.ServerPlayer requester,
+                                MinecraftServer server) {
         if (activeTestRunner != null && !activeTestRunner.isFinished()) {
             return false;
         }
@@ -227,9 +242,19 @@ public final class AutonomousNpcRuntime {
                 requester,
                 () -> getLastParsedIntent(npcId),
                 () -> isNpcIdle(npcId),
+                () -> actionExecutor.isVillagerAlive(server, npcId),
                 instruction -> enqueuePlayerUtterance(npcId, requester.getName().getString(), instruction),
                 () -> resetNpcForTest(npcId)
         );
+        return true;
+    }
+
+    public boolean cancelTestRun() {
+        if (activeTestRunner == null || activeTestRunner.isFinished()) {
+            return false;
+        }
+        activeTestRunner.cancel();
+        activeTestRunner = null;
         return true;
     }
 
@@ -253,8 +278,24 @@ public final class AutonomousNpcRuntime {
                                     String previousInstruction,
                                     long now, boolean hasPendingInstruction) {
         String activeOffer = actionExecutor.activeOfferSummary(npcId, handle.ownerPlayerId());
+        PendingClarification pendingClarification = pendingClarificationByNpc.get(npcId);
+        if (pendingClarification != null && System.currentTimeMillis() > pendingClarification.expiresAtMillis()) {
+            pendingClarificationByNpc.remove(npcId);
+            pendingClarification = null;
+        }
+        String pendingClarificationSummary = pendingClarification == null ? ""
+                : "original_instruction='" + pendingClarification.originalInstruction()
+                        + "'; npc_question='" + pendingClarification.question() + "'";
+        PendingConfirmation pendingConfirmation = pendingConfirmationByNpc.get(npcId);
+        if (pendingConfirmation != null && System.currentTimeMillis() > pendingConfirmation.expiresAtMillis()) {
+            pendingConfirmationByNpc.remove(npcId);
+            pendingConfirmation = null;
+        }
+        String pendingConfirmationSummary = pendingConfirmation == null ? ""
+                : "proposed_action='" + pendingConfirmation.description() + "'";
         String prompt = promptFactory.actionSelectionPrompt(
-                snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction, activeOffer);
+                snapshot, memory, hasPendingInstruction, latestInstruction, "", "", previousInstruction, activeOffer,
+                pendingClarificationSummary, pendingConfirmationSummary);
 
         llmInFlight.put(npcId, true);
         String raw;
@@ -266,6 +307,52 @@ public final class AutonomousNpcRuntime {
 
         AgentDecision decision = decisionParser.parse(raw);
         lastParsedDecisionIntentByNpc.put(npcId, decision.intent().name().toLowerCase());
+        if (decision.intent() != AgentIntentType.ASK_CLARIFICATION
+                && decision.intent() != AgentIntentType.DIALOGUE_REPLY
+                && decision.intent() != AgentIntentType.IDLE) {
+            pendingClarificationByNpc.remove(npcId);
+        }
+
+        if (decision.intent() == AgentIntentType.CONFIRM_YES) {
+            pendingConfirmationByNpc.remove(npcId);
+            if (pendingConfirmation != null) {
+                executeConfirmedAction(server, handle, npcId, pendingConfirmation);
+                return;
+            }
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "There's nothing waiting for me to confirm.");
+            return;
+        }
+        if (decision.intent() == AgentIntentType.CONFIRM_NO) {
+            boolean hadPending = pendingConfirmationByNpc.remove(npcId) != null;
+            if (hadPending) {
+                actionExecutor.sayAsNpc(server, npcId, handle.npcName(), "Alright, I won't do that.");
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+                return;
+            }
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "Alright.");
+            return;
+        }
+        // A new decision that is not a confirmation reply supersedes any pending confirmation.
+        pendingConfirmationByNpc.remove(npcId);
+
+        if (decision.intent() == AgentIntentType.CANCEL_TASK) {
+            boolean cancelled = actionExecutor.cancelActiveTasks(server, npcId, handle.npcName());
+            if (cancelled) {
+                pendingInstruction.put(npcId, false);
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+                storeActionMemory(npcId, speaker, latestInstruction, "cancel");
+                lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+                return;
+            }
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                    "I'm not in the middle of anything right now.");
+            return;
+        }
 
         // When NPC is busy, trade and explicit new build requests execute; everything else becomes dialogue
         if (actionExecutor.getNpcState(npcId) != AgentActionExecutor.NpcState.IDLE
@@ -298,34 +385,9 @@ public final class AutonomousNpcRuntime {
             }
             return;
         }
-        if (decision.intent() == AgentIntentType.SEARCH_ENTITY) {
-            String entityId = decision.parameters().has("entity_id")
-                    ? decision.parameters().get("entity_id").getAsString() : "";
-            String entityLabel = decision.parameters().has("entity_label")
-                    ? decision.parameters().get("entity_label").getAsString() : entityId;
-            if (actionExecutor.executeSearchDirect(
-                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    entityId, entityLabel)) {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-                storeActionMemory(npcId, speaker, latestInstruction, "search");
-            } else {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            }
-            return;
-        }
-        if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
-            if (actionExecutor.executeScoutDirect(
-                    server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    latestInstruction, decision.parameters())) {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
-                storeActionMemory(npcId, speaker, latestInstruction, "scout");
-            } else {
-                pendingInstruction.put(npcId, false);
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            }
+        if (decision.intent() == AgentIntentType.SEARCH_ENTITY
+                || decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
+            requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
             return;
         }
 
@@ -347,28 +409,64 @@ public final class AutonomousNpcRuntime {
                 actionExecutor.notifyLlmUnavailable(server, npcId, handle.npcName());
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 5000L);
-            } else {
-                logger.info("Idle decision rejected for pending instruction on agent {}. Retrying.", handle.npcName());
-                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
             }
-            return;
-        }
-        if (decision.intent() == AgentIntentType.DIALOGUE_REPLY && !decision.parameters().has("text")) {
-            logger.info("Dialogue decision missing parameters.text for agent {}. Retrying.", handle.npcName());
+            int rejects = consecutiveIdleRejectsByNpc.merge(npcId, 1, Integer::sum);
+            if (rejects >= 3) {
+                logger.info("Giving up on instruction after {} idle decisions for agent {}.", rejects, handle.npcName());
+                consecutiveIdleRejectsByNpc.remove(npcId);
+                fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction,
+                        "I'm having trouble working that one out — could you say it differently?");
+                return;
+            }
+            logger.info("Idle decision rejected for pending instruction on agent {} ({}/3). Retrying.",
+                    handle.npcName(), rejects);
             nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
             return;
         }
-        if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST && !decision.parameters().has("item_id")) {
-            logger.info("Fetch decision missing parameters.item_id for agent {}. Retrying.", handle.npcName());
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+        consecutiveIdleRejectsByNpc.remove(npcId);
+        if (decision.intent() == AgentIntentType.ASK_CLARIFICATION) {
+            var textElement = decision.parameters().get("text");
+            String lastResort = textElement != null && textElement.isJsonPrimitive()
+                    && textElement.getAsJsonPrimitive().isString()
+                    && !textElement.getAsString().isBlank()
+                    ? textElement.getAsString()
+                    : "I'm not sure what you mean — could you say that another way?";
+            PendingClarification existing = pendingClarificationByNpc.get(npcId);
+            String original = existing != null ? existing.originalInstruction() : latestInstruction;
+            pendingClarificationByNpc.put(npcId,
+                    new PendingClarification(original, "asked the player for the missing detail",
+                            System.currentTimeMillis() + 90_000L));
+            fallBackToDialogue(server, handle, npcId, memory, snapshot, speaker, latestInstruction, lastResort);
             return;
         }
-        if (decision.intent() == AgentIntentType.MINE_BLOCK
-                && !decision.parameters().has("block")
-                && !(decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"))) {
-            logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
-            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
-            return;
+        if (decision.intent() == AgentIntentType.FETCH_FROM_CHEST) {
+            var itemElement = decision.parameters().get("item_id");
+            boolean validItem = itemElement != null && itemElement.isJsonPrimitive()
+                    && itemElement.getAsJsonPrimitive().isString()
+                    && !itemElement.getAsString().isBlank()
+                    && !itemElement.getAsString().contains("...");
+            if (!validItem) {
+                logger.info("Fetch decision missing usable parameters.item_id for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
+            }
+        }
+        if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            String mineScope = decision.parameters().has("scope")
+                    ? decision.parameters().get("scope").getAsString().toLowerCase() : "single";
+            boolean scopeTargetsSelf = mineScope.equals("tree") || mineScope.equals("own_build");
+            boolean hasBlockTarget = decision.parameters().has("block")
+                    || (decision.parameters().has("x") && decision.parameters().has("y") && decision.parameters().has("z"));
+            if (!scopeTargetsSelf && !hasBlockTarget) {
+                logger.info("Mine decision missing block target for agent {}. Retrying.", handle.npcName());
+                nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+                return;
+            }
+            if (mineScope.equals("tree") || mineScope.equals("area") || mineScope.equals("own_build")) {
+                requestConfirmation(server, handle, npcId, decision, latestInstruction, speaker);
+                return;
+            }
         }
         if (decision.intent() == AgentIntentType.MINE_TO_CHEST && !decision.parameters().has("block")) {
             logger.info("Mine-to-chest decision missing parameters.block for agent {}. Retrying.", handle.npcName());
@@ -382,9 +480,15 @@ public final class AutonomousNpcRuntime {
         }
 
         if (decision.intent() == AgentIntentType.BUILD_STRUCTURE) {
+            String buildInstruction = decision.parameters().has("description")
+                    ? decision.parameters().get("description").getAsString()
+                    : "";
+            if (buildInstruction.isBlank()) {
+                buildInstruction = latestInstruction;
+            }
             if (actionExecutor.tryHandleScenarioInstruction(
                     server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    latestInstruction, memory, snapshot, true)) {
+                    buildInstruction, memory, snapshot, true)) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 storeActionMemory(npcId, speaker, latestInstruction, "scenario");
@@ -406,7 +510,7 @@ public final class AutonomousNpcRuntime {
         if (decision.intent().name().startsWith("TRADE_")) {
             if (actionExecutor.tryHandleTradeInstruction(
                     server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
-                    latestInstruction, memory, snapshot)) {
+                    latestInstruction, memory, snapshot, decision.intent())) {
                 pendingInstruction.put(npcId, false);
                 nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
                 memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("trade",
@@ -585,6 +689,113 @@ public final class AutonomousNpcRuntime {
             pendingInstruction.put(npcId, false);
             pendingWelcomeBack.add(npcId);
             logger.info("Restored embodied AI agent {} from saved binding", npcName);
+        }
+    }
+
+    private void fallBackToDialogue(MinecraftServer server, AgentHandle handle, UUID npcId,
+                                    MemoryContext memory, WorldSnapshot snapshot,
+                                    String speaker, String latestInstruction, String lastResortLine) {
+        if (actionExecutor.tryHandleDialogueInstruction(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                latestInstruction, memory, snapshot)) {
+            storeActionMemory(npcId, speaker, latestInstruction, "dialogue");
+        } else {
+            actionExecutor.sayAsNpc(server, npcId, handle.npcName(), lastResortLine);
+        }
+        pendingInstruction.put(npcId, false);
+        nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+        lastProcessedInstructionByNpc.put(npcId, latestInstruction);
+    }
+
+    private void requestConfirmation(MinecraftServer server, AgentHandle handle, UUID npcId,
+                                     AgentDecision decision, String instruction, String speaker) {
+        String description = describeProposedAction(decision);
+        pendingConfirmationByNpc.put(npcId,
+                new PendingConfirmation(decision, instruction, speaker, description,
+                        System.currentTimeMillis() + 90_000L));
+        actionExecutor.sayAsNpc(server, npcId, handle.npcName(), "Do you want me to " + description + "?");
+        pendingInstruction.put(npcId, false);
+        nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+    }
+
+    private String describeProposedAction(AgentDecision decision) {
+        if (decision.intent() == AgentIntentType.SEARCH_ENTITY) {
+            String label = decision.parameters().has("entity_label")
+                    ? decision.parameters().get("entity_label").getAsString()
+                    : (decision.parameters().has("entity_id")
+                            ? decision.parameters().get("entity_id").getAsString() : "that");
+            return "search for " + label;
+        }
+        if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
+            String direction = decision.parameters().has("direction")
+                    ? decision.parameters().get("direction").getAsString() : "around";
+            return "scout " + direction + " and report back";
+        }
+        if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            String mineScope = decision.parameters().has("scope")
+                    ? decision.parameters().get("scope").getAsString().toLowerCase() : "single";
+            return switch (mineScope) {
+                case "tree" -> "cut down the nearest tree";
+                case "own_build" -> "take down the structure I built";
+                case "area" -> "clear the " + (decision.parameters().has("block")
+                        ? decision.parameters().get("block").getAsString().replace("minecraft:", "") : "blocks")
+                        + " nearby";
+                default -> "mine that";
+            };
+        }
+        return "do that";
+    }
+
+    private void executeConfirmedAction(MinecraftServer server, AgentHandle handle, UUID npcId,
+                                        PendingConfirmation confirmation) {
+        AgentDecision decision = confirmation.decision();
+        if (decision.intent() == AgentIntentType.SEARCH_ENTITY) {
+            doSearch(server, handle, npcId, decision, confirmation.instruction(), confirmation.speaker());
+        } else if (decision.intent() == AgentIntentType.SCOUT_EXPLORER) {
+            doScout(server, handle, npcId, decision, confirmation.instruction(), confirmation.speaker());
+        } else if (decision.intent() == AgentIntentType.MINE_BLOCK) {
+            actionExecutor.execute(npcId, decision);
+            memoryStore.appendWorking(npcId, MemoryEntry.working(decision, true));
+            memoryStore.appendLongTerm(npcId, handle.ownerPlayerId(), MemoryEntry.episodic("decision",
+                    "Executed " + decision.intent().name().toLowerCase() + ": " + decision.reasoning()));
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1500L);
+            lastProcessedInstructionByNpc.put(npcId, confirmation.instruction());
+        } else {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+        }
+    }
+
+    private void doSearch(MinecraftServer server, AgentHandle handle, UUID npcId,
+                          AgentDecision decision, String instruction, String speaker) {
+        String entityId = decision.parameters().has("entity_id")
+                ? decision.parameters().get("entity_id").getAsString() : "";
+        String entityLabel = decision.parameters().has("entity_label")
+                ? decision.parameters().get("entity_label").getAsString() : entityId;
+        if (actionExecutor.executeSearchDirect(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                entityId, entityLabel)) {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+            storeActionMemory(npcId, speaker, instruction, "search");
+        } else {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
+        }
+    }
+
+    private void doScout(MinecraftServer server, AgentHandle handle, UUID npcId,
+                         AgentDecision decision, String instruction, String speaker) {
+        if (actionExecutor.executeScoutDirect(
+                server, npcId, handle.npcName(), speaker, handle.ownerPlayerId(),
+                instruction, decision.parameters())) {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 800L);
+            storeActionMemory(npcId, speaker, instruction, "scout");
+        } else {
+            pendingInstruction.put(npcId, false);
+            nextThinkAt.put(npcId, System.currentTimeMillis() + 1200L);
         }
     }
 
